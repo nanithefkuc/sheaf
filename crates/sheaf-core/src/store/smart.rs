@@ -1917,7 +1917,10 @@ mod tests {
         let handle = handle_at(&store, "@", "src/lib.rs", "fn alpha() {\n    1\n}");
 
         let noop = store
-            .plan_smart_with_heads(std::slice::from_ref(&handle), &heads(&[("src/lib.rs", GOOD)]))
+            .plan_smart_with_heads(
+                std::slice::from_ref(&handle),
+                &heads(&[("src/lib.rs", GOOD)]),
+            )
             .unwrap();
         assert_eq!(noop.unchanged, 1);
 
@@ -1927,14 +1930,20 @@ mod tests {
             GOOD.replace("    1", "    9").as_bytes(),
         );
         let edited = store
-            .plan_smart_with_heads(std::slice::from_ref(&handle), &heads(&[("src/lib.rs", GOOD)]))
+            .plan_smart_with_heads(
+                std::slice::from_ref(&handle),
+                &heads(&[("src/lib.rs", GOOD)]),
+            )
             .unwrap();
         assert!(edited.applicable());
         assert_eq!(edited.selections[0].kind, SmartKind::Replace);
 
         std::fs::remove_file(root.join("src/lib.rs")).unwrap();
         let gone = store
-            .plan_smart_with_heads(std::slice::from_ref(&handle), &heads(&[("src/lib.rs", GOOD)]))
+            .plan_smart_with_heads(
+                std::slice::from_ref(&handle),
+                &heads(&[("src/lib.rs", GOOD)]),
+            )
             .unwrap();
         assert_eq!(
             single_condition(&gone),
