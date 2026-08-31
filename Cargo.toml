@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/sheaf-core", "crates/sheaf-daemon", "crates/sheaf-cli", "crates/sheaf-mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/nanithefkuc/sheaf"
+homepage = "https://github.com/nanithefkuc/sheaf"
+authors = ["nanithefkuc"]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+inotify = "0.10"
+walkdir = "2"
+globset = "0.4"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4", features = ["derive"] }
+signal-hook = "0.3"
+tempfile = "3"
+loro = "1"
+sha2 = "0.10"
+crc32c = "0.6"
+hex = "0.4"
+zstd = "0.13"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+lto = "thin"
+strip = true

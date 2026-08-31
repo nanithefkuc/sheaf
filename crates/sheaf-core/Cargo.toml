@@ -1,0 +1,42 @@
+[package]
+name = "sheaf-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Core storage, timeline, restore, and watcher primitives for Sheaf"
+readme = "../../README.md"
+keywords = ["version-control", "history", "undo", "crdt"]
+categories = ["development-tools"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+inotify.workspace = true
+walkdir.workspace = true
+globset.workspace = true
+chrono.workspace = true
+libc = "0.2"
+loro.workspace = true
+sha2.workspace = true
+crc32c.workspace = true
+hex.workspace = true
+zstd.workspace = true
+
+[features]
+evt_debug = []
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber = { workspace = true, optional = false }
+# Dev-only: the trigram-engine comparison benchmark measures the shipping
+# custom postings against SQLite FTS5 `detail=none`. Bundled so the benchmark
+# is self-contained; this is NOT a runtime dependency of sheaf-core.
+rusqlite = { version = "0.31", features = ["bundled"] }

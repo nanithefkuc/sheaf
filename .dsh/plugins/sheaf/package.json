@@ -1,0 +1,47 @@
+{
+  "name": "dsh-sheaf",
+  "version": "0.2.1",
+  "description": "sheaf flight-recorder tools and Host service surface for DeepSeek Harness",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "sheaf",
+    "version-control",
+    "flight-recorder"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "nanithefkuc",
+  "homepage": "https://github.com/nanithefkuc/sheaf#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nanithefkuc/sheaf.git",
+    "directory": ".dsh/plugins/sheaf"
+  },
+  "bugs": {
+    "url": "https://github.com/nanithefkuc/sheaf/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

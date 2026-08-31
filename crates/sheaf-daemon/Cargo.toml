@@ -1,0 +1,32 @@
+[package]
+name = "sheaf-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Background capture daemon for the Sheaf worktree flight recorder"
+readme = "../../README.md"
+keywords = ["version-control", "history", "undo", "daemon"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "sheafd"
+path = "src/main.rs"
+
+[dependencies]
+walkdir.workspace = true
+chrono.workspace = true
+sheaf-core = { version = "0.1.0", path = "../sheaf-core" }
+anyhow.workspace = true
+libc = "0.2"
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+signal-hook.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "sheaf-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Model Context Protocol adapter for the Sheaf worktree flight recorder"
+readme = "../../README.md"
+keywords = ["version-control", "mcp", "agent", "undo"]
+categories = ["development-tools"]
+
+[dependencies]
+sheaf-core = { version = "0.1.0", path = "../sheaf-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

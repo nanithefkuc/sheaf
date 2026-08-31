@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test Rust documentation
+        run: cargo test --workspace --all-features --doc
+      - name: Test DSH plugin
+        run: npm test
+        working-directory: .dsh/plugins/sheaf
+      - name: Test with 95% line coverage
+        run: ./scripts/coverage.sh --summary-only

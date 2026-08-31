@@ -1,0 +1,20 @@
+# sheaf profile bundle: adds one host-plane plugin row to the DSH profile.
+#
+# Host plane is required, not a preference: this plugin PUBLISHES the `sheaf`
+# service (the read surface future DSH UI consumes), and a service with
+# consumers outside the agent plane cannot sit in an agent preset — a loose
+# preset row publishes it process-global and is rejected at mount, while an
+# isolate realm would hide it from the host/UI. Installing the bundle into a
+# profile is the opt-in; every session in that profile then shares one
+# instance.
+#
+# All config keys are optional; defaults are shown.
+- insert:
+    - id: sheaf
+      name: dsh-sheaf
+      config:
+        bin: sheaf            # CLI binary (mirrors the SHEAF_BIN override)
+        allowWrite: false     # default-deny: restore apply, gc collect, and init rewrite the worktree or timeline, so they need explicit opt-in
+        # defaultProject: /path/to/project  # fallback when a call names no project
+        timeoutMs: 60000      # per-call timeout
+        maxOutputChars: 200000  # output cap per result, so one huge patch cannot flood the model context
