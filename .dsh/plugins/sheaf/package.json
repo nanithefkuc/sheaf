@@ -14,7 +14,7 @@
     "cordis.patch.yml"
   ],
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "keywords": [
     "deepseek-harness",
