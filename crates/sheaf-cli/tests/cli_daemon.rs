@@ -530,7 +530,85 @@ fn restore_resume_and_abandon_report_daemon_errors_without_pending_intent() {
     assert!(out.contains("restore intent abandoned"), "{out}");
 }
 
+#[test]
+fn live_worktree_edits_form_a_branch_that_squash_merges() {
+    let fx = fixture("worktree-merge", V1);
+    let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "branch-base"]);
+    assert!(ok, "{err}");
+
+    write_file(&fx.root, "src/target.rs", "pub fn target() {}\n");
+    wait_caught_up(&fx);
+
+    let linked = fx._env.base.join("branch");
+    let (ok, out, err) = sheaf(
+        &fx,
+        &[
+            "worktree",
+            "add",
+            "checkpoint:branch-base",
+            linked.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(ok, "{err}");
+    let added = json_out(&out);
+    assert_eq!(added["watching"], serde_json::json!(true));
+    assert!(linked.join(".sheaf").is_file());
+    assert!(!linked.join("src/target.rs").exists());
+
+    write_file(&linked, "src/source.rs", "pub fn source() {}\n");
+    wait_caught_up_at(&fx, &linked);
+    let (ok, out, err) = sheaf_at(&fx, &linked, &["log", "--json"]);
+    assert!(ok, "{err}");
+    let source = json_out(&out)["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (ok, out, err) = sheaf(&fx, &["worktree", "list", "--json"]);
+    assert!(ok, "{err}");
+    let listed = json_out(&out);
+    let branch = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"] == linked.to_string_lossy().as_ref())
+        .expect("linked worktree listed");
+    assert_eq!(branch["capture_id"], source);
+
+    let (ok, out, err) = sheaf(&fx, &["merge", &source, "--json"]);
+    assert!(ok, "{err}");
+    let plan = json_out(&out);
+    assert!(plan["conflicts"].as_array().unwrap().is_empty());
+    assert_eq!(plan["actions"].as_array().unwrap().len(), 1);
+    assert_eq!(plan["actions"][0]["path"], "src/source.rs");
+
+    let (ok, out, err) = sheaf(&fx, &["merge", &source, "--apply", "--json"]);
+    assert!(ok, "{err}");
+    let outcome = json_out(&out);
+    assert_eq!(outcome["files_written"], 1);
+    assert!(outcome["capture_id"].is_string());
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("src/source.rs")).unwrap(),
+        "pub fn source() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("src/target.rs")).unwrap(),
+        "pub fn target() {}\n"
+    );
+}
+
 // --------------------------------------------------- worktree list / add (human)
+
+/// Capture id at the tip of `root`'s timeline (the daemon's `log` view).
+fn latest_capture(fx: &Fixture, root: &Path) -> String {
+    let (ok, out, err) = sheaf_at(fx, root, &["log", "--json"]);
+    assert!(ok, "{err}");
+    json_out(&out)["entries"][0]["id"]
+        .as_str()
+        .expect("a capture at the tip")
+        .to_owned()
+}
 
 #[test]
 fn worktree_list_human_marks_primary_and_shows_linked_tips() {
@@ -601,6 +679,106 @@ fn worktree_add_to_existing_destination_fails_clearly() {
     assert!(!occupied.join(".sheaf").exists(), "no link created: {err}");
 }
 
+// ------------------------------------------------------------ merge (human)
+
+#[test]
+fn merge_preview_prints_plan_then_apply_writes_files() {
+    let fx = fixture("merge-human", V1);
+    let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "base"]);
+    assert!(ok, "{err}");
+
+    let linked = fx._env.base.join("branch");
+    let (ok, _, err) = sheaf(
+        &fx,
+        &["worktree", "add", "checkpoint:base", linked.to_str().unwrap()],
+    );
+    assert!(ok, "{err}");
+    write_file(&linked, "src/added.rs", "pub fn added() {}\n");
+    wait_caught_up_at(&fx, &linked);
+    let source = latest_capture(&fx, &linked);
+
+    // Preview: the plan text, then the copy-paste apply hint (no conflicts).
+    let (ok, out, err) = sheaf(&fx, &["merge", &source]);
+    assert!(ok, "{err}");
+    assert!(out.contains("changes:      1"), "{out}");
+    assert!(out.contains("conflicts:    0"), "{out}");
+    assert!(out.contains("Create  src/added.rs"), "{out}");
+    assert!(
+        out.contains(&format!("apply:        sheaf merge {source} --apply")),
+        "apply hint present: {out}"
+    );
+
+    // Apply: reports the write and stamps a merge capture.
+    let (ok, out, err) = sheaf(&fx, &["merge", &source, "--apply"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("merged 1 change(s): 1 written, 0 deleted"),
+        "{out}"
+    );
+    assert!(out.contains("capture: "), "capture line: {out}");
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("src/added.rs")).unwrap(),
+        "pub fn added() {}\n"
+    );
+}
+
+#[test]
+fn conflicting_merge_lists_conflicts_and_blocks_apply() {
+    let fx = fixture("merge-conflict", V1);
+    let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "base"]);
+    assert!(ok, "{err}");
+
+    let linked = fx._env.base.join("branch");
+    let (ok, _, err) = sheaf(
+        &fx,
+        &["worktree", "add", "checkpoint:base", linked.to_str().unwrap()],
+    );
+    assert!(ok, "{err}");
+
+    // Both branches change src/lib.rs differently relative to the shared base.
+    write_file(&linked, "src/lib.rs", V2);
+    wait_caught_up_at(&fx, &linked);
+    let source = latest_capture(&fx, &linked);
+    write_file(&fx.root, "src/lib.rs", V3);
+    wait_caught_up(&fx);
+
+    // Preview lists the conflict and withholds the apply hint.
+    let (ok, out, err) = sheaf(&fx, &["merge", &source]);
+    assert!(ok, "{err}");
+    assert!(out.contains("conflicts:    1"), "{out}");
+    assert!(out.contains("conflict  src/lib.rs:"), "{out}");
+    assert!(
+        out.contains("apply:        blocked until conflicts are resolved"),
+        "{out}"
+    );
+    assert!(!out.contains("--apply"), "no apply hint on conflict: {out}");
+
+    // Forcing `--apply` still refuses, reporting the conflict on stderr, and
+    // the target keeps its own version.
+    let (ok, _, err) = sheaf(&fx, &["merge", &source, "--apply"]);
+    assert!(!ok, "conflicting apply must be blocked");
+    assert!(err.contains("blocked by 1 conflict"), "{err}");
+    assert_eq!(std::fs::read_to_string(fx.root.join("src/lib.rs")).unwrap(), V3);
+
+    // The `--json` apply path emits the machine-readable plan (conflicts and
+    // all) and still exits non-zero without touching the worktree.
+    let (ok, out, _err) = sheaf(&fx, &["merge", &source, "--apply", "--json"]);
+    assert!(!ok, "json apply on conflict must also refuse");
+    assert_eq!(json_out(&out)["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(fx.root.join("src/lib.rs")).unwrap(), V3);
+}
+
+#[test]
+fn merge_resume_without_intent_errors_cleanly() {
+    let fx = fixture("merge-resume-empty", V1);
+    let (ok, _, err) = sheaf(&fx, &["merge", "--resume"]);
+    assert!(!ok, "resume without a pending merge must fail");
+    assert!(
+        err.contains("no pending merge intent") || err.contains("merge"),
+        "{err}"
+    );
+}
+
 #[test]
 fn worktree_add_resolves_relative_destination_against_cwd() {
     let fx = fixture("wt-add-rel", V1);
@@ -633,3 +811,15 @@ fn worktree_add_resolves_relative_destination_against_cwd() {
     assert!(created.join(".sheaf").is_file(), "link planted at cwd-relative dest");
 }
 
+#[test]
+fn merge_with_unknown_source_reports_daemon_error() {
+    let fx = fixture("merge-bad-source", V1);
+    let (ok, _, err) = sheaf(&fx, &["merge", "no-such-reference"]);
+    assert!(!ok, "merge against an unknown source must fail");
+    assert!(!err.is_empty(), "a diagnostic is printed: {err}");
+
+    // No source and no `--resume` is a usage error, not a daemon round-trip.
+    let (ok, _, err) = sheaf(&fx, &["merge"]);
+    assert!(!ok, "bare merge must fail");
+    assert!(err.contains("needs a source reference or `--resume`"), "{err}");
+}

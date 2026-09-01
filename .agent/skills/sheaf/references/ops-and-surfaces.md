@@ -37,15 +37,22 @@ and pending restore targets. Explicitly marking a point is the destructive
 override; confirm that action with the user. Preview collection before applying
 it.
 
-## Branch worktrees
+## Branch worktrees and timeline merge
 
 ```sh
 sheaf worktree list                       # primary + every linked worktree
 sheaf worktree add <reference> <dir>      # materialize a point as a live worktree
+sheaf merge <source>                      # preview a squash onto the active worktree
+sheaf merge <source> --apply              # apply the squash as one capture
+sheaf merge --resume                      # finish a crash-interrupted merge
 ```
 
 A linked worktree shares the store and is watched like the primary; each head
-diverges independently, and nothing is copied or overwritten.
+diverges independently. `merge` squashes a divergent source (a branch tip,
+checkpoint, or capture) onto the active worktree as a single capture. It is
+previewed by default; conflicting paths are reported and block the apply until
+resolved, leaving the worktree untouched. Merging never rewrites history — the
+source stays reachable.
 
 ## Ignore heavy and generated trees
 
@@ -75,6 +82,7 @@ When available, prefer structured native tools over shell commands:
 - `sheaf_checkpoint_list`, `sheaf_checkpoint_create`
 - `sheaf_restore_plan`, `sheaf_restore_apply`
 - `sheaf_worktree_list`, `sheaf_worktree_add`
+- `sheaf_merge_plan`, `sheaf_merge_apply`
 
 Timeline grep, cache commands, fragment selection, and smart squash may be
 CLI-only on some adapters. Use the CLI when the native catalog lacks the

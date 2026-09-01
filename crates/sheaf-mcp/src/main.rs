@@ -183,6 +183,7 @@ fn write_gated(name: &str, args: &Value) -> bool {
     match name {
         "sheaf_restore_apply"
         | "sheaf_worktree_add"
+        | "sheaf_merge_apply"
         | "sheaf_init" => true,
 
         "sheaf_gc" => bool_arg(args, "apply"),
@@ -305,6 +306,22 @@ fn tool_table() -> Vec<Value> {
                 "destination": {"type": "string", "description": "New non-overlapping directory for the worktree."}
             }), project_prop()]),
             &["point", "destination"],
+        ),
+        tool(
+            "sheaf_merge_plan",
+            "Preview a squash merge from a divergent timeline source onto the active worktree; reports explicit path conflicts without writing.",
+            merge_props(&[json!({
+                "source": {"type": "string", "description": "Capture, checkpoint, or branch-tip reference to merge."}
+            }), project_prop()]),
+            &["source"],
+        ),
+        tool(
+            "sheaf_merge_apply",
+            "Apply a conflict-free squash merge onto the active worktree as one capture. Old branches remain reachable. REQUIRES SHEAF_MCP_ALLOW_WRITE=1.",
+            merge_props(&[json!({
+                "source": {"type": "string", "description": "Capture, checkpoint, or branch-tip reference to merge."}
+            }), project_prop()]),
+            &["source"],
         ),
 
         tool(
@@ -499,6 +516,19 @@ fn build_command(
                 anyhow::bail!("sheaf_worktree_add needs a destination");
             };
             cmd.args(["worktree", "add", point, destination, "--json"]);
+            if let Some(root) = project {
+                cmd.args(["-C", root]);
+            }
+        }
+        "sheaf_merge_plan" | "sheaf_merge_apply" => {
+            let Some(source) = str_arg(args, "source") else {
+                anyhow::bail!("{name} needs a source timeline point");
+            };
+            cmd.arg("merge").arg(source);
+            if name == "sheaf_merge_apply" {
+                cmd.arg("--apply");
+            }
+            cmd.arg("--json");
             if let Some(root) = project {
                 cmd.args(["-C", root]);
             }
@@ -732,6 +762,8 @@ mod tests {
                 "sheaf_restore_apply",
                 "sheaf_worktree_list",
                 "sheaf_worktree_add",
+                "sheaf_merge_plan",
+                "sheaf_merge_apply",
 
                 "sheaf_doctor",
                 "sheaf_gc",
@@ -763,6 +795,8 @@ mod tests {
         assert_eq!(required("sheaf_restore_plan"), ["point"]);
         assert_eq!(required("sheaf_restore_apply"), ["point"]);
         assert_eq!(required("sheaf_worktree_add"), ["point", "destination"]);
+        assert_eq!(required("sheaf_merge_plan"), ["source"]);
+        assert_eq!(required("sheaf_merge_apply"), ["source"]);
 
         assert_eq!(required("sheaf_init"), ["path"]);
     }
@@ -772,6 +806,7 @@ mod tests {
         for name in [
             "sheaf_restore_apply",
             "sheaf_worktree_add",
+            "sheaf_merge_apply",
             "sheaf_gc",
             "sheaf_init",
         ] {
@@ -908,6 +943,7 @@ mod tests {
         assert!(!write_gated("sheaf_checkpoint_create", &plain));
         assert!(!write_gated("sheaf_restore_plan", &plain));
         assert!(!write_gated("sheaf_worktree_list", &plain));
+        assert!(!write_gated("sheaf_merge_plan", &plain));
 
         assert!(!write_gated("sheaf_doctor", &plain));
         assert!(!write_gated("sheaf_gc", &gc_report));
@@ -916,6 +952,7 @@ mod tests {
         assert!(write_gated("sheaf_restore_apply", &plain));
         assert!(write_gated("sheaf_init", &plain));
         assert!(write_gated("sheaf_worktree_add", &plain));
+        assert!(write_gated("sheaf_merge_apply", &plain));
 
         assert!(write_gated("sheaf_gc", &gc_collect));
         // String-typed booleans gate too — clients mis-type arguments.
@@ -1145,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_tools_map_to_their_subcommands() {
+    fn worktree_and_merge_tools_map_to_the_subcommands() {
         let cmd = build("sheaf_worktree_list", json!({"project": "/p"}), Some("/p")).unwrap();
         assert_eq!(argv(&cmd), [BIN, "worktree", "list", "--json", "-C", "/p"]);
 
@@ -1159,10 +1196,21 @@ mod tests {
             argv(&cmd),
             [BIN, "worktree", "add", "checkpoint:x", "/w", "--json", "-C", "/p"]
         );
+
+        let cmd = build("sheaf_merge_plan", json!({"source": "checkpoint:x"}), None).unwrap();
+        assert_eq!(argv(&cmd), [BIN, "merge", "checkpoint:x", "--json"]);
+
+        let cmd = build(
+            "sheaf_merge_apply",
+            json!({"source": "@~1", "project": "/p"}),
+            Some("/p"),
+        )
+        .unwrap();
+        assert_eq!(argv(&cmd), [BIN, "merge", "@~1", "--apply", "--json", "-C", "/p"]);
     }
 
     #[test]
-    fn worktree_tools_require_their_references() {
+    fn worktree_and_merge_tools_require_their_references() {
         assert!(build("sheaf_worktree_add", json!({"point": "@"}), None)
             .unwrap_err()
             .to_string()
@@ -1171,6 +1219,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("timeline point"));
+        for name in ["sheaf_merge_plan", "sheaf_merge_apply"] {
+            let err = build(name, json!({}), None).unwrap_err();
+            assert!(err.to_string().contains(name), "{err}");
+            assert!(err.to_string().contains("source"));
+        }
     }
 
     #[test]
@@ -1252,6 +1305,6 @@ mod tests {
         // The client's initialized notification is silently consumed.
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let list = handle_request("tools/list", json!(1), json!({})).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 14);
     }
 }

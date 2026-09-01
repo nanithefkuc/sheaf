@@ -280,6 +280,23 @@ enum StoreCommand {
             std::result::Result<sheaf_core::store::WorktreeInfo, sheaf_core::SheafError>,
         >,
     },
+    PlanMerge {
+        source: String,
+        reply: Sender<
+            std::result::Result<sheaf_core::store::MergePlan, sheaf_core::SheafError>,
+        >,
+    },
+    ApplyMerge {
+        token: String,
+        reply: Sender<
+            std::result::Result<sheaf_core::store::MergeOutcome, sheaf_core::SheafError>,
+        >,
+    },
+    ResumeMerge {
+        reply: Sender<
+            std::result::Result<sheaf_core::store::MergeOutcome, sheaf_core::SheafError>,
+        >,
+    },
 }
 
 /// The collector side of `smart.plan`: phase one names candidate paths,
@@ -1025,6 +1042,25 @@ fn boot_reconcile_store(
             .unwrap_or_else(|_| IgnoreSet::empty());
             &owned_ignore
         };
+        if sheaf_core::store::pending_merge_at(&worktree).is_some() {
+            match store.resume_merge() {
+                Ok(Some(outcome)) => tracing::warn!(
+                    root = %worktree.display(),
+                    written = outcome.files_written,
+                    deleted = outcome.files_deleted,
+                    "interrupted merge completed on startup"
+                ),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        root = %worktree.display(),
+                        %error,
+                        "merge resume blocked; leaving intent pending and skipping reconciliation"
+                    );
+                    continue;
+                }
+            }
+        }
         let resumed =
             resume_interrupted_restore(&worktree, store, ignore, max_resume_age_ms);
         match store.reconcile_worktree(ignore) {
@@ -1171,6 +1207,7 @@ fn collect_loop(
     // the single writer is the only thing entitled to honour a token.
     let mut plans: Vec<sheaf_core::store::RestorePlan> = Vec::new();
     let mut fragment_plans: Vec<sheaf_core::store::FragmentPlan> = Vec::new();
+    let mut merge_plans: Vec<sheaf_core::store::MergePlan> = Vec::new();
 
     loop {
         while let Ok(command) = control.try_recv() {
@@ -1210,6 +1247,7 @@ fn collect_loop(
                 &ig,
                 &mut plans,
                 &mut fragment_plans,
+                &mut merge_plans,
                 command,
                 flush_error,
                 max_resume_age_ms,
@@ -1312,7 +1350,9 @@ impl StoreCommand {
             | StoreCommand::ApplyRestore { .. }
             | StoreCommand::ResumeRestore { .. }
             | StoreCommand::ApplyFragment { .. }
-            | StoreCommand::AddWorktree { .. } => true,
+            | StoreCommand::AddWorktree { .. }
+            | StoreCommand::ApplyMerge { .. }
+            | StoreCommand::ResumeMerge { .. } => true,
             _ => false,
         }
     }
@@ -1334,6 +1374,7 @@ impl StoreCommand {
             | StoreCommand::Diff { .. }
             | StoreCommand::Grep { .. }
             | StoreCommand::CacheBackfill { .. }
+            | StoreCommand::PlanMerge { .. }
             | StoreCommand::AddWorktree { .. } => true,
             _ => false,
         }
@@ -1363,6 +1404,9 @@ impl StoreCommand {
             StoreCommand::PlanSmart { reply, .. } => { let _ = reply.send(Err(error)); }
             StoreCommand::ListWorktrees { reply } => { let _ = reply.send(Err(error)); }
             StoreCommand::AddWorktree { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::PlanMerge { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ApplyMerge { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ResumeMerge { reply } => { let _ = reply.send(Err(error)); }
         }
     }
 }
@@ -1405,6 +1449,7 @@ fn handle_store_command(
     ignore: &IgnoreSet,
     plans: &mut Vec<sheaf_core::store::RestorePlan>,
     fragment_plans: &mut Vec<sheaf_core::store::FragmentPlan>,
+    merge_plans: &mut Vec<sheaf_core::store::MergePlan>,
     command: StoreCommand,
     flush_error: Option<sheaf_core::SheafError>,
     max_resume_age_ms: i64,
@@ -1613,6 +1658,47 @@ fn handle_store_command(
             };
             let _ = reply.send(result);
         }
+        StoreCommand::PlanMerge { source, reply } => {
+            let result = store.plan_merge(&source);
+            if let Ok(plan) = &result {
+                merge_plans.retain(|cached| cached.token != plan.token);
+                merge_plans.push(plan.clone());
+                if merge_plans.len() > PLAN_CACHE {
+                    merge_plans.remove(0);
+                }
+            }
+            let _ = reply.send(result);
+        }
+        StoreCommand::ApplyMerge { token, reply } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => match merge_plans.iter().find(|plan| plan.token == token).cloned() {
+                    Some(plan) => store.apply_merge(&plan, ignore),
+                    None => Err(sheaf_core::SheafError::MergePlanStale(format!(
+                        "unknown or expired merge plan token `{token}`; re-plan the merge"
+                    ))),
+                },
+            };
+            if result.is_ok() {
+                merge_plans.clear();
+                plans.clear();
+                fragment_plans.clear();
+            }
+            let _ = reply.send(result);
+        }
+        StoreCommand::ResumeMerge { reply } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => match store.resume_merge() {
+                    Ok(Some(outcome)) => Ok(outcome),
+                    Ok(None) => Err(sheaf_core::SheafError::MergePlanStale(
+                        "no pending merge intent to resume".into(),
+                    )),
+                    Err(error) => Err(error),
+                },
+            };
+            let _ = reply.send(result);
+        }
         StoreCommand::InWorktree { .. } => unreachable!("worktree wrapper was unwrapped"),
 
     }
@@ -1799,6 +1885,10 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                     "cache.backfill",
                     "worktree.list",
                     "worktree.add",
+                    "merge.plan",
+                    "merge.apply",
+                    "merge.resume",
+
                 ],
             }),
         )),
@@ -1823,6 +1913,10 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
         "cache.backfill" => plain(cache_backfill(shared, req, rid)),
         "worktree.list" => plain(worktree_list(shared, req, rid)),
         "worktree.add" => plain(worktree_add(shared, req, rid)),
+        "merge.plan" => plain(merge_plan(shared, req, rid)),
+        "merge.apply" => plain(merge_apply(shared, req, rid)),
+        "merge.resume" => plain(merge_resume(shared, req, rid)),
+
         "enroll.notify" => plain(enroll_notify(shared, req, rid)),
         "shutdown" => {
             *shutting_down = true;
@@ -1887,6 +1981,8 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
             "auto_resume": !stale,
         })
     });
+    let pending_merge = sheaf_core::store::pending_merge_at(&root);
+
     Response::ok(
         rid,
         json!({
@@ -1899,6 +1995,7 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
             "cold": shared.cold(&store_root),
             "store_format": format,
             "pending_restore": pending,
+            "pending_merge": pending_merge,
         }),
     )
 }
@@ -3033,6 +3130,87 @@ fn worktree_add(shared: &Shared, req: &Request, rid: String) -> Response {
     }
 }
 
+fn merge_plan(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(path) => normalize(path),
+        Err(response) => return response,
+    };
+    let Some(source) = req.params.get("source").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`source` is required"));
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::PlanMerge {
+            source: source.to_owned(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(DIFF_HARD) {
+        Ok(Ok(plan)) => Response::ok(rid, json!({"plan": plan})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "merge plan timed out")),
+    }
+}
+
+fn merge_apply(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(path) => normalize(path),
+        Err(response) => return response,
+    };
+    let Some(token) = req.params.get("token").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`token` is required"));
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::ApplyMerge {
+            token: token.to_owned(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(RESTORE_HARD) {
+        Ok(Ok(outcome)) => Response::ok(rid, json!({"outcome": outcome})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "merge apply timed out")),
+    }
+}
+
+fn merge_resume(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(path) => normalize(path),
+        Err(response) => return response,
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::ResumeMerge { reply: reply_tx })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(RESTORE_HARD) {
+        Ok(Ok(outcome)) => Response::ok(rid, json!({"outcome": outcome})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "merge resume timed out")),
+    }
+}
+
 
 fn enroll_notify(shared: &Shared, req: &Request, rid: String) -> Response {
     let root = match require_project(req, &rid) {
@@ -3658,11 +3836,13 @@ mod tests {
         frags: &mut Vec<sheaf_core::store::FragmentPlan>,
         command: StoreCommand,
     ) -> Option<sheaf_core::store::RestoreOutcome> {
+        let mut merge_plans = Vec::new();
         handle_store_command(
             store,
             ignore,
             plans,
             frags,
+            &mut merge_plans,
             command,
             None,
             60_000,
@@ -3789,6 +3969,7 @@ mod tests {
             &ignore,
             &mut plans,
             &mut frags,
+            &mut Vec::new(),
 
             StoreCommand::CreateCheckpoint {
                 name: "cp-two".into(),
@@ -4051,6 +4232,7 @@ mod tests {
             &ignore,
             &mut plans,
             &mut frags,
+            &mut Vec::new(),
 
             StoreCommand::ResumeRestore { reply: tx },
             Some(sheaf_core::SheafError::Config("tail lost".into())),
@@ -4350,6 +4532,397 @@ mod tests {
         let source = capture(&mut store, &linked, "source.txt", true);
         store.activate_worktree(&primary).unwrap();
         (store, ignore, lock, primary, linked, source)
+    }
+
+    #[test]
+    fn worktree_and_merge_verbs_answer_and_surface_typed_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut store, ignore, _lock, primary, linked, source) = branched_store(tmp.path());
+        let mut plans = Vec::new();
+        let mut frags = Vec::new();
+        let mut merges = Vec::new();
+
+        // worktree.list names the primary and the one present linked worktree.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ListWorktrees { reply: tx },
+            None,
+            60_000,
+        );
+        let worktrees = rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        assert_eq!(worktrees.len(), 2, "primary plus one linked worktree");
+        assert!(worktrees.iter().any(|w| w.primary));
+        assert!(worktrees.iter().any(|w| !w.primary && w.present));
+
+        // worktree.add onto an existing directory is refused by the store.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::AddWorktree {
+                reference: "base".into(),
+                destination: linked.clone(),
+                reply: tx,
+            },
+            None,
+            60_000,
+        );
+        assert!(rx
+            .recv_timeout(TEN_SECS)
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+
+        // A lost debounce tail poisons the mutation before the store is touched.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::AddWorktree {
+                reference: "base".into(),
+                destination: tmp.path().join("linked2"),
+                reply: tx,
+            },
+            Some(sheaf_core::SheafError::Config("tail lost".into())),
+            60_000,
+        );
+        assert!(rx.recv_timeout(TEN_SECS).unwrap().is_err());
+        assert!(!tmp.path().join("linked2").exists(), "poisoned add wrote nothing");
+
+        // merge.plan caches exactly one entry keyed by token; the source-only
+        // change is the single action and there are no conflicts.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::PlanMerge {
+                source: source.clone(),
+                reply: tx,
+            },
+            None,
+            60_000,
+        );
+        let plan = rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        assert_eq!(merges.len(), 1, "the handed-out merge plan is cached by token");
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            plan.actions
+                .iter()
+                .map(|action| action.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source.txt"]
+        );
+        let token = plan.token.clone();
+
+        // merge.apply with an unknown token is a stale-plan error.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ApplyMerge {
+                token: "no-such-token".into(),
+                reply: tx,
+            },
+            None,
+            60_000,
+        );
+        assert!(rx
+            .recv_timeout(TEN_SECS)
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown or expired merge plan token"));
+
+        // A lost tail also poisons apply, leaving the cached plan intact.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ApplyMerge {
+                token: token.clone(),
+                reply: tx,
+            },
+            Some(sheaf_core::SheafError::Config("tail lost".into())),
+            60_000,
+        );
+        assert!(rx.recv_timeout(TEN_SECS).unwrap().is_err());
+        assert_eq!(merges.len(), 1, "a poisoned apply keeps the plan cached");
+
+        // merge.apply by token squashes the source change onto the primary as
+        // one capture and clears every plan cache.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ApplyMerge {
+                token: token.clone(),
+                reply: tx,
+            },
+            None,
+            60_000,
+        );
+        let outcome = rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        assert_eq!(outcome.files_written, 1);
+        assert!(merges.is_empty() && plans.is_empty() && frags.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(primary.join("source.txt")).unwrap(),
+            "source\n",
+            "the merge actually wrote the source file"
+        );
+
+        // merge.resume with no pending intent refuses by name, and a lost
+        // tail poisons it like any mutation.
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ResumeMerge { reply: tx },
+            None,
+            60_000,
+        );
+        assert!(rx
+            .recv_timeout(TEN_SECS)
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("no pending merge intent"));
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ResumeMerge { reply: tx },
+            Some(sheaf_core::SheafError::Config("tail lost".into())),
+            60_000,
+        );
+        assert!(rx.recv_timeout(TEN_SECS).unwrap().is_err());
+    }
+
+    #[test]
+    fn merge_apply_reports_path_conflicts_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut store, ignore, _lock, primary, linked, _source) = branched_store(tmp.path());
+        // Diverge one path on both branches: the target edits base.txt and
+        // the source edits it differently.
+        std::fs::write(primary.join("base.txt"), "target edit\n").unwrap();
+        capture(&mut store, &primary, "base.txt", false);
+        store.activate_worktree(&linked).unwrap();
+        std::fs::write(linked.join("base.txt"), "source edit\n").unwrap();
+        let source = capture(&mut store, &linked, "base.txt", false);
+        store.activate_worktree(&primary).unwrap();
+
+        let mut plans = Vec::new();
+        let mut frags = Vec::new();
+        let mut merges = Vec::new();
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::PlanMerge {
+                source,
+                reply: tx,
+            },
+            None,
+            60_000,
+        );
+        let plan = rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].path, "base.txt");
+
+        let (tx, rx) = channel();
+        handle_store_command(
+            &mut store,
+            &ignore,
+            &mut plans,
+            &mut frags,
+            &mut merges,
+            StoreCommand::ApplyMerge {
+                token: plan.token.clone(),
+                reply: tx,
+            },
+            None,
+            60_000,
+        );
+        assert!(rx
+            .recv_timeout(TEN_SECS)
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("conflict"));
+        assert_eq!(
+            std::fs::read_to_string(primary.join("base.txt")).unwrap(),
+            "target edit\n",
+            "a conflicting merge leaves the target untouched"
+        );
+    }
+
+    #[test]
+    fn inworktree_wrapper_delegates_classification_and_error_routing() {
+        let root = PathBuf::from("/tmp/sheafd-inworktree");
+        // worktree_root answers only for the wrapper; the delegated
+        // classification is exactly the inner command's.
+        let (tx, _rx) = channel::<
+            std::result::Result<Vec<sheaf_core::store::WorktreeInfo>, sheaf_core::SheafError>,
+        >();
+        let wrapped = StoreCommand::InWorktree {
+            root: root.clone(),
+            command: Box::new(StoreCommand::ListWorktrees { reply: tx }),
+        };
+        assert_eq!(wrapped.worktree_root(), Some(root.as_path()));
+        assert!(!wrapped.crosses_debounce_boundary());
+        assert!(!wrapped.is_memory_heavy());
+
+        // A bare command has no worktree root.
+        let (tx, _rx) =
+            channel::<std::result::Result<sheaf_core::store::MergeOutcome, sheaf_core::SheafError>>();
+        assert_eq!(
+            StoreCommand::ResumeMerge { reply: tx }.worktree_root(),
+            None
+        );
+
+        // Classification of the new worktree/merge variants.
+        let (tx, _rx) =
+            channel::<std::result::Result<sheaf_core::store::WorktreeInfo, sheaf_core::SheafError>>();
+        let add = StoreCommand::AddWorktree {
+            reference: "base".into(),
+            destination: root.clone(),
+            reply: tx,
+        };
+        assert!(add.crosses_debounce_boundary() && add.is_memory_heavy());
+        let (tx, _rx) =
+            channel::<std::result::Result<sheaf_core::store::MergePlan, sheaf_core::SheafError>>();
+        let plan = StoreCommand::PlanMerge {
+            source: "@".into(),
+            reply: tx,
+        };
+        assert!(!plan.crosses_debounce_boundary() && plan.is_memory_heavy());
+        let (tx, _rx) =
+            channel::<std::result::Result<sheaf_core::store::MergeOutcome, sheaf_core::SheafError>>();
+        let apply = StoreCommand::ApplyMerge {
+            token: "t".into(),
+            reply: tx,
+        };
+        assert!(apply.crosses_debounce_boundary() && !apply.is_memory_heavy());
+
+        // send_error routes through the wrapper to the inner reply, and each
+        // new variant's own arm delivers a typed error to its receiver.
+        let (tx, rx) = channel();
+        StoreCommand::InWorktree {
+            root,
+            command: Box::new(StoreCommand::ApplyMerge {
+                token: "t".into(),
+                reply: tx,
+            }),
+        }
+        .send_error(sheaf_core::SheafError::StoreCorrupt("boom".into()));
+        assert!(rx.recv().unwrap().is_err(), "wrapper routes to the inner reply");
+
+        let (tx, rx) = channel();
+        StoreCommand::ListWorktrees { reply: tx }
+            .send_error(sheaf_core::SheafError::StoreCorrupt("boom".into()));
+        assert!(rx.recv().unwrap().is_err());
+        let (tx, rx) = channel();
+        StoreCommand::AddWorktree {
+            reference: "base".into(),
+            destination: PathBuf::from("/tmp/x"),
+            reply: tx,
+        }
+        .send_error(sheaf_core::SheafError::StoreCorrupt("boom".into()));
+        assert!(rx.recv().unwrap().is_err());
+        let (tx, rx) = channel();
+        StoreCommand::PlanMerge {
+            source: "@".into(),
+            reply: tx,
+        }
+        .send_error(sheaf_core::SheafError::StoreCorrupt("boom".into()));
+        assert!(rx.recv().unwrap().is_err());
+        let (tx, rx) = channel();
+        StoreCommand::ResumeMerge { reply: tx }
+            .send_error(sheaf_core::SheafError::StoreCorrupt("boom".into()));
+        assert!(rx.recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn boot_reconcile_resumes_an_interrupted_merge_and_reconciles_every_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _ignore, lock, primary, linked, source) = branched_store(tmp.path());
+
+        // Park a merge intent exactly as a crash mid-apply would leave it:
+        // planned and written, but never finished.
+        let plan = store.plan_merge(&source).unwrap();
+        let intent = sheaf_core::store::MergeIntent {
+            plan,
+            worktree: store.root().to_path_buf(),
+            started_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let intent_path = sheaf_core::config::sheaf_dir(&primary)
+            .join("state")
+            .join("merge.intent");
+        std::fs::write(&intent_path, serde_json::to_string(&intent).unwrap()).unwrap();
+        assert!(sheaf_core::store::pending_merge_at(&primary).is_some());
+
+        // Uncaptured edits on both physical worktrees; boot reconciliation
+        // must fold them into history.
+        std::fs::write(primary.join("late.txt"), "late primary\n").unwrap();
+        std::fs::write(linked.join("late-linked.txt"), "late linked\n").unwrap();
+
+        // Reopen exactly as a fresh daemon boot would.
+        drop(store);
+        drop(lock);
+        let (mut store, ignore, _lock) = opened_store(&primary);
+        boot_reconcile_store(&primary, &mut store, &ignore, 60_000);
+
+        // The interrupted merge finished: source.txt landed and the intent
+        // was cleared.
+        assert_eq!(
+            std::fs::read_to_string(primary.join("source.txt")).unwrap(),
+            "source\n"
+        );
+        assert!(sheaf_core::store::pending_merge_at(&primary).is_none());
+
+        // Both worktrees are already reconciled: a second pass finds nothing.
+        store.activate_worktree(&primary).unwrap();
+        assert!(
+            store.reconcile_worktree(&ignore).unwrap().is_none(),
+            "the primary's late edit was captured at boot"
+        );
+        store.activate_worktree(&linked).unwrap();
+        assert!(
+            store.reconcile_worktree(&ignore).unwrap().is_none(),
+            "the linked worktree's late edit was captured at boot"
+        );
     }
 
     #[test]
@@ -5529,4 +6102,96 @@ mod tests {
         assert_eq!(report["root"], root.display().to_string());
     }
 
+    #[test]
+    fn worktree_and_merge_cycle_over_ipc() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Build divergent history plus a linked worktree, then release the
+        // writer lock so the daemon reopens the very same store.
+        let (store, _ignore, lock, _primary, _linked, source) = branched_store(tmp.path());
+        drop(store);
+        drop(lock);
+        let primary = tmp.path().join("primary");
+        let linked = tmp.path().join("linked");
+
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &primary));
+        let shutting_down = std::cell::RefCell::new(false);
+        let send = |method: &str, params: serde_json::Value| {
+            dispatch(
+                &shared,
+                &test_request(method, Some(primary.clone()), params),
+                &mut shutting_down.borrow_mut(),
+            )
+        };
+
+        // Warm the lazy store so the writer is live.
+        let (resp, _) = send("timeline.log", json!({"limit": 10}));
+        assert!(resp.ok, "warm-up failed: {:?}", resp.error);
+
+        // worktree.list names the primary and the present linked worktree.
+        let (resp, _) = send("worktree.list", json!({}));
+        assert!(resp.ok, "worktree.list failed: {:?}", resp.error);
+        assert_eq!(
+            resp.result.unwrap()["worktrees"].as_array().unwrap().len(),
+            2
+        );
+
+        // merge.plan requires a source; then answers with the source-only plan.
+        let (resp, _) = send("merge.plan", json!({}));
+        assert_eq!(error_code_of(&resp), "bad.params");
+        let (resp, _) = send("merge.plan", json!({ "source": source }));
+        assert!(resp.ok, "merge.plan failed: {:?}", resp.error);
+        let plan = resp.result.unwrap()["plan"].clone();
+        assert_eq!(plan["actions"].as_array().unwrap().len(), 1);
+        let token = plan["token"].as_str().unwrap().to_owned();
+
+        // merge.apply requires a token; a bogus one is stale; the real one
+        // squashes the source change onto the primary worktree.
+        let (resp, _) = send("merge.apply", json!({}));
+        assert_eq!(error_code_of(&resp), "bad.params");
+        let (resp, _) = send("merge.apply", json!({"token": "no-such-token"}));
+        assert_eq!(error_code_of(&resp), "merge.plan_stale");
+        let (resp, _) = send("merge.apply", json!({ "token": token }));
+        assert!(resp.ok, "merge.apply failed: {:?}", resp.error);
+        assert_eq!(resp.result.unwrap()["outcome"]["files_written"], 1);
+        assert_eq!(
+            std::fs::read_to_string(primary.join("source.txt")).unwrap(),
+            "source\n"
+        );
+
+        // merge.resume with nothing pending refuses by name.
+        let (resp, _) = send("merge.resume", json!({}));
+        assert_eq!(error_code_of(&resp), "merge.plan_stale");
+
+        // worktree.add validates its params, refuses an existing directory,
+        // then materializes a fresh worktree and starts watching it.
+        let (resp, _) = send("worktree.add", json!({"destination": "/tmp/x"}));
+        assert_eq!(error_code_of(&resp), "bad.params", "missing reference");
+        let (resp, _) = send("worktree.add", json!({"reference": "base"}));
+        assert_eq!(error_code_of(&resp), "bad.params", "missing destination");
+        let (resp, _) = send(
+            "worktree.add",
+            json!({"reference": "base", "destination": "relative/dir"}),
+        );
+        assert_eq!(error_code_of(&resp), "bad.params", "destination not absolute");
+        let (resp, _) = send(
+            "worktree.add",
+            json!({"reference": "base", "destination": linked.display().to_string()}),
+        );
+        assert!(resp
+            .error
+            .unwrap()
+            .message
+            .contains("already exists"), "add onto an existing dir must be refused");
+        let fresh = tmp.path().join("linked-2");
+        let (resp, _) = send(
+            "worktree.add",
+            json!({"reference": "base", "destination": fresh.display().to_string()}),
+        );
+        assert!(resp.ok, "worktree.add failed: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["watching"], true);
+        assert_eq!(result["worktree"]["primary"], false);
+        assert!(fresh.is_dir(), "the fresh worktree was materialized on disk");
+    }
 }

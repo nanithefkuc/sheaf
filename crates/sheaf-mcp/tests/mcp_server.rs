@@ -214,11 +214,12 @@ fn tools_list_exposes_the_documented_tools() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 14);
 
     assert!(names.contains(&"sheaf_status"));
     assert!(names.contains(&"sheaf_restore_apply"));
     assert!(names.contains(&"sheaf_worktree_add"));
+    assert!(names.contains(&"sheaf_merge_apply"));
 
     assert!(names.contains(&"sheaf_gc"));
 }
@@ -550,7 +551,7 @@ fn a_session_serves_sequential_requests_on_one_connection() {
     let ping = s.request("ping", json!({}));
     assert_eq!(ping["result"], json!({}));
     let list = s.request("tools/list", json!({}));
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 14);
     let status = s.call_tool("sheaf_status", json!({}));
     assert!(!is_error(&status));
 }

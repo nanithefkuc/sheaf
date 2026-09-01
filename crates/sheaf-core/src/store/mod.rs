@@ -19,6 +19,7 @@ mod grep;
 mod grep_trigram;
 mod journal;
 mod ledger;
+mod merge;
 
 mod maintenance;
 mod restore;
@@ -67,6 +68,9 @@ pub use maintenance::{
     doctor, doctor_fix, gc_apply, gc_plan, gc_run, gc_run_store, retention_mark, AppliedFix, Check,
     DoctorReply, GcOutcome, GcPlan, GcReport, IntegrityReport, MarkedCapture, ProtectedPoint,
     PrunableCapture, Refusal, RepairOutcome, RetentionFacts,
+};
+pub use merge::{
+    pending_merge_at, MergeAction, MergeConflict, MergeIntent, MergeOutcome, MergePlan,
 };
 
 pub use restore::{

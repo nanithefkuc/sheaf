@@ -357,6 +357,30 @@ EXAMPLES:
         #[command(subcommand)]
         command: WorktreeCmd,
     },
+    /// Squash a divergent timeline source onto the active worktree.
+    ///
+    /// Preview by default. `--apply` executes the exact plan token returned
+    /// by the daemon; conflicting paths leave the worktree untouched.
+    #[command(after_help = "\
+EXAMPLES:
+    sheaf merge checkpoint:experiment          preview source → this worktree
+    sheaf merge checkpoint:experiment --apply  apply as one capture
+    sheaf merge --resume                       finish an interrupted merge")]
+    Merge {
+        /// Source capture, checkpoint, or branch-tip reference.
+        source: Option<String>,
+        /// Apply the previewed plan.
+        #[arg(long, conflicts_with = "resume")]
+        apply: bool,
+        /// Resume a crash-interrupted merge intent.
+        #[arg(long, conflicts_with_all = ["source", "apply"])]
+        resume: bool,
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage the per-user service unit (systemd user session).
     Service {
         #[command(subcommand)]
@@ -508,7 +532,8 @@ impl Cmd {
             | Cmd::Doctor { json, .. }
             | Cmd::Gc { json, .. }
             | Cmd::Restore { json, .. }
-            | Cmd::Squash { json, .. } => *json,
+            | Cmd::Squash { json, .. }
+            | Cmd::Merge { json, .. } => *json,
             Cmd::Worktree {
                 command: WorktreeCmd::List { json, .. } | WorktreeCmd::Add { json, .. },
             } => *json,
@@ -792,6 +817,20 @@ fn main() -> ExitCode {
                 json,
             ),
         },
+        Cmd::Merge {
+            source,
+            apply,
+            resume,
+            project,
+            json,
+        } => cmd_merge(
+            project.as_deref(),
+            source.as_deref(),
+            apply,
+            resume,
+            json,
+        ),
+
         Cmd::Service { command } => match command {
             ServiceCmd::Install { no_start } => cmd_service_install(no_start),
             ServiceCmd::Status => cmd_service_status(),
@@ -2193,6 +2232,162 @@ fn cmd_worktree_add(
             .unwrap_or("------------");
         println!("worktree {} -> {point}", worktree.path.display());
         println!("watching: yes");
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------- merge
+
+fn print_merge_plan(plan: &sheaf_core::store::MergePlan) {
+    let short = |point: &sheaf_core::store::ResolvedPoint| {
+        point
+            .capture_id
+            .as_deref()
+            .map(|id| id[..12.min(id.len())].to_owned())
+            .unwrap_or_else(|| point.frontier[..12.min(point.frontier.len())].to_owned())
+    };
+    println!("merge base:   {}", short(&plan.base));
+    println!("source:       {}", short(&plan.source));
+    println!("target:       {}", short(&plan.target));
+    println!("changes:      {}", plan.actions.len());
+    println!("conflicts:    {}", plan.conflicts.len());
+    for action in &plan.actions {
+        println!("  {:?}  {}", action.kind, action.path);
+    }
+    for conflict in &plan.conflicts {
+        println!("  conflict  {}: {}", conflict.path, conflict.reason);
+    }
+}
+
+fn cmd_merge(
+    project: Option<&Path>,
+    source: Option<&str>,
+    apply: bool,
+    resume: bool,
+    as_json: bool,
+) -> CliResult {
+    let root = timeline_root(project)?;
+    let mut client = daemon_client("timeline merging")?;
+    client.set_timeout(Duration::from_secs(120))?;
+
+    if resume {
+        let reply = client.call(
+            "merge.resume",
+            Some(&root),
+            serde_json::json!({}),
+            None,
+
+        )?;
+        if !reply.response.ok {
+            return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+        }
+        let outcome: sheaf_core::store::MergeOutcome = serde_json::from_value(
+            reply
+                .response
+                .result
+                .and_then(|value| value.get("outcome").cloned())
+                .unwrap_or_default(),
+        )
+        .context("daemon returned invalid merge outcome")?;
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&outcome).map_err(anyhow::Error::from)?
+            );
+
+        } else {
+            println!(
+                "merge resumed: {} written, {} deleted",
+                outcome.files_written, outcome.files_deleted
+            );
+        }
+        return Ok(());
+    }
+    let Some(source) = source else {
+        return Err(anyhow::anyhow!("merge needs a source reference or `--resume`").into());
+    };
+    let reply = client.call(
+        "merge.plan",
+        Some(&root),
+        serde_json::json!({"source": source}),
+        None,
+
+    )?;
+    if !reply.response.ok {
+        return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    }
+    let plan: sheaf_core::store::MergePlan = serde_json::from_value(
+        reply
+            .response
+            .result
+            .and_then(|value| value.get("plan").cloned())
+            .unwrap_or_default(),
+    )
+    .context("daemon returned invalid merge plan")?;
+    if !apply {
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).map_err(anyhow::Error::from)?
+            );
+
+        } else {
+            print_merge_plan(&plan);
+            if plan.conflicts.is_empty() {
+                println!("apply:        sheaf merge {source} --apply");
+            } else {
+                println!("apply:        blocked until conflicts are resolved");
+            }
+        }
+        return Ok(());
+    }
+    if !plan.conflicts.is_empty() {
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).map_err(anyhow::Error::from)?
+            );
+
+        } else {
+            print_merge_plan(&plan);
+            eprintln!("sheaf: merge blocked by {} conflict(s)", plan.conflicts.len());
+        }
+        return Err(ExitErr::SilentCode(EXIT_RESTORE_BLOCKED));
+    }
+    let reply = client.call(
+        "merge.apply",
+        Some(&root),
+        serde_json::json!({"token": plan.token}),
+        None,
+
+    )?;
+    if !reply.response.ok {
+        return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    }
+    let outcome: sheaf_core::store::MergeOutcome = serde_json::from_value(
+        reply
+            .response
+            .result
+            .and_then(|value| value.get("outcome").cloned())
+            .unwrap_or_default(),
+    )
+    .context("daemon returned invalid merge outcome")?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome).map_err(anyhow::Error::from)?
+        );
+
+    } else {
+        println!(
+            "merged {} change(s): {} written, {} deleted",
+            plan.actions.len(),
+            outcome.files_written,
+            outcome.files_deleted
+        );
+        if let Some(id) = outcome.capture_id {
+            println!("capture: {}", &id[..12.min(id.len())]);
+        }
     }
     Ok(())
 }
@@ -5890,6 +6085,53 @@ mod output_and_argument_tests {
         .contains("fragment ← selection-1"));
     }
 
+    #[test]
+    fn merge_plan_renderer_prints_points_actions_and_conflicts() {
+        use sheaf_core::store::{MergeAction, MergeConflict, MergePlan};
+        // `base` carries a capture id (short = its 12 hex prefix); `source`
+        // carries none, so `short` must fall back to the frontier prefix.
+        let base = ResolvedPoint {
+            capture_id: Some("abcdef1234567890".into()),
+            frontier: "basefrontier".into(),
+        };
+        let source = ResolvedPoint {
+            capture_id: None,
+            frontier: "0123456789abcdef".into(),
+        };
+        let target = ResolvedPoint {
+            capture_id: Some("fedcba0987654321".into()),
+            frontier: "targetfrontier".into(),
+        };
+        let action = |path: &str, kind: ActionKind| MergeAction {
+            path: path.into(),
+            kind,
+            content: None,
+            bytes: 0,
+            hash: None,
+            exec: false,
+        };
+        let plan = MergePlan {
+            token: "token".into(),
+            base,
+            source,
+            target,
+            actions: vec![
+                action("src/new.rs", ActionKind::Create),
+                action("src/mod.rs", ActionKind::Update),
+                action("src/old.rs", ActionKind::Delete),
+            ],
+            conflicts: vec![MergeConflict {
+                path: "src/conf.rs".into(),
+                reason: "both branches changed this path differently".into(),
+            }],
+            unchanged: 2,
+            created_at_ms: 0,
+        };
+        // Renders base/source/target/changes/conflicts plus a line per action
+        // and per conflict across every ActionKind and both point-resolution
+        // branches without panicking.
+        print_merge_plan(&plan);
+    }
 }
 
 #[cfg(test)]

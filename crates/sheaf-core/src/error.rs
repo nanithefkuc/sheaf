@@ -52,6 +52,12 @@ pub enum SheafError {
 
     #[error("restore blocked by the live worktree: {0}")]
     RestoreObstructed(String),
+    #[error("timeline merge plan is no longer valid: {0}")]
+    MergePlanStale(String),
+
+    #[error("timeline merge conflict: {0}")]
+    TimelineMergeConflict(String),
+
 
     #[error("{0}")]
     Other(String),
@@ -79,6 +85,8 @@ impl SheafError {
             SheafError::BadCursor(_) => "state.bad_cursor",
             SheafError::RestorePlanStale(_) => "restore.plan_stale",
             SheafError::RestoreObstructed(_) => "restore.obstructed",
+            SheafError::MergePlanStale(_) => "merge.plan_stale",
+            SheafError::TimelineMergeConflict(_) => "merge.conflict",
 
             SheafError::Other(_) => "internal",
         }
@@ -135,6 +143,14 @@ mod tests {
             (
                 SheafError::RestoreObstructed("busy".into()),
                 "restore.obstructed",
+            ),
+            (
+                SheafError::MergePlanStale("old".into()),
+                "merge.plan_stale",
+            ),
+            (
+                SheafError::TimelineMergeConflict("both changed".into()),
+                "merge.conflict",
             ),
             (SheafError::Other("misc".into()), "internal"),
         ];

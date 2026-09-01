@@ -54,6 +54,9 @@ and forward through your work at any time.
 - **Branch worktrees** - materialize any timeline point as a live linked
   worktree that shares the store, turning a divergent branch into a real
   directory you can build and edit in.
+- **Timeline merge** - squash a divergent timeline onto your current worktree
+  as one capture; conflicting paths are reported and block the merge until
+  resolved.
 - **Checkpoints** - create meaningful restore points for branching or 
   semantically indicating a new phase.
 - **Respects ignore rules** - anything git ignores — `.gitignore` files,
@@ -122,9 +125,10 @@ reconnect MCP servers in the client after changing the definition.
 
 The server uses stdio and resolves the project from its working directory by
 default. It exposes status, log, diff, checkpoint, restore planning, worktree
-materialization, doctor, and retention tools. Worktree/store rewrites are
-denied by default; clients that need them must explicitly add
-SHEAF_MCP_ALLOW_WRITE=1 to the server's environment.
+materialization, timeline merge, doctor, and retention tools. Worktree/store
+rewrites are denied by default; clients
+that need them must explicitly add `SHEAF_MCP_ALLOW_WRITE=1` to the server's
+environment.
 
 ## Checking Changes
 
@@ -238,6 +242,30 @@ The daemon watches every linked worktree the same way it watches the primary,
 so edits in either are captured on their own head. Each worktree diverges
 independently; nothing is copied and nothing is overwritten.
 
+## Merging Timelines
+
+When work on a divergent branch — a linked worktree, a checkpoint, or any
+capture — is ready, `merge` squashes that source onto your current worktree as
+a single capture.
+
+```sh
+# Preview the squash: the files it would write and any conflicts. Read-only.
+sheaf merge "before refactoring"
+
+# Apply it as one capture on the current worktree.
+sheaf merge "before refactoring" --apply
+```
+
+The merge is previewed by default. Paths that both sides changed divergently
+are reported as conflicts and block the apply until resolved — the worktree is
+never left half-merged. If a merge is interrupted, finish it with:
+
+```sh
+sheaf merge --resume
+```
+
+Merging never rewrites history: the source branch stays reachable, and the
+merge lands as a new capture stamped with a merge origin.
 
 ## Maintenance
 
@@ -301,9 +329,6 @@ includes:
 - **A more intuitive branch viewer:** The current timeline viewer makes it
   hard to see where the timeline branches and how parallel branches run
   alongside each other; a dedicated branching view is planned.
-- **Explicit timeline-merge semantics:** Divergent timelines are currently
-  kept side by side; an explicit "squash this timeline into that one"
-  operation is planned as a follow-up.
 - **Agentic Integration:** Allow AI agents to use Sheaf; restore changes
   within an agent turn.
 - **Platform Support:** Future support for MacOS and Windows.
