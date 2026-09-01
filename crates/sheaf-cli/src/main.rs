@@ -2106,6 +2106,13 @@ fn cmd_checkpoint_create(project: Option<&Path>, name: &str, at: Option<&str>) -
     let mut client = Client::connect(&socket, Duration::from_secs(2)).map_err(|_| {
         anyhow::anyhow!("checkpoint creation requires the running daemon; no offline writer fallback is allowed")
     })?;
+    // Checkpoint creation first flushes the open debounce window; on a
+    // large dirty tree that legitimately outlives the 2s handshake budget
+    // (the daemon allows itself far longer). The client must wait at least
+    // as long as the daemon's own hard deadline or the mutation succeeds
+    // after the caller has already reported failure.
+    client.set_timeout(Duration::from_secs(120))?;
+
     let reply = client.call(
         "checkpoint.create",
         Some(&root),
@@ -2453,6 +2460,14 @@ fn cmd_restore(
             .into())
         }
     };
+    // Planning and applying a restore both materialize whole timeline
+    // points; the daemon's own hard deadline is 120s (RESTORE_HARD), and a
+    // client that gives up sooner reports failure for work that still
+    // completes. Match the daemon's ceiling, like worktree add and merge.
+    if let Some(client) = client.as_mut() {
+        client.set_timeout(Duration::from_secs(120))?;
+    }
+
 
     let plan: sheaf_core::store::RestorePlan = match client.as_mut() {
         Some(client) => {
@@ -2593,6 +2608,12 @@ fn cmd_fragment_restore(
             .into())
         }
     };
+    // Fragment planning/apply share the restore ceiling for the same
+    // reason: the daemon may legitimately compute past handshake speed.
+    if let Some(client) = client.as_mut() {
+        client.set_timeout(Duration::from_secs(120))?;
+    }
+
 
     let plan: FragmentPlan = match client.as_mut() {
         Some(client) => {
@@ -2912,6 +2933,8 @@ fn cmd_restore_resume(project: Option<&Path>, _as_json: bool) -> CliResult {
             "resuming a restore requires the running daemon; check `sheaf status` for the pending intent"
         )
     })?;
+    client.set_timeout(Duration::from_secs(120))?;
+
     let reply = client.call("restore.resume", Some(&root), serde_json::json!({}), None)?;
     if !reply.response.ok {
         return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
@@ -2928,6 +2951,8 @@ fn cmd_restore_abandon(project: Option<&Path>, _as_json: bool) -> CliResult {
             "abandoning a restore requires the running daemon; check `sheaf status` for the pending intent"
         )
     })?;
+    client.set_timeout(Duration::from_secs(120))?;
+
     let reply = client.call("restore.abandon", Some(&root), serde_json::json!({}), None)?;
     if !reply.response.ok {
         return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
@@ -3147,6 +3172,10 @@ fn cmd_gc(
     // and marking there can never race a live flush.
     let socket = sheaf_core::paths::control_socket_path();
     if let Ok(mut client) = Client::connect(&socket, Duration::from_secs(2)) {
+        // Marking, reporting, and especially `--apply` walk blob
+        // reachability over the whole store — well past the 2s handshake
+        // budget on real projects.
+        let _ = client.set_timeout(Duration::from_secs(120));
         if let Some(reference) = &mark {
             let reply = client.call(
                 "store.gc",
@@ -3632,7 +3661,7 @@ impl<'a> SquashCtx<'a> {
         let Some(client) = self.client.as_mut() else {
             anyhow::bail!("daemon unavailable");
         };
-        if method == "diff" {
+        if method == "diff" || method == "checkpoint.create" {
             client.set_timeout(Duration::from_secs(35))?;
         }
         let reply = client.call(method, Some(self.root), params, None)?;
