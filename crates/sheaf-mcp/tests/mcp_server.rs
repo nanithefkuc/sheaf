@@ -204,7 +204,6 @@ fn notifications_are_consumed_silently_and_ordering_holds() {
 
 #[test]
 fn tools_list_exposes_the_documented_tools() {
-
     let f = fixture();
     let mut s = Server::spawn(&f.fake, &f.server_cwd, &[]);
     let reply = s.request("tools/list", json!({}));

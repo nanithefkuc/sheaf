@@ -191,7 +191,6 @@ fn sheaf_at(fx: &Fixture, root: &Path, args: &[&str]) -> (bool, String, String) 
     )
 }
 
-
 fn write_file(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -621,7 +620,12 @@ fn worktree_list_human_marks_primary_and_shows_linked_tips() {
     // daemon is watching the new physical worktree.
     let (ok, add_out, err) = sheaf(
         &fx,
-        &["worktree", "add", "checkpoint:base", linked.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "checkpoint:base",
+            linked.to_str().unwrap(),
+        ],
     );
     assert!(ok, "{err}");
     assert!(
@@ -670,7 +674,12 @@ fn worktree_add_to_existing_destination_fails_clearly() {
 
     let (ok, _, err) = sheaf(
         &fx,
-        &["worktree", "add", "checkpoint:base", occupied.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "checkpoint:base",
+            occupied.to_str().unwrap(),
+        ],
     );
     assert!(!ok, "add over an existing dir must fail");
     assert!(err.contains("already exists"), "{err}");
@@ -690,7 +699,12 @@ fn merge_preview_prints_plan_then_apply_writes_files() {
     let linked = fx._env.base.join("branch");
     let (ok, _, err) = sheaf(
         &fx,
-        &["worktree", "add", "checkpoint:base", linked.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "checkpoint:base",
+            linked.to_str().unwrap(),
+        ],
     );
     assert!(ok, "{err}");
     write_file(&linked, "src/added.rs", "pub fn added() {}\n");
@@ -731,7 +745,12 @@ fn conflicting_merge_lists_conflicts_and_blocks_apply() {
     let linked = fx._env.base.join("branch");
     let (ok, _, err) = sheaf(
         &fx,
-        &["worktree", "add", "checkpoint:base", linked.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "checkpoint:base",
+            linked.to_str().unwrap(),
+        ],
     );
     assert!(ok, "{err}");
 
@@ -758,14 +777,20 @@ fn conflicting_merge_lists_conflicts_and_blocks_apply() {
     let (ok, _, err) = sheaf(&fx, &["merge", &source, "--apply"]);
     assert!(!ok, "conflicting apply must be blocked");
     assert!(err.contains("blocked by 1 conflict"), "{err}");
-    assert_eq!(std::fs::read_to_string(fx.root.join("src/lib.rs")).unwrap(), V3);
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("src/lib.rs")).unwrap(),
+        V3
+    );
 
     // The `--json` apply path emits the machine-readable plan (conflicts and
     // all) and still exits non-zero without touching the worktree.
     let (ok, out, _err) = sheaf(&fx, &["merge", &source, "--apply", "--json"]);
     assert!(!ok, "json apply on conflict must also refuse");
     assert_eq!(json_out(&out)["conflicts"].as_array().unwrap().len(), 1);
-    assert_eq!(std::fs::read_to_string(fx.root.join("src/lib.rs")).unwrap(), V3);
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("src/lib.rs")).unwrap(),
+        V3
+    );
 }
 
 #[test]
@@ -808,7 +833,10 @@ fn worktree_add_resolves_relative_destination_against_cwd() {
         json_out(&out)["worktree"]["path"],
         created.to_string_lossy().as_ref()
     );
-    assert!(created.join(".sheaf").is_file(), "link planted at cwd-relative dest");
+    assert!(
+        created.join(".sheaf").is_file(),
+        "link planted at cwd-relative dest"
+    );
 }
 
 #[test]
@@ -821,5 +849,8 @@ fn merge_with_unknown_source_reports_daemon_error() {
     // No source and no `--resume` is a usage error, not a daemon round-trip.
     let (ok, _, err) = sheaf(&fx, &["merge"]);
     assert!(!ok, "bare merge must fail");
-    assert!(err.contains("needs a source reference or `--resume`"), "{err}");
+    assert!(
+        err.contains("needs a source reference or `--resume`"),
+        "{err}"
+    );
 }

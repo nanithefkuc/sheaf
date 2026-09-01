@@ -99,10 +99,16 @@ fn canonical_new_path(path: &Path) -> Result<PathBuf> {
         )));
     }
     let name = path.file_name().ok_or_else(|| {
-        SheafError::Config(format!("worktree destination {} has no final name", path.display()))
+        SheafError::Config(format!(
+            "worktree destination {} has no final name",
+            path.display()
+        ))
     })?;
     let parent = path.parent().ok_or_else(|| {
-        SheafError::Config(format!("worktree destination {} has no parent", path.display()))
+        SheafError::Config(format!(
+            "worktree destination {} has no parent",
+            path.display()
+        ))
     })?;
     let parent = parent.canonicalize().map_err(|error| {
         SheafError::Config(format!(
@@ -133,7 +139,12 @@ fn worktree_id(frontier: &str, path: &Path) -> String {
     hash.update(b"\0");
     hash.update(path.as_os_str().as_encoded_bytes());
     hash.update(b"\0");
-    hash.update(Utc::now().timestamp_nanos_opt().unwrap_or_default().to_le_bytes());
+    hash.update(
+        Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
     hex::encode(hash.finalize())[..16].to_owned()
 }
 
@@ -181,8 +192,8 @@ impl ProjectStore {
     /// Primary plus every registered physical worktree.
     pub fn worktrees(&self) -> Result<Vec<WorktreeInfo>> {
         let primary_root = self.store_root().to_path_buf();
-        let primary_frontier = read_head_frontier(&primary_root)
-            .unwrap_or_else(|| self.current_frontier());
+        let primary_frontier =
+            read_head_frontier(&primary_root).unwrap_or_else(|| self.current_frontier());
         let primary_capture = decode_frontier(&primary_frontier)
             .ok()
             .and_then(|frontier| super::timeline::capture_id_at(self.doc_ref(), &frontier));
@@ -218,7 +229,9 @@ impl ProjectStore {
         ensure_disjoint(&destination, existing.iter().map(|item| item.path.clone()))?;
 
         let id = worktree_id(&point.frontier, &destination);
-        let parent = destination.parent().expect("canonical destination has parent");
+        let parent = destination
+            .parent()
+            .expect("canonical destination has parent");
         let staging = parent.join(format!(".sheaf-worktree-{id}.tmp"));
         if staging.exists() {
             return Err(SheafError::Config(format!(
@@ -258,7 +271,11 @@ impl ProjectStore {
             fsutil::atomic_write(&head_path, head.to_string().as_bytes())?;
 
             let mut registry = load_registry(self.store_root())?;
-            if registry.worktrees.iter().any(|item| item.id.as_deref() == Some(&id)) {
+            if registry
+                .worktrees
+                .iter()
+                .any(|item| item.id.as_deref() == Some(&id))
+            {
                 return Err(SheafError::StoreCorrupt(format!(
                     "duplicate managed worktree id {id}"
                 )));
@@ -305,7 +322,9 @@ impl ProjectStore {
             return Ok(true);
         }
         let linked = linked_worktrees(self.store_root())?;
-        Ok(linked.into_iter().any(|item| item.path == root && item.present))
+        Ok(linked
+            .into_iter()
+            .any(|item| item.path == root && item.present))
     }
 }
 
@@ -338,7 +357,10 @@ mod tests {
             .unwrap();
 
         let created = store.add_worktree("@", &linked).unwrap();
-        assert_eq!(std::fs::read_to_string(linked.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(
+            std::fs::read_to_string(linked.join("a.txt")).unwrap(),
+            "one\n"
+        );
         assert_eq!(config::store_root(&linked), primary);
         assert_eq!(config::worktree_id(&linked), created.id);
         assert_eq!(store.worktrees().unwrap().len(), 2);
@@ -423,7 +445,10 @@ mod tests {
         assert_eq!(linked_info.id, created.id);
         assert!(primary_info.present && linked_info.present);
         // Each worktree resolves to its own capture, not a shared one.
-        assert_eq!(linked_info.capture_id.as_deref(), Some(linked_capture.as_str()));
+        assert_eq!(
+            linked_info.capture_id.as_deref(),
+            Some(linked_capture.as_str())
+        );
         assert_ne!(primary_info.capture_id, linked_info.capture_id);
 
         // A vanished directory is reported not-present, keeping its registry row.
@@ -508,7 +533,10 @@ mod tests {
 
         store.add_worktree("@", &linked).unwrap();
         assert_eq!(std::fs::read(linked.join("blob.bin")).unwrap(), bytes);
-        let mode = std::fs::metadata(linked.join("run.sh")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(linked.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert!(mode & 0o111 != 0, "exec bit is materialized");
     }
 
@@ -541,7 +569,12 @@ mod tests {
         let leftover: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains("sheaf-worktree"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("sheaf-worktree")
+            })
             .collect();
         assert!(leftover.is_empty(), "staging directory cleaned up");
         // The registry stays empty; a failed add registers nothing.

@@ -416,7 +416,6 @@ enum WorktreeCmd {
     },
 }
 
-
 #[derive(Subcommand)]
 enum CacheCmd {
     /// Index every retained capture's touched paths into the grep cache.
@@ -802,20 +801,13 @@ fn main() -> ExitCode {
             None => cmd_squash(project.as_deref(), range.as_deref(), &git_args, json),
         },
         Cmd::Worktree { command } => match command {
-            WorktreeCmd::List { project, json } => {
-                cmd_worktree_list(project.as_deref(), json)
-            }
+            WorktreeCmd::List { project, json } => cmd_worktree_list(project.as_deref(), json),
             WorktreeCmd::Add {
                 reference,
                 destination,
                 project,
                 json,
-            } => cmd_worktree_add(
-                project.as_deref(),
-                &reference,
-                &destination,
-                json,
-            ),
+            } => cmd_worktree_add(project.as_deref(), &reference, &destination, json),
         },
         Cmd::Merge {
             source,
@@ -823,13 +815,7 @@ fn main() -> ExitCode {
             resume,
             project,
             json,
-        } => cmd_merge(
-            project.as_deref(),
-            source.as_deref(),
-            apply,
-            resume,
-            json,
-        ),
+        } => cmd_merge(project.as_deref(), source.as_deref(), apply, resume, json),
 
         Cmd::Service { command } => match command {
             ServiceCmd::Install { no_start } => cmd_service_install(no_start),
@@ -2151,12 +2137,7 @@ fn daemon_client(feature: &str) -> anyhow::Result<Client> {
 fn cmd_worktree_list(project: Option<&Path>, as_json: bool) -> CliResult {
     let root = timeline_root(project)?;
     let mut client = daemon_client("listing live worktrees")?;
-    let reply = client.call(
-        "worktree.list",
-        Some(&root),
-        serde_json::json!({}),
-        None,
-    )?;
+    let reply = client.call("worktree.list", Some(&root), serde_json::json!({}), None)?;
     if !reply.response.ok {
         return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
     }
@@ -2202,7 +2183,6 @@ fn cmd_worktree_add(
         std::env::current_dir()
             .map_err(anyhow::Error::from)?
             .join(destination)
-
     };
     let mut client = daemon_client("creating a live worktree")?;
     client.set_timeout(Duration::from_secs(120))?;
@@ -2215,22 +2195,19 @@ fn cmd_worktree_add(
             "destination": destination,
         }),
         None,
-
     )?;
     if !reply.response.ok {
         return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
     }
     let result = reply.response.result.unwrap_or_default();
-    let worktree: sheaf_core::store::WorktreeInfo = serde_json::from_value(
-        result.get("worktree").cloned().unwrap_or_default(),
-    )
-    .context("daemon returned invalid worktree")?;
+    let worktree: sheaf_core::store::WorktreeInfo =
+        serde_json::from_value(result.get("worktree").cloned().unwrap_or_default())
+            .context("daemon returned invalid worktree")?;
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
         );
-
     } else {
         let point = worktree
             .capture_id
@@ -2278,13 +2255,7 @@ fn cmd_merge(
     client.set_timeout(Duration::from_secs(120))?;
 
     if resume {
-        let reply = client.call(
-            "merge.resume",
-            Some(&root),
-            serde_json::json!({}),
-            None,
-
-        )?;
+        let reply = client.call("merge.resume", Some(&root), serde_json::json!({}), None)?;
         if !reply.response.ok {
             return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
         }
@@ -2301,7 +2272,6 @@ fn cmd_merge(
                 "{}",
                 serde_json::to_string_pretty(&outcome).map_err(anyhow::Error::from)?
             );
-
         } else {
             println!(
                 "merge resumed: {} written, {} deleted",
@@ -2318,7 +2288,6 @@ fn cmd_merge(
         Some(&root),
         serde_json::json!({"source": source}),
         None,
-
     )?;
     if !reply.response.ok {
         return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
@@ -2337,7 +2306,6 @@ fn cmd_merge(
                 "{}",
                 serde_json::to_string_pretty(&plan).map_err(anyhow::Error::from)?
             );
-
         } else {
             print_merge_plan(&plan);
             if plan.conflicts.is_empty() {
@@ -2354,10 +2322,12 @@ fn cmd_merge(
                 "{}",
                 serde_json::to_string_pretty(&plan).map_err(anyhow::Error::from)?
             );
-
         } else {
             print_merge_plan(&plan);
-            eprintln!("sheaf: merge blocked by {} conflict(s)", plan.conflicts.len());
+            eprintln!(
+                "sheaf: merge blocked by {} conflict(s)",
+                plan.conflicts.len()
+            );
         }
         return Err(ExitErr::SilentCode(EXIT_RESTORE_BLOCKED));
     }
@@ -2366,7 +2336,6 @@ fn cmd_merge(
         Some(&root),
         serde_json::json!({"token": plan.token}),
         None,
-
     )?;
     if !reply.response.ok {
         return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
@@ -2384,7 +2353,6 @@ fn cmd_merge(
             "{}",
             serde_json::to_string_pretty(&outcome).map_err(anyhow::Error::from)?
         );
-
     } else {
         println!(
             "merged {} change(s): {} written, {} deleted",
@@ -2398,7 +2366,6 @@ fn cmd_merge(
     }
     Ok(())
 }
-
 
 // ------------------------------------------------------------------ restore
 
@@ -2467,7 +2434,6 @@ fn cmd_restore(
     if let Some(client) = client.as_mut() {
         client.set_timeout(Duration::from_secs(120))?;
     }
-
 
     let plan: sheaf_core::store::RestorePlan = match client.as_mut() {
         Some(client) => {
@@ -2613,7 +2579,6 @@ fn cmd_fragment_restore(
     if let Some(client) = client.as_mut() {
         client.set_timeout(Duration::from_secs(120))?;
     }
-
 
     let plan: FragmentPlan = match client.as_mut() {
         Some(client) => {

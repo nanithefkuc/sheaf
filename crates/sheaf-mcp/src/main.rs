@@ -181,10 +181,7 @@ fn allow_write() -> bool {
 /// only mutates with `apply=true`; the report is a read.
 fn write_gated(name: &str, args: &Value) -> bool {
     match name {
-        "sheaf_restore_apply"
-        | "sheaf_worktree_add"
-        | "sheaf_merge_apply"
-        | "sheaf_init" => true,
+        "sheaf_restore_apply" | "sheaf_worktree_add" | "sheaf_merge_apply" | "sheaf_init" => true,
 
         "sheaf_gc" => bool_arg(args, "apply"),
         _ => false,
@@ -764,7 +761,6 @@ mod tests {
                 "sheaf_worktree_add",
                 "sheaf_merge_plan",
                 "sheaf_merge_apply",
-
                 "sheaf_doctor",
                 "sheaf_gc",
                 "sheaf_init",
@@ -810,7 +806,6 @@ mod tests {
             "sheaf_gc",
             "sheaf_init",
         ] {
-
             let resp = handle_request("tools/list", json!(3), json!({})).unwrap();
             let desc = resp["result"]["tools"]
                 .as_array()
@@ -1194,7 +1189,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             argv(&cmd),
-            [BIN, "worktree", "add", "checkpoint:x", "/w", "--json", "-C", "/p"]
+            [
+                BIN,
+                "worktree",
+                "add",
+                "checkpoint:x",
+                "/w",
+                "--json",
+                "-C",
+                "/p"
+            ]
         );
 
         let cmd = build("sheaf_merge_plan", json!({"source": "checkpoint:x"}), None).unwrap();
@@ -1206,7 +1210,10 @@ mod tests {
             Some("/p"),
         )
         .unwrap();
-        assert_eq!(argv(&cmd), [BIN, "merge", "@~1", "--apply", "--json", "-C", "/p"]);
+        assert_eq!(
+            argv(&cmd),
+            [BIN, "merge", "@~1", "--apply", "--json", "-C", "/p"]
+        );
     }
 
     #[test]
@@ -1215,10 +1222,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("destination"));
-        assert!(build("sheaf_worktree_add", json!({"destination": "/w"}), None)
-            .unwrap_err()
-            .to_string()
-            .contains("timeline point"));
+        assert!(
+            build("sheaf_worktree_add", json!({"destination": "/w"}), None)
+                .unwrap_err()
+                .to_string()
+                .contains("timeline point")
+        );
         for name in ["sheaf_merge_plan", "sheaf_merge_apply"] {
             let err = build(name, json!({}), None).unwrap_err();
             assert!(err.to_string().contains(name), "{err}");

@@ -29,7 +29,6 @@ mod squash;
 mod timeline;
 mod worktree;
 
-
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -99,7 +98,6 @@ pub use timeline::{
     OriginKind, ResolvedPoint, TimelineReader,
 };
 pub use worktree::{linked_worktrees, WorktreeInfo};
-
 
 use crate::config::{self, sheaf_dir};
 use crate::error::{Result, SheafError};
@@ -579,11 +577,12 @@ impl ProjectStore {
                 self.store_root.display()
             )));
         }
-        let frontier = timeline::read_head_frontier(&root)
-            .ok_or_else(|| SheafError::StoreCorrupt(format!(
+        let frontier = timeline::read_head_frontier(&root).ok_or_else(|| {
+            SheafError::StoreCorrupt(format!(
                 "managed worktree {} has no head state",
                 root.display()
-            )))?;
+            ))
+        })?;
         let frontier = timeline::decode_frontier(&frontier)?;
         if self.doc.frontiers_to_vv(&frontier).is_none() {
             return Err(SheafError::StoreCorrupt(format!(
@@ -1336,7 +1335,6 @@ impl ProjectStore {
         });
         let path = config::worktree_head_path(&self.root);
         fsutil::atomic_write(&path, head.to_string_pretty_or_compact().as_bytes()).map_err(io_err)
-
     }
 
     /// Structural records as currently materialized (`tree_events`).

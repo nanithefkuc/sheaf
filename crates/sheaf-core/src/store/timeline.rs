@@ -53,7 +53,6 @@ pub enum OriginKind {
     FragmentRestore,
     /// A divergent source branch squashed onto the active worktree.
     Merge,
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -77,7 +77,9 @@ fn intent_path(root: &Path) -> PathBuf {
             .parent()
             .expect("managed head has parent")
             .join(format!("{id}.{INTENT_FILE}")),
-        None => crate::config::sheaf_dir(root).join("state").join(INTENT_FILE),
+        None => crate::config::sheaf_dir(root)
+            .join("state")
+            .join(INTENT_FILE),
     }
 }
 
@@ -219,13 +221,25 @@ fn disk_matches(root: &Path, sdir: &Path, path: &str, entry: Option<&Entry>) -> 
     }
 }
 
-fn write_entry_atomic(root: &Path, sdir: &Path, token: &str, index: usize, path: &str, entry: &Entry) -> Result<()> {
+fn write_entry_atomic(
+    root: &Path,
+    sdir: &Path,
+    token: &str,
+    index: usize,
+    path: &str,
+    entry: &Entry,
+) -> Result<()> {
     super::restore::validate_key(path)?;
     let dst = root.join(path);
     let parent = dst.parent().expect("validated path has parent");
     std::fs::create_dir_all(parent)?;
-    if std::fs::symlink_metadata(&dst).is_ok_and(|meta| !meta.file_type().is_file() || meta.file_type().is_symlink()) {
-        return Err(SheafError::RestoreObstructed(format!("{} is not a regular file", dst.display())));
+    if std::fs::symlink_metadata(&dst)
+        .is_ok_and(|meta| !meta.file_type().is_file() || meta.file_type().is_symlink())
+    {
+        return Err(SheafError::RestoreObstructed(format!(
+            "{} is not a regular file",
+            dst.display()
+        )));
     }
     let tmp = parent.join(format!(".sheaf-merge-{}-{index}.tmp", &token[..12]));
     let mut output = std::fs::File::create(&tmp)?;
@@ -268,7 +282,11 @@ impl ProjectStore {
     pub fn plan_merge(&self, source_reference: &str) -> Result<MergePlan> {
         let source = self.resolve(source_reference)?;
         let target_frontier = self.materialized_frontiers();
-        merge_plan_between(self.doc_ref(), source, point(self.doc_ref(), &target_frontier))
+        merge_plan_between(
+            self.doc_ref(),
+            source,
+            point(self.doc_ref(), &target_frontier),
+        )
     }
 
     fn write_merge_intent(&self, plan: &MergePlan) -> Result<()> {
@@ -283,14 +301,27 @@ impl ProjectStore {
         Ok(())
     }
 
-    fn apply_merge_files(&self, plan: &MergePlan) -> Result<(BTreeMap<String, Entry>, BTreeMap<String, Entry>)> {
+    fn apply_merge_files(
+        &self,
+        plan: &MergePlan,
+    ) -> Result<(BTreeMap<String, Entry>, BTreeMap<String, Entry>)> {
         let source_frontier = decode_frontier(&plan.source.frontier)?;
         let target_frontier = decode_frontier(&plan.target.frontier)?;
         let source_entries = entries_at(self.doc_ref(), &source_frontier)?;
         let target_entries = entries_at(self.doc_ref(), &target_frontier)?;
         for action in &plan.actions {
-            let disk_is_target = disk_matches(self.root(), &self.sdir, &action.path, target_entries.get(&action.path))?;
-            let disk_is_result = disk_matches(self.root(), &self.sdir, &action.path, source_entries.get(&action.path))?;
+            let disk_is_target = disk_matches(
+                self.root(),
+                &self.sdir,
+                &action.path,
+                target_entries.get(&action.path),
+            )?;
+            let disk_is_result = disk_matches(
+                self.root(),
+                &self.sdir,
+                &action.path,
+                source_entries.get(&action.path),
+            )?;
             if !disk_is_target && !disk_is_result {
                 return Err(SheafError::TimelineMergeConflict(format!(
                     "{} changed after merge planning",
@@ -298,7 +329,11 @@ impl ProjectStore {
                 )));
             }
         }
-        for action in plan.actions.iter().filter(|action| action.kind == ActionKind::Delete) {
+        for action in plan
+            .actions
+            .iter()
+            .filter(|action| action.kind == ActionKind::Delete)
+        {
             let path = self.root().join(&action.path);
             match std::fs::remove_file(&path) {
                 Ok(()) => fsutil::sync_parent_dir(&path)?,
@@ -316,7 +351,14 @@ impl ProjectStore {
                 SheafError::StoreCorrupt(format!("merge source lost {}", action.path))
             })?;
             if !disk_matches(self.root(), &self.sdir, &action.path, Some(entry))? {
-                write_entry_atomic(self.root(), &self.sdir, &plan.token, index, &action.path, entry)?;
+                write_entry_atomic(
+                    self.root(),
+                    &self.sdir,
+                    &plan.token,
+                    index,
+                    &action.path,
+                    entry,
+                )?;
             }
         }
         Ok((target_entries, source_entries))
@@ -390,7 +432,11 @@ impl ProjectStore {
             Some(CaptureOrigin {
                 kind: OriginKind::Merge,
                 target: plan.source.capture_id.clone(),
-                scope: plan.actions.iter().map(|action| action.path.clone()).collect(),
+                scope: plan
+                    .actions
+                    .iter()
+                    .map(|action| action.path.clone())
+                    .collect(),
                 selections: Vec::new(),
             }),
         )?;
@@ -495,13 +541,7 @@ mod tests {
             .id
     }
 
-    fn branched_store() -> (
-        tempfile::TempDir,
-        ProjectStore,
-        PathBuf,
-        PathBuf,
-        String,
-    ) {
+    fn branched_store() -> (tempfile::TempDir, ProjectStore, PathBuf, PathBuf, String) {
         let tmp = tempfile::tempdir().unwrap();
         let primary = tmp.path().join("primary");
         let linked = tmp.path().join("linked");
@@ -544,7 +584,9 @@ mod tests {
             "target\n"
         );
         assert!(outcome.capture_id.is_some());
-        let capture = store.capture_info(outcome.capture_id.as_deref().unwrap()).unwrap();
+        let capture = store
+            .capture_info(outcome.capture_id.as_deref().unwrap())
+            .unwrap();
         assert_eq!(
             capture.capture.origin.as_ref().map(|origin| origin.kind),
             Some(OriginKind::Merge)
@@ -599,7 +641,10 @@ mod tests {
         assert_ne!(plan.base.frontier, plan.source.frontier);
         assert_ne!(plan.base.frontier, plan.target.frontier);
         assert_ne!(plan.source.frontier, plan.target.frontier);
-        assert_eq!(plan.source.frontier, store.resolve(&source).unwrap().frontier);
+        assert_eq!(
+            plan.source.frontier,
+            store.resolve(&source).unwrap().frontier
+        );
         assert_eq!(plan.target.frontier, store.resolve("@").unwrap().frontier);
         // base.txt and target.txt are both source-side unchanged.
         assert_eq!(plan.unchanged, 2);
@@ -782,7 +827,10 @@ mod tests {
         store.activate_worktree(&primary).unwrap();
 
         let plan = store.plan_merge(&source).unwrap();
-        assert!(plan.actions.iter().any(|action| action.path == "run.sh" && action.exec));
+        assert!(plan
+            .actions
+            .iter()
+            .any(|action| action.path == "run.sh" && action.exec));
         store.apply_merge(&plan, &IgnoreSet::empty()).unwrap();
         let mode = std::fs::metadata(primary.join("run.sh"))
             .unwrap()

@@ -58,7 +58,6 @@ pub enum SheafError {
     #[error("timeline merge conflict: {0}")]
     TimelineMergeConflict(String),
 
-
     #[error("{0}")]
     Other(String),
 }
@@ -144,10 +143,7 @@ mod tests {
                 SheafError::RestoreObstructed("busy".into()),
                 "restore.obstructed",
             ),
-            (
-                SheafError::MergePlanStale("old".into()),
-                "merge.plan_stale",
-            ),
+            (SheafError::MergePlanStale("old".into()), "merge.plan_stale"),
             (
                 SheafError::TimelineMergeConflict("both changed".into()),
                 "merge.conflict",

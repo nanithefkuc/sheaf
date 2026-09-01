@@ -52,7 +52,6 @@ fn restore_intent_path(root: &Path) -> PathBuf {
     }
 }
 
-
 // --------------------------------------------------------------- state view
 
 /// The content half of one tracked path's state at some point in history.
@@ -579,7 +578,6 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 pub(super) fn validate_key(key: &str) -> Result<()> {
-
     let bad = key.is_empty()
         || key.starts_with('/')
         || key.split('/').any(|c| c == ".." || c == ".")
@@ -2475,10 +2473,10 @@ mod tests {
         flush(&mut store, &root, vec![touched(&root, "a.txt")]);
 
         // Materialize a linked worktree sharing this store.
-        let linked = root
-            .parent()
-            .unwrap()
-            .join(format!("{}-linked", root.file_name().unwrap().to_string_lossy()));
+        let linked = root.parent().unwrap().join(format!(
+            "{}-linked",
+            root.file_name().unwrap().to_string_lossy()
+        ));
         store.add_worktree("@", &linked).unwrap();
 
         // A plan is enough to author an intent; the on-disk path is the contract.

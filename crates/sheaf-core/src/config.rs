@@ -31,7 +31,6 @@ pub const SHEAF_DIR_NAME: &str = ".sheaf";
 /// Format version of the lightweight `.sheaf` link file in managed worktrees.
 pub const WORKTREE_LINK_VERSION: u32 = 1;
 
-
 /// Debounce and buffering knobs that govern how filesystem activity is
 /// coalesced into captured batches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +99,6 @@ pub fn default_patterns() -> Vec<String> {
     vec![
         ".sheaf/".into(),
         ".sheaf".into(), // managed worktrees carry a link file, not a store directory
-
         ".git/".into(),
         "node_modules/".into(),
         "target/".into(),
@@ -298,13 +296,11 @@ pub fn write_worktree_link(root: &Path, link: &WorktreeLink) -> Result<()> {
     Ok(())
 }
 
-
 /// `<root>/.sheaf` for a primary worktree, or the shared store directory
 /// named by a managed worktree's `.sheaf` link file.
 pub fn sheaf_dir(root: &Path) -> PathBuf {
     store_root(root).join(SHEAF_DIR_NAME)
 }
-
 
 /// Path to the retired legacy `FORMAT_VERSION` marker, `<root>/.sheaf/FORMAT_VERSION`.
 pub fn format_file_path(root: &Path) -> PathBuf {
