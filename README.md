@@ -61,9 +61,12 @@ and forward through your work at any time.
   resolved.
 - **Checkpoints** - create meaningful restore points for branching or 
   semantically indicating a new phase.
-- **Respects ignore rules** - anything git ignores — `.gitignore` files,
-  `.git/info/exclude`, and the global git ignore — is automatically ignored
-  by Sheaf too, and rule edits apply without restarting the daemon.
+- **Classifies instead of ignores** - anything git ignores — `.gitignore`
+  files, `.git/info/exclude`, and the global git ignore — plus editor
+  swap/temp litter is classified *volatile*: kept out of the timeline but
+  mirrored into a bounded recovery ring, so `sheaf recover <path>` brings
+  back the bytes git never tracked. Rule edits apply without restarting
+  the daemon.
 
 ## Requirements
 
@@ -370,7 +373,8 @@ includes:
 - **Platform Support:** Future support for MacOS and Windows.
 
 <sub>
-    *macOS and Windows support are future work. On Linux, ignore rules
-    (`.gitignore`, `.git/info/exclude`, and git's global ignore, plus
-    Sheaf's own patterns) apply to what gets recorded.
+    *macOS and Windows support are future work. On Linux, classification
+    (`.gitignore`, `.git/info/exclude`, git's global ignore, plus
+    `[classify] volatile` patterns) decides what is durable history, what
+    is ring-buffered volatile state, and what is never observed.
 </sub>

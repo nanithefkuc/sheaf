@@ -81,20 +81,39 @@ impl Default for WatchConfig {
     }
 }
 
-/// The project's configured ignore patterns, unioned at runtime with the
-/// project's own `.gitignore` files.
+/// Legacy ignore patterns, retained for configs written by older builds.
+/// Read by the classifier as extra VOLATILE patterns, unioned on top of
+/// `[classify] volatile`; the hard core (`.sheaf/`, `.git/`) is built in.
+/// Defaults to EMPTY — the volatile tier's defaults live in
+/// `[classify] volatile` so no list is maintained twice, and an empty list
+/// serializes to nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IgnoreConfig {
     /// gitignore-subset patterns:
     /// trailing `/` → directory name at any depth; wildcard patterns are
     /// globbed against root-relative paths; bare names match any component.
-    #[serde(default = "default_patterns")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
 }
 
-/// The built-in ignore patterns every new project starts with: the store
-/// and VCS dirs, the common heavy build trees, and editor swap/backup/temp
-/// litter (suffix globs matched against every path segment).
+impl IgnoreConfig {
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+}
+
+impl Default for IgnoreConfig {
+    fn default() -> Self {
+        IgnoreConfig {
+            patterns: Vec::new(),
+        }
+    }
+}
+
+/// The ignore list older builds wrote into `[ignore] patterns` (and the
+/// default a missing section used to expand to). Retained for reference and
+/// test fixtures; the live volatile tier is `[classify] volatile` plus the
+/// hard core built into the classifier.
 pub fn default_patterns() -> Vec<String> {
     vec![
         ".sheaf/".into(),
@@ -124,10 +143,105 @@ pub fn default_patterns() -> Vec<String> {
     ]
 }
 
-impl Default for IgnoreConfig {
+/// Path-classification knobs: what the watcher treats as volatile
+/// (observed, ring-buffered, never captured) versus durable work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifyConfig {
+    /// Honor the repository's own ignore rule sources (`.gitignore`
+    /// files, `.git/info/exclude`) as volatile classification. Git's
+    /// answer to "what is not source" is the one the ecosystem already
+    /// maintains; sheaf follows it by default.
+    #[serde(default = "default_classify_gitignore")]
+    pub gitignore: bool,
+    /// Extra volatile patterns, same grammar as `[ignore] patterns`.
+    /// An explicit list replaces the defaults (write the ones you want
+    /// to keep); `[ignore] patterns` still unions on top.
+    #[serde(default = "default_volatile_patterns")]
+    pub volatile: Vec<String>,
+    /// Durable overrides: paths matching these are captured as ordinary
+    /// work even when a volatile pattern (or `.gitignore`) matched.
+    /// Nothing overrides the hard core (`.sheaf/`, `.git/`).
+    #[serde(default)]
+    pub durable: Vec<String>,
+}
+
+fn default_classify_gitignore() -> bool {
+    true
+}
+
+/// The volatile tier every new project starts with: the common heavy
+/// regenerable trees and editor swap/backup/temp litter. The hard core
+/// (`.sheaf/`, `.git/`) is NOT here — it is built into the classifier and
+/// cannot be configured away.
+pub fn default_volatile_patterns() -> Vec<String> {
+    vec![
+        "node_modules/".into(),
+        "target/".into(),
+        // Editor swap/backup/atomic-save litter — the files `sheaf recover`
+        // exists for. Suffix globs match at any depth.
+        "*.swp".into(),
+        "*.swo".into(),
+        "*.swn".into(),
+        "*~".into(),
+        "*.bak".into(),
+        "*.tmp".into(),
+        "*.orig".into(),
+    ]
+}
+
+impl Default for ClassifyConfig {
     fn default() -> Self {
-        IgnoreConfig {
-            patterns: default_patterns(),
+        ClassifyConfig {
+            gitignore: default_classify_gitignore(),
+            volatile: default_volatile_patterns(),
+            durable: Vec::new(),
+        }
+    }
+}
+
+/// Scratch-ring knobs: the bounded best-effort recovery net for volatile
+/// paths. The ring is NOT part of the timeline — no captures, no journal
+/// frames, invisible to gc — it is a fixed-size circular buffer of recent
+/// volatile-file snapshots under `.sheaf/scratch/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchConfig {
+    /// Record volatile paths at all. Off restores the old behavior:
+    /// volatile paths are classified but not recoverable.
+    #[serde(default = "default_scratch_enabled")]
+    pub enabled: bool,
+    /// Total ring bound. Oldest segments are deleted once exceeded.
+    #[serde(default = "default_scratch_max_bytes")]
+    pub max_bytes: u64,
+    /// Per-file content cap. Larger volatile files record metadata (and a
+    /// truncated head) only — regenerable artifacts need no full copies.
+    #[serde(default = "default_scratch_file_bytes")]
+    pub max_file_bytes: u64,
+    /// Longest gap between ring flushes when only volatile paths are
+    /// changing. Durable activity flushes the ring immediately.
+    #[serde(default = "default_scratch_flush_ms")]
+    pub flush_ms: u64,
+}
+
+fn default_scratch_enabled() -> bool {
+    true
+}
+fn default_scratch_max_bytes() -> u64 {
+    crate::scratch::DEFAULT_MAX_BYTES
+}
+fn default_scratch_file_bytes() -> u64 {
+    crate::scratch::DEFAULT_FILE_BYTES
+}
+fn default_scratch_flush_ms() -> u64 {
+    crate::scratch::DEFAULT_FLUSH_MS
+}
+
+impl Default for ScratchConfig {
+    fn default() -> Self {
+        ScratchConfig {
+            enabled: default_scratch_enabled(),
+            max_bytes: default_scratch_max_bytes(),
+            max_file_bytes: default_scratch_file_bytes(),
+            flush_ms: default_scratch_flush_ms(),
         }
     }
 }
@@ -218,7 +332,7 @@ pub struct ProjectConfig {
     pub format_version: u32,
     #[serde(default)]
     pub watch: WatchConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IgnoreConfig::is_empty")]
     pub ignore: IgnoreConfig,
     #[serde(default)]
     pub restore: RestoreConfig,
@@ -230,6 +344,10 @@ pub struct ProjectConfig {
     /// here on its next restart (or a lazy store's next cold open).
     #[serde(default)]
     pub store: crate::store::StoreLimits,
+    #[serde(default)]
+    pub classify: ClassifyConfig,
+    #[serde(default)]
+    pub scratch: ScratchConfig,
 }
 
 fn default_format_version() -> u32 {
@@ -364,6 +482,12 @@ pub fn load(root: &Path) -> Result<ProjectConfig> {
 pub fn render_default() -> String {
     let cfg = ProjectConfig {
         format_version: STORE_FORMAT_VERSION,
+        // New projects classify through `[classify]` (plus the repository's
+        // gitignore rules); the legacy `[ignore]` section starts empty and
+        // is omitted so no pattern list is maintained twice.
+        ignore: IgnoreConfig {
+            patterns: Vec::new(),
+        },
         ..Default::default()
     };
     toml::to_string_pretty(&cfg).expect("default config serializes")
@@ -424,13 +548,22 @@ mod tests {
         assert_eq!(cfg.format_version, STORE_FORMAT_VERSION);
         assert_eq!(cfg.watch.debounce_ms, 300);
         assert_eq!(cfg.watch.max_tracked_bytes, DEFAULT_MAX_TRACKED_BYTES);
-        assert!(cfg.ignore.patterns.contains(&".git/".to_string()));
+        // Classification owns the tiers now: no `[ignore]` section is
+        // written and the volatile defaults live under `[classify]`.
+        assert!(cfg.ignore.patterns.is_empty());
+        assert!(cfg.classify.gitignore);
+        assert!(cfg.classify.volatile.contains(&"*.swp".to_string()));
+        assert!(!cfg.classify.volatile.contains(&".git/".to_string()));
+        assert!(cfg.scratch.enabled);
+        assert_eq!(cfg.scratch.max_bytes, crate::scratch::DEFAULT_MAX_BYTES);
         assert!(cfg.retention.expiry.is_none());
-        // The rendered skeleton exposes the store cadence section so the
-        // knobs are discoverable in every new project's config.
+        // The rendered skeleton exposes every section so the knobs are
+        // discoverable in each new project's config.
         let rendered = render_default();
         assert!(rendered.contains("[store]"));
-        assert!(rendered.contains("snapshot_edit_size = 512"));
+        assert!(rendered.contains("[classify]"));
+        assert!(rendered.contains("[scratch]"));
+        assert!(!rendered.contains("[ignore]"));
     }
 
     #[test]

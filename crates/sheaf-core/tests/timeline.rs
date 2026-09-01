@@ -196,11 +196,7 @@ fn checkpoint_listing_is_chronological_not_alphabetical() {
     capture(&mut store, root, "f.txt", "new", 1_700_000_001_100);
     store.create_checkpoint("aaa-newer", None).unwrap();
 
-    let names: Vec<_> = store
-        .checkpoints()
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
+    let names: Vec<_> = store.checkpoints().into_iter().map(|c| c.name).collect();
     assert_eq!(names, vec!["aaa-newer", "zzz-older"]);
 }
 

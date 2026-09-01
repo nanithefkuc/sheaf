@@ -37,12 +37,12 @@ const POLL_IDLE_MS: libc::c_int = 250;
 /// mostly caps truth-latency of differing-name splits, not pairing odds.
 const COOKIE_TTL: Duration = Duration::from_millis(750);
 
-/// The Linux inotify watch backend for one project root, carrying the ignore
-/// set it filters emitted events against.
+/// The Linux inotify watch backend for one project root, carrying the
+/// classifier it filters emitted events against.
 #[derive(Debug)]
 pub struct InotifySource {
     root: PathBuf,
-    ignores: crate::watcher::SharedIgnores,
+    classifier: crate::watcher::SharedClassifier,
 }
 
 const WATCH_MASK: WatchMask = WatchMask::CREATE
@@ -57,20 +57,20 @@ const WATCH_MASK: WatchMask = WatchMask::CREATE
 
 impl InotifySource {
     /// Construct a backend rooted at `root`, failing if it is not a directory.
-    pub fn new(root: PathBuf, ignores: crate::watcher::SharedIgnores) -> Result<Self> {
+    pub fn new(root: PathBuf, classifier: crate::watcher::SharedClassifier) -> Result<Self> {
         if !root.is_dir() {
             return Err(SheafError::WatchInit {
                 message: "project root missing or not a directory".into(),
                 root,
             });
         }
-        Ok(InotifySource { root, ignores })
+        Ok(InotifySource { root, classifier })
     }
 }
 
 struct RunState {
     root: PathBuf,
-    ignores: crate::watcher::SharedIgnores,
+    classifier: crate::watcher::SharedClassifier,
     ino: Inotify,
     tx: Sender<FsEvent>,
     /// watch descriptor -> absolute watched directory
@@ -79,7 +79,7 @@ struct RunState {
     pending_moves: HashMap<u32, (PathBuf, Instant)>,
     /// Directories whose inhabitants need reporting once the current kernel
     /// batch finishes draining. Deferral matters: a MOVED_FROM sitting later
-    /// in the SAME batch as the CREATE of the destination directory is the
+    /// in the SAME batch as the destination directory's CREATE is the
     /// cross-watch rename race, and claiming it requires pending_moves to be
     /// fully populated first.
     pending_sweeps: Vec<PathBuf>,
@@ -87,8 +87,15 @@ struct RunState {
 
 impl RunState {
     fn add_watch(&mut self, dir: &Path) {
+        // Registration descends into DURABLE directories only: volatile
+        // subtrees (build trees, vendored deps) stay dark exactly as they
+        // were under plain ignore — no watch descriptors spent on them.
+        // Volatile FILES living in watched (durable) directories still
+        // surface through their parent's watch.
         if let Ok(rel) = dir.strip_prefix(&self.root) {
-            if !rel.as_os_str().is_empty() && self.ignores.read().unwrap().is_ignored_rel(rel) {
+            if !rel.as_os_str().is_empty()
+                && self.classifier.read().classify_rel(rel) != crate::classify::PathClass::Durable
+            {
                 return;
             }
         }
@@ -114,13 +121,16 @@ impl RunState {
     fn register_tree_at(&mut self, base: &Path) {
         // Phase 1: collect registration targets under a read-only borrow.
         let targets: Vec<PathBuf> = {
-            let ig = self.ignores.read().unwrap().clone();
+            let classifier = self.classifier.read().clone();
             let root = self.root.clone();
             WalkDir::new(base)
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(move |e| match e.path().strip_prefix(&root) {
-                    Ok(rel) => e.depth() == 0 || !ig.is_ignored_rel(rel),
+                    Ok(rel) => {
+                        e.depth() == 0
+                            || classifier.classify_rel(rel) == crate::classify::PathClass::Durable
+                    }
                     Err(_) => false,
                 })
                 .filter_map(|e| e.ok())
@@ -144,7 +154,7 @@ impl RunState {
     /// delete-plus-create.
     fn sweep_report(&mut self, base: &Path) {
         let discovered: Vec<PathBuf> = {
-            let ig = self.ignores.read().unwrap().clone();
+            let classifier = self.classifier.read().clone();
             let root = self.root.clone();
             let base_owned = base.to_path_buf();
             WalkDir::new(base)
@@ -152,9 +162,16 @@ impl RunState {
                 .into_iter()
                 // NOTE: filter_entry prunes whole subtrees on false, so do
                 // NOT gate on depth here — the base itself must pass or
-                // nothing beneath it is ever visited.
+                // nothing beneath it is ever visited. Sweeps report DURABLE
+                // paths only, matching registration: a freshly created
+                // volatile subtree (target/, node_modules/) announces one
+                // structural event from its parent and then stays dark —
+                // its interior is the ring's non-business.
                 .filter_entry(move |e| match e.path().strip_prefix(&root) {
-                    Ok(rel) => rel.as_os_str().is_empty() || !ig.is_ignored_rel(rel),
+                    Ok(rel) => {
+                        rel.as_os_str().is_empty()
+                            || classifier.classify_rel(rel) == crate::classify::PathClass::Durable
+                    }
                     Err(_) => false,
                 })
                 .filter_map(|e| e.ok())
@@ -222,8 +239,26 @@ impl RunState {
         self.dirs.retain(|_, p| !p.starts_with(dir));
     }
 
-    /// Emit one event through ignore filtering. Receiver-gone (shutdown)
-    /// silently drops — correct behavior, not an error.
+    /// True when `dir` classifies as durable work: only then is it worth
+    /// registering (and sweep-reporting) — a freshly created volatile
+    /// subtree announces itself with one event from its parent and stays
+    /// dark, spending no watch descriptors and no walks.
+    fn dir_is_durable(&self, dir: &Path) -> bool {
+        match dir.strip_prefix(&self.root) {
+            Ok(rel) => {
+                rel.as_os_str().is_empty()
+                    || self.classifier.read().classify_rel(rel)
+                        == crate::classify::PathClass::Durable
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Emit one event through classification. `Never` paths are dropped
+    /// (the watcher never observes its own store or `.git`); `Volatile`
+    /// paths flow — the OWNER routes them to the recovery ring, not the
+    /// timeline. Receiver-gone (shutdown) silently drops — correct
+    /// behavior, not an error.
     fn emit(&mut self, kind: EventKind) {
         let probe: &Path = match &kind {
             EventKind::Added { path } => path,
@@ -232,7 +267,9 @@ impl RunState {
             EventKind::Touched { path } => &path.0,
         };
         if let Ok(rel) = probe.strip_prefix(&self.root) {
-            if self.ignores.read().unwrap().is_ignored_rel(rel) {
+            if !rel.as_os_str().is_empty()
+                && self.classifier.read().classify_rel(rel) == crate::classify::PathClass::Never
+            {
                 return;
             }
         }
@@ -279,7 +316,7 @@ impl RunState {
             } else {
                 self.emit(EventKind::Added { path: path.clone() });
             }
-            if path.is_dir() {
+            if path.is_dir() && self.dir_is_durable(&path) {
                 // Moved-in subtree: interior was never watched at its old
                 // location relative to us — sweep its real contents in.
                 self.register_tree_at(&path);
@@ -288,7 +325,7 @@ impl RunState {
         } else if mask.contains(EventMask::CREATE) {
             let is_dir = path.is_dir();
             self.emit(EventKind::Added { path: path.clone() });
-            if is_dir {
+            if is_dir && self.dir_is_durable(&path) {
                 self.register_tree_at(&path);
                 self.pending_sweeps.push(path);
             }
@@ -337,7 +374,7 @@ impl crate::watcher::WatchBackend for InotifySource {
 
         let mut st = RunState {
             root: self.root.clone(),
-            ignores: self.ignores.clone(),
+            classifier: self.classifier.clone(),
             ino,
             tx,
             dirs: HashMap::new(),
@@ -452,14 +489,14 @@ mod tests {
 
     fn state(
         root: &Path,
-        ignores: crate::watcher::SharedIgnores,
+        classifier: crate::watcher::SharedClassifier,
     ) -> (RunState, std::sync::mpsc::Receiver<FsEvent>) {
         let (tx, rx) = channel();
         let ino = Inotify::init().unwrap();
         (
             RunState {
                 root: root.to_path_buf(),
-                ignores,
+                classifier,
                 ino,
                 tx,
                 dirs: HashMap::new(),
@@ -470,9 +507,9 @@ mod tests {
         )
     }
 
-    fn shared(patterns: &[&str]) -> crate::watcher::SharedIgnores {
-        crate::watcher::shared_ignores(
-            crate::ignore::IgnoreSet::from_patterns(
+    fn shared(patterns: &[&str]) -> crate::watcher::SharedClassifier {
+        crate::watcher::shared_classifier(
+            crate::classify::Classifier::from_volatile_patterns(
                 &patterns.iter().map(|p| (*p).into()).collect::<Vec<_>>(),
             )
             .unwrap(),
@@ -549,9 +586,23 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::Touched { .. })));
-        assert!(!events
-            .iter()
-            .any(|e| e.path().starts_with(root.join("ignored"))));
+        // Volatile paths in a WATCHED directory flow to the owner (the
+        // daemon routes them to the recovery ring); only Never paths are
+        // dropped at the source.
+        assert!(events.iter().any(|e| e.path() == root.join("ignored")));
+        st.handle_event(
+            root.to_path_buf(),
+            Some(".sheaf/never.txt".into()),
+            EventMask::CREATE,
+            0,
+        );
+        let after: Vec<_> = rx.try_iter().collect();
+        assert!(
+            !after
+                .iter()
+                .any(|e| e.path().starts_with(root.join(".sheaf"))),
+            "Never paths must never be reported: {after:?}"
+        );
     }
 
     #[test]

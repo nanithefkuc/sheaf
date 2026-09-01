@@ -254,9 +254,8 @@ impl Client {
                         }
                     } else {
                         for _ in 0..info.chunks {
-                            let chunk = read_frame(&mut self.stream, MAX_CHUNK).map_err(|e| {
-                                SheafError::Ipc(format!("read body chunk: {e}"))
-                            })?;
+                            let chunk = read_frame(&mut self.stream, MAX_CHUNK)
+                                .map_err(|e| SheafError::Ipc(format!("read body chunk: {e}")))?;
                             body_out.extend_from_slice(&chunk);
                         }
                     }
@@ -295,9 +294,8 @@ impl Client {
                         }
                     } else {
                         for _ in 0..info.chunks {
-                            let chunk = read_frame(&mut self.stream, MAX_CHUNK).map_err(|e| {
-                                SheafError::Ipc(format!("read body chunk: {e}"))
-                            })?;
+                            let chunk = read_frame(&mut self.stream, MAX_CHUNK)
+                                .map_err(|e| SheafError::Ipc(format!("read body chunk: {e}")))?;
                             on_chunk(&chunk);
                             body_out.extend_from_slice(&chunk);
                         }

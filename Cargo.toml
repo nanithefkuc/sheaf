@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 inotify = "0.10"
 walkdir = "2"
 globset = "0.4"
+parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
 signal-hook = "0.3"

@@ -20,29 +20,33 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use super::{StopFlag, Watch, WatchBackend};
+use crate::classify::Classifier;
 use crate::events::{EventKind, FsEvent};
-use crate::ignore::IgnoreSet;
 
 /// How long any single scenario waits for its evidence before failing.
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Factory: construct a fresh backend rooted at `root` honoring `ignores`.
+/// A volatile canary the suite relies on: files matching it live in watched
+/// (durable) directories, so their events MUST flow to the owner.
+pub const VOLATILE_CANARY: &str = "conf-noise-*.log";
+
+/// Factory: construct a fresh backend rooted at `root` honoring `classifier`.
 pub type BackendFactory<'a> =
-    dyn FnMut(&Path, IgnoreSet) -> anyhow::Result<Box<dyn WatchBackend>> + 'a;
+    dyn FnMut(&Path, Classifier) -> anyhow::Result<Box<dyn WatchBackend>> + 'a;
 
 /// Run every scenario against a backend produced by `factory`. Panics with a
 /// named scenario on the first violation — this is a test suite, not a
 /// library API.
-pub fn run_suite(factory: &mut BackendFactory, root: &Path, ignores: IgnoreSet) {
-    let backend = factory(root, ignores.clone())
+pub fn run_suite(factory: &mut BackendFactory, root: &Path, classifier: Classifier) {
+    let backend = factory(root, classifier.clone())
         .unwrap_or_else(|e| panic!("factory failed to construct a backend: {e}"));
     scenario_stop_responsiveness(backend);
 
-    let backend = factory(root, ignores.clone())
+    let backend = factory(root, classifier.clone())
         .unwrap_or_else(|e| panic!("factory failed to construct a backend: {e}"));
-    scenario_basic_lifecycle(backend, root);
+    scenario_basic_lifecycle(backend, root, &classifier);
 
-    let backend = factory(root, ignores)
+    let backend = factory(root, classifier)
         .unwrap_or_else(|e| panic!("factory failed to construct a backend: {e}"));
     scenario_new_dir_discovery(backend, root);
 }
@@ -136,10 +140,32 @@ fn scenario_stop_responsiveness(backend: Box<dyn WatchBackend>) {
 
 /// 2. Create → touch → rename → delete all surface, ignored paths stay
 ///    silent, and every path is absolute under root.
-fn scenario_basic_lifecycle(backend: Box<dyn WatchBackend>, root: &Path) {
+fn scenario_basic_lifecycle(backend: Box<dyn WatchBackend>, root: &Path, classifier: &Classifier) {
     let h = Harness::start(backend);
     std::thread::sleep(Duration::from_millis(120)); // let baseline settle
 
+    // Volatile files in watched directories FLOW — the owner routes them
+    // to the recovery ring. The canary matches VOLATILE_CANARY.
+    let noisy = h.rel("conf-noise-7.log");
+    std::fs::write(&noisy, "ring fodder").expect("write volatile canary");
+    h.wait_for(
+        |ev| {
+            matches!(&ev.kind, EventKind::Added { path } if path == &noisy)
+                || matches!(&ev.kind, EventKind::Touched { path } if path.0 == noisy)
+        },
+        SCENARIO_TIMEOUT,
+    );
+    assert_eq!(
+        classifier.classify_rel(std::path::Path::new("conf-noise-7.log")),
+        crate::classify::PathClass::Volatile,
+        "suite canary must actually be volatile in the passed classifier"
+    );
+
+    // Never paths are silent even though the root itself is watched.
+    let store_dir = root.join(".sheaf");
+    std::fs::create_dir_all(&store_dir).expect("mkdir .sheaf");
+    std::fs::write(store_dir.join("never.txt"), "self-observation").expect("write never");
+    std::thread::sleep(Duration::from_millis(300));
     let a = h.rel("conf-a.txt");
     std::fs::write(&a, "hello").expect("create a");
     let evs = h.wait_for(
@@ -184,8 +210,13 @@ fn scenario_basic_lifecycle(backend: Box<dyn WatchBackend>, root: &Path) {
             "basic_lifecycle: event path {p:?} escapes the watched root"
         );
         assert!(
-            !p.starts_with(&ignored_dir),
-            "basic_lifecycle: ignored path {p:?} leaked an event ({})",
+            !(p.starts_with(&ignored_dir) && p != ignored_dir),
+            "basic_lifecycle: non-durable subtree leaked an event ({p:?}, {})",
+            kind_name(ev)
+        );
+        assert!(
+            !p.starts_with(&store_dir),
+            "basic_lifecycle: Never path {p:?} leaked an event ({}) — the watcher must never observe the store",
             kind_name(ev)
         );
         // Evidence check: every path the suite created outside ignores was seen.

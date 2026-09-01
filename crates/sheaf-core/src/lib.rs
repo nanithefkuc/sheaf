@@ -2,7 +2,7 @@
 //!
 //! Deliberately sync-only (std threads): every API here is callable from
 //! plain threads; async wiring lives in the binary crates.
-
+pub mod classify;
 pub mod config;
 pub mod debounce;
 pub mod error;
@@ -12,6 +12,7 @@ pub mod init;
 pub mod ipc;
 pub mod paths;
 pub mod registry;
+pub mod scratch;
 pub mod store;
 pub mod watcher;
 

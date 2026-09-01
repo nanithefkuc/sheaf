@@ -9,23 +9,25 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+use sheaf_core::classify::Classifier;
 use sheaf_core::config;
 use sheaf_core::events::FsEvent;
-use sheaf_core::ignore::IgnoreSet;
-use sheaf_core::watcher::{conformance, shared_ignores, InotifySource, StopFlag, WatchBackend};
+use sheaf_core::watcher::{conformance, shared_classifier, InotifySource, StopFlag, WatchBackend};
 
-fn ignores() -> IgnoreSet {
-    // `conf-ignored/` is the suite's canary directory.
-    let mut patterns = config::default_patterns();
+fn classifier() -> Classifier {
+    // `conf-ignored/` is the suite's silent-subtree canary;
+    // `conf-noise-*.log` is its flows-to-owner volatile canary.
+    let mut patterns = config::default_volatile_patterns();
     patterns.push("conf-ignored/".into());
-    IgnoreSet::from_patterns(&patterns).unwrap()
+    patterns.push(conformance::VOLATILE_CANARY.into());
+    Classifier::from_volatile_patterns(&patterns).unwrap()
 }
 
-fn inotify_factory() -> impl FnMut(&Path, IgnoreSet) -> anyhow::Result<Box<dyn WatchBackend>> {
-    |root: &Path, ignores: IgnoreSet| {
+fn inotify_factory() -> impl FnMut(&Path, Classifier) -> anyhow::Result<Box<dyn WatchBackend>> {
+    |root: &Path, classifier: Classifier| {
         Ok(Box::new(InotifySource::new(
             root.to_path_buf(),
-            shared_ignores(ignores),
+            shared_classifier(classifier),
         )?) as Box<dyn WatchBackend>)
     }
 }
@@ -34,7 +36,7 @@ fn inotify_factory() -> impl FnMut(&Path, IgnoreSet) -> anyhow::Result<Box<dyn W
 fn the_real_inotify_backend_satisfies_the_contract() {
     let tmp = tempfile::tempdir().unwrap();
     let mut factory = inotify_factory();
-    conformance::run_suite(&mut factory, tmp.path(), ignores());
+    conformance::run_suite(&mut factory, tmp.path(), classifier());
 }
 
 /// A synthetic backend that emits a scripted, correct event sequence. It
@@ -67,7 +69,6 @@ impl WatchBackend for Loopback {
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -76,10 +77,14 @@ impl WatchBackend for Loopback {
 fn the_conformance_suite_accepts_a_correct_synthetic_backend() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
-    let mut factory = move |r: &Path, _ig: IgnoreSet| {
+    let mut factory = move |r: &Path, _classifier: Classifier| {
         Ok(Box::new(Loopback {
             root: r.to_path_buf(),
             script: vec![
+                // volatile canary in a watched dir: must flow to the owner
+                FsEvent::now(sheaf_core::events::EventKind::Added {
+                    path: root.join("conf-noise-7.log"),
+                }),
                 // create
                 FsEvent::now(sheaf_core::events::EventKind::Added {
                     path: root.join("conf-a.txt"),
@@ -107,5 +112,5 @@ fn the_conformance_suite_accepts_a_correct_synthetic_backend() {
             stop_after: Duration::from_secs(30),
         }) as Box<dyn WatchBackend>)
     };
-    conformance::run_suite(&mut factory, tmp.path(), ignores());
+    conformance::run_suite(&mut factory, tmp.path(), classifier());
 }

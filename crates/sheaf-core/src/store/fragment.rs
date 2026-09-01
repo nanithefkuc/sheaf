@@ -34,7 +34,7 @@ use super::timeline::{decode_frontier, CaptureOrigin, OriginKind, ResolvedPoint}
 use super::{blobs, state_dir, Capture, ProjectStore, TimelineReader};
 use crate::error::{Result, SheafError};
 use crate::events::{Batch, EventKind, FsEvent};
-use crate::ignore::IgnoreSet;
+use crate::ignore::ExcludesRel;
 
 /// Intent file is shared with the whole-tree engine; only its payload differs.
 const INTENT_FILE: &str = "restore.intent";
@@ -829,7 +829,7 @@ impl ProjectStore {
     pub fn apply_fragment_restore(
         &mut self,
         plan: &FragmentPlan,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<RestoreOutcome> {
         self.run_fragment(plan, ignore, false)
     }
@@ -837,7 +837,7 @@ impl ProjectStore {
     fn run_fragment(
         &mut self,
         plan: &FragmentPlan,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
         resumed: bool,
     ) -> Result<RestoreOutcome> {
         if !plan.applicable() {
@@ -1102,7 +1102,7 @@ impl ProjectStore {
     pub(super) fn resume_fragment(
         &mut self,
         intent: &RestoreIntent,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<RestoreOutcome> {
         let Some(plan) = intent.fragment.as_deref() else {
             return Err(SheafError::StoreCorrupt(
@@ -1220,6 +1220,7 @@ fn describe_conflicts(conflicts: &[FragmentConflict]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ignore::IgnoreSet;
 
     fn handle(text: &str, needle: &str) -> SelectionHandle {
         let start = text.find(needle).unwrap();

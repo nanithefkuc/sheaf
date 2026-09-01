@@ -59,10 +59,11 @@ struct TestWatch {
 
 impl TestWatch {
     fn start(root: &Path) -> Self {
-        let ignores = IgnoreSet::from_patterns(&default_patterns()).unwrap();
+        let classifier =
+            sheaf_core::classify::Classifier::from_volatile_patterns(&default_patterns()).unwrap();
         let backend = default_backend(
             root.to_path_buf(),
-            sheaf_core::watcher::shared_ignores(ignores),
+            sheaf_core::watcher::shared_classifier(classifier),
         )
         .expect("backend init");
         let (tx, rx) = channel::<FsEvent>();
@@ -161,7 +162,7 @@ fn newer_store_format_fails_closed() {
 }
 
 #[test]
-fn churn_events_are_structurally_correct_and_ignored_paths_stay_silent() {
+fn churn_events_are_structurally_correct_and_nondurable_subtrees_stay_dark() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
@@ -223,10 +224,11 @@ fn churn_events_are_structurally_correct_and_ignored_paths_stay_silent() {
     assert_eq!(removal_count, 1, "exactly one Removed per delete");
 
     // Explicit pairing assertions for BOTH renames.
-    let all_so_far = snapshot(&w.rx); // leftovers shouldn't matter for asserts below
-    let _ = all_so_far;
-
-    // --- ignored subtrees must stay completely silent ---
+    let _all_so_far = snapshot(&w.rx); // leftovers shouldn't matter for asserts below
+                                       // --- non-durable subtrees stay dark; their dir-create itself flows ---
+                                       // A volatile directory created inside a watched dir surfaces as ONE
+                                       // structural event (the daemon's ring stats it and moves on); nothing
+                                       // BENEATH it may ever surface, because registration never descends.
     std::fs::write(root.join("target/debug/out.bin"), vec![0u8; 64]).unwrap();
     std::fs::write(root.join(".git/config.extra"), b"noise").unwrap();
     let extra = root.join("node_modules");
@@ -236,13 +238,13 @@ fn churn_events_are_structurally_correct_and_ignored_paths_stay_silent() {
     let quiet_check = drive(&w.rx, 700, |acc| !acc.is_empty() || true); // just wait out the window
     let noisy = quiet_check.iter().any(|ev| {
         let p = TestWatch::probe_path(ev);
-        p.starts_with(root.join("target"))
+        (p.starts_with(root.join("target")) && p != root.join("target"))
             || p.starts_with(root.join(".git"))
-            || p.starts_with(&extra)
+            || (p.starts_with(&extra) && p != extra)
     });
     assert!(
         !noisy,
-        "ignored subtrees emitted events: {:?}",
+        "events leaked from non-durable subtrees: {:?}",
         kinds(&quiet_check)
     );
 
@@ -251,13 +253,13 @@ fn churn_events_are_structurally_correct_and_ignored_paths_stay_silent() {
     let tail = snapshot(&w.rx);
     let noisy_tail = tail.iter().any(|ev| {
         let p = TestWatch::probe_path(ev);
-        p.starts_with(root.join("target"))
+        (p.starts_with(root.join("target")) && p != root.join("target"))
             || p.starts_with(root.join(".git"))
-            || p.starts_with(&extra)
+            || (p.starts_with(&extra) && p != extra)
     });
     assert!(
         !noisy_tail,
-        "late-arriving ignored events: {:?}",
+        "late-arriving events from non-durable subtrees: {:?}",
         kinds(&tail)
     );
 }
@@ -290,13 +292,15 @@ fn enrollments_survive_restart_simulation() {
     assert!(ig.is_ignored_rel(Path::new(".git/objects/ab/cd")));
 }
 
-/// A Neovim-style atomic save writes a swap file (`.name.swp`) and a temp file,
-/// then renames the temp over the real file. With the default ignore patterns,
-/// the swap and temp paths must stay completely silent while the real file's
-/// content change is still observed — otherwise every editor save floods the
-/// timeline with transient captures.
+/// A Neovim-style atomic save writes a swap file (`.name.swp`) and a temp
+/// file, then renames the temp over the real file. Under classification
+/// the litter is VOLATILE, not invisible: its events must flow so the
+/// daemon's scratch ring can mirror the last state (that is what makes
+/// `sheaf recover` possible after an editor crash). What must NOT happen
+/// is the timeline capturing them — that is the daemon's routing job and
+/// is pinned by the daemon-level tests.
 #[test]
-fn editor_atomic_save_swap_and_temp_stay_silent() {
+fn editor_atomic_save_litter_flows_for_the_ring() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(root.join("notes.md"), b"v1\n").unwrap();
@@ -312,15 +316,15 @@ fn editor_atomic_save_swap_and_temp_stay_silent() {
     // Swap file removed on save completion.
     std::fs::remove_file(root.join(".notes.md.swp")).unwrap();
 
-    // The real file's update must be observed (as an Added/Touched/Renamed-to
+    // The real file's update must be observed (as Added/Touched/Renamed-to,
     // whichever the backend reports for a rename-over-existing).
     let seen = drive(&w.rx, 5000, |acc| {
         acc.iter()
             .any(|e| TestWatch::probe_path(e).ends_with("notes.md"))
     });
 
-    // No event may reference the swap, backup, or temp litter.
-    let litter_noise: Vec<_> = seen
+    // The litter surfaces too — volatile events flow to the owner.
+    let litter: Vec<_> = seen
         .iter()
         .filter(|e| {
             let p = TestWatch::probe_path(e);
@@ -329,22 +333,8 @@ fn editor_atomic_save_swap_and_temp_stay_silent() {
         })
         .collect();
     assert!(
-        litter_noise.is_empty(),
-        "editor litter leaked into events: {:?}",
+        !litter.is_empty(),
+        "volatile editor litter must reach the owner for the ring: {:?}",
         kinds(&seen)
-    );
-
-    // Grace beat, then confirm no late litter events arrive either.
-    std::thread::sleep(Duration::from_millis(150));
-    let tail = snapshot(&w.rx);
-    let late_litter = tail.iter().any(|e| {
-        let p = TestWatch::probe_path(e);
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        name.ends_with(".swp") || name.ends_with('~') || name.ends_with(".tmp")
-    });
-    assert!(
-        !late_litter,
-        "late editor-litter events: {:?}",
-        kinds(&tail)
     );
 }

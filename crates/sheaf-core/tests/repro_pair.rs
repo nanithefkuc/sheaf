@@ -3,9 +3,9 @@
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
+use sheaf_core::classify::Classifier;
 use sheaf_core::config::default_patterns;
-use sheaf_core::ignore::IgnoreSet;
-use sheaf_core::watcher::{default_backend, new_stop_flag, shared_ignores};
+use sheaf_core::watcher::{default_backend, new_stop_flag, shared_classifier};
 
 #[test]
 fn same_poll_window_mkdir_then_move_in() {
@@ -14,8 +14,8 @@ fn same_poll_window_mkdir_then_move_in() {
 
     std::thread::sleep(Duration::from_millis(50)); // watcher will start below
 
-    let ignores = IgnoreSet::from_patterns(&default_patterns()).unwrap();
-    let backend = default_backend(root.clone(), shared_ignores(ignores)).unwrap();
+    let classifier = Classifier::from_volatile_patterns(&default_patterns()).unwrap();
+    let backend = default_backend(root.clone(), shared_classifier(classifier)).unwrap();
     let (tx, rx) = channel::<sheaf_core::events::FsEvent>();
     let stop = new_stop_flag();
     let stop2 = stop.clone();

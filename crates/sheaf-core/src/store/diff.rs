@@ -29,7 +29,7 @@ use super::restore::{
 use super::timeline::{decode_frontier, resolve_in_doc, ResolvedPoint};
 use super::{ProjectStore, TimelineReader};
 use crate::error::Result;
-use crate::ignore::IgnoreSet;
+use crate::ignore::ExcludesRel;
 
 /// Lines of context around each change region.
 const CONTEXT: usize = 3;
@@ -166,7 +166,7 @@ pub(super) fn compute_diff(
     from_ref: &str,
     to_ref: Option<&str>,
     paths: &[String],
-    ignore: &IgnoreSet,
+    ignore: &dyn ExcludesRel,
 ) -> Result<DiffOutcome> {
     let from_point = resolve_in_doc(doc, ledger, current, from_ref)?;
     let to_point = match to_ref {
@@ -186,7 +186,7 @@ pub(super) fn compute_diff_points(
     from_point: ResolvedPoint,
     to_point: Option<ResolvedPoint>,
     paths: &[String],
-    ignore: &IgnoreSet,
+    ignore: &dyn ExcludesRel,
 ) -> Result<DiffOutcome> {
     let to_frontier = match &to_point {
         Some(point) => Some(decode_frontier(&point.frontier)?),
@@ -387,7 +387,7 @@ impl ProjectStore {
         from_ref: &str,
         to_ref: Option<&str>,
         paths: &[String],
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<DiffOutcome> {
         let current = self.materialized_frontiers();
         compute_diff(
@@ -410,7 +410,7 @@ impl TimelineReader {
         from_ref: &str,
         to_ref: Option<&str>,
         paths: &[String],
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<DiffOutcome> {
         let current = decode_frontier(&self.current_frontier())?;
         let mut outcome = compute_diff(
@@ -433,7 +433,7 @@ impl TimelineReader {
 /// Tracked content of the live non-ignored worktree.
 fn worktree_entries(
     root: &Path,
-    ignore: &IgnoreSet,
+    ignore: &dyn ExcludesRel,
     scope: &[String],
 ) -> Result<BTreeMap<String, Entry>> {
     let mut out = BTreeMap::new();

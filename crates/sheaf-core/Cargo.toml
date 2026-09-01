@@ -22,6 +22,7 @@ tracing.workspace = true
 inotify.workspace = true
 walkdir.workspace = true
 globset.workspace = true
+parking_lot.workspace = true
 chrono.workspace = true
 libc = "0.2"
 loro.workspace = true

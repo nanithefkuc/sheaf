@@ -398,6 +398,33 @@ EXAMPLES:
         #[command(subcommand)]
         command: CacheCmd,
     },
+    /// Bring back a volatile file's bytes from the scratch ring.
+    ///
+    /// Editor swap files, atomic-save temps and other classified-volatile
+    /// litter never enter the timeline; the ring holds their recent
+    /// snapshots so a crash does not have to mean loss. This is the
+    /// explicit way in — timeline history is `sheaf restore`'s job.
+    #[command(after_help = "Examples:
+  sheaf recover notes.md.swp --list        show ring snapshots for a path
+  sheaf recover notes.md.swp               write notes.md.swp.recovered
+  sheaf recover notes.md.swp --pick 1      second-most-recent snapshot
+  sheaf recover notes.md.swp --stdout      dump bytes to stdout")]
+    Recover {
+        /// Root-relative path (as the project sees it) to recover.
+        path: String,
+        /// Project directory (default: nearest ancestor with a store).
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+        /// List the ring's snapshots for the path instead of writing one.
+        #[arg(long)]
+        list: bool,
+        /// Write the recovered bytes to stdout instead of a sibling file.
+        #[arg(long)]
+        stdout: bool,
+        /// Which content snapshot to recover: 0 = latest (default).
+        #[arg(long)]
+        pick: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -908,6 +935,13 @@ fn main() -> ExitCode {
                 cmd_cache_backfill(project.as_deref(), all, true, None, json)
             }
         },
+        Cmd::Recover {
+            path,
+            project,
+            list,
+            stdout,
+            pick,
+        } => cmd_recover(&path, project.as_deref(), list, stdout, pick),
     };
     if color_on {
         print!("\x1b[0m");
@@ -1010,15 +1044,44 @@ fn cmd_status(path: Option<&Path>) -> CliResult {
     );
     if let Some(cfg) = &cfg_ok {
         println!(
-            "watch config:  debounce={}ms ignore-patterns={} tracked-text-limit={}MiB snapshot-every={}",
+            "watch config:  debounce={}ms tracked-text-limit={}MiB snapshot-every={}",
             cfg.watch.debounce_ms,
-            cfg.ignore.patterns.len(),
             cfg.watch.max_tracked_bytes / (1024 * 1024),
             match cfg.store.snapshot_edit_size {
                 0 => "off".to_string(),
                 n => format!("{n} edits ([store] in config.toml)"),
             }
         );
+        let legacy = cfg.ignore.patterns.len();
+        println!(
+            "classify:      volatile={} config patterns{} gitignore={} durable-overrides={}",
+            cfg.classify.volatile.len() + legacy,
+            if legacy > 0 {
+                format!(" (+{legacy} legacy [ignore])")
+            } else {
+                String::new()
+            },
+            if cfg.classify.gitignore { "on" } else { "off" },
+            cfg.classify.durable.len(),
+        );
+        if cfg.scratch.enabled {
+            let ring = sheaf_core::config::sheaf_dir(&root).join("scratch");
+            let used: u64 = std::fs::read_dir(&ring)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0);
+            println!(
+                "scratch:       on — ring {:.1}MiB of {}MiB (`sheaf recover <path>`)",
+                used as f64 / (1024.0 * 1024.0),
+                cfg.scratch.max_bytes / (1024 * 1024),
+            );
+        } else {
+            println!("scratch:       off ([scratch] enabled = false)");
+        }
         match &cfg.retention.expiry {
             Some(spec) => println!(
                 "retention:     edits expire after {spec} (reachability-bound; `sheaf gc --apply` reclaims)"
@@ -1040,6 +1103,111 @@ fn cmd_status(path: Option<&Path>) -> CliResult {
     }
 
     report_daemon_status(Some(&root));
+    Ok(())
+}
+
+/// `sheaf recover`: pull a volatile path's bytes back out of the scratch
+/// ring. Deliberately offline (pure file reads — works with the daemon
+/// down) and deliberately NOT `restore`: no timeline points, no branches,
+/// no CRDT semantics, just "the bytes it held, last time we looked".
+fn cmd_recover(
+    path: &str,
+    project: Option<&Path>,
+    list: bool,
+    stdout: bool,
+    pick: Option<usize>,
+) -> CliResult {
+    let start = match project {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("no current directory")?,
+    };
+    let root = resolve_project_root(&start)
+        .map(|r| normalize_existing(&r))
+        .with_context(|| format!("no sheaf store above {}", start.display()))?;
+    let rel = if Path::new(path).is_absolute() {
+        Path::new(path)
+            .strip_prefix(&root)
+            .map(|p| p.to_path_buf())
+            .with_context(|| format!("{path} is not inside {}", root.display()))?
+    } else {
+        PathBuf::from(path.trim_start_matches("./"))
+    };
+    let rel_str = rel.to_string_lossy().to_string();
+    let ring = sheaf_core::config::sheaf_dir(&root).join("scratch");
+
+    let history = sheaf_core::scratch::history(&ring, &root, &rel_str);
+    if history.is_empty() {
+        return Err(ExitErr::Fatal(anyhow::anyhow!(
+            "the scratch ring holds no snapshots for {rel_str} in {}\n\
+             the ring records classified-volatile files in watched \
+             directories (editor litter, .gitignored loose files);\n\
+             unwatched subtrees (target/, node_modules/) and durable \
+             files are not ring candidates —\nfor durable history use \
+             `sheaf log --path {rel_str}` + `sheaf restore`",
+            root.display()
+        )));
+    }
+
+    if list {
+        println!("ring snapshots for {rel_str} (oldest → newest):");
+        for rec in &history {
+            let state = if rec.gone {
+                "gone".to_string()
+            } else {
+                match (rec.size, rec.content()) {
+                    (Some(size), Some(_)) if rec.trunc => {
+                        format!("{size} bytes (truncated head kept)")
+                    }
+                    (Some(size), Some(_)) => format!("{size} bytes"),
+                    (Some(size), None) => format!("{size} bytes (metadata only)"),
+                    _ => "metadata only".to_string(),
+                }
+            };
+            println!(
+                "  {}  {state}",
+                chrono::DateTime::from_timestamp(rec.ts_ms / 1000, (rec.ts_ms % 1000) as u32)
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| format!("ts {}", rec.ts_ms)),
+            );
+        }
+        return Ok(());
+    }
+
+    let content_records: Vec<&sheaf_core::scratch::ScratchRecord> =
+        history.iter().filter(|r| r.content().is_some()).collect();
+    let pick = pick.unwrap_or(0);
+    let chosen = content_records.iter().rev().nth(pick).with_context(|| {
+        format!(
+            "only {} content snapshot(s) in the ring for {rel_str}; cannot pick #{pick}",
+            content_records.len()
+        )
+    })?;
+    let bytes = chosen.content().expect("filtered to content records");
+
+    if stdout {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(&bytes)
+            .context("write recovered bytes to stdout")?;
+        return Ok(());
+    }
+    let dest = root.join(&rel);
+    let mut recovered = dest.into_os_string();
+    recovered.push(".recovered");
+    let recovered: PathBuf = recovered.into();
+    std::fs::write(&recovered, &bytes).with_context(|| format!("write {}", recovered.display()))?;
+    println!(
+        "recovered {} ({} bytes, {}) → {}",
+        rel_str,
+        bytes.len(),
+        if chosen.trunc {
+            "truncated head"
+        } else {
+            "full snapshot"
+        },
+        recovered.display()
+    );
+    println!("nothing was overwritten; the live file, if any, is untouched");
     Ok(())
 }
 
@@ -5997,6 +6165,69 @@ mod grep_cli_layer_tests {
     fn hits_len_reads_the_summary_count() {
         assert_eq!(hits_len(&serde_json::json!({ "hits": 7 })), 7);
         assert_eq!(hits_len(&serde_json::json!({})), 0);
+    }
+}
+
+#[cfg(test)]
+mod recover_cli_tests {
+    use super::*;
+
+    /// `ExitErr` is not `Debug`; unwrap with the error's human text.
+    fn unwrap_cli(result: CliResult) {
+        if let Err(e) = result {
+            match e {
+                ExitErr::Fatal(err) => panic!("recover failed: {err:#}"),
+                ExitErr::SilentCode(code) => panic!("recover exited silently: {code}"),
+            }
+        }
+    }
+    #[test]
+    fn recover_lists_and_restores_ring_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sheaf_core::config::write_skeleton(root).unwrap();
+        let ring = sheaf_core::config::sheaf_dir(root).join("scratch");
+        std::fs::write(root.join("notes.md.swp"), b"buffer v1\n").unwrap();
+        let mut w = sheaf_core::scratch::ScratchWriter::open(&ring, 1 << 20, 1 << 20);
+        w.snapshot(root, &root.join("notes.md.swp"), "notes.md.swp");
+        w.flush();
+        std::fs::write(root.join("notes.md.swp"), b"buffer v2 longer\n").unwrap();
+        w.snapshot(root, &root.join("notes.md.swp"), "notes.md.swp");
+        w.flush();
+
+        // Listing reports both snapshots without writing anything.
+        unwrap_cli(cmd_recover("notes.md.swp", Some(root), true, false, None));
+        assert!(!root.join("notes.md.swp.recovered").exists());
+
+        // Default restores the LATEST content snapshot to a sibling file;
+        // the live file is untouched.
+        unwrap_cli(cmd_recover("notes.md.swp", Some(root), false, false, None));
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md.swp.recovered")).unwrap(),
+            "buffer v2 longer\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md.swp")).unwrap(),
+            "buffer v2 longer\n",
+            "recovery must never overwrite the live file"
+        );
+
+        // --pick 1 reaches the previous snapshot.
+        unwrap_cli(cmd_recover(
+            "notes.md.swp",
+            Some(root),
+            false,
+            false,
+            Some(1),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md.swp.recovered")).unwrap(),
+            "buffer v1\n"
+        );
+
+        // An unknown path fails loudly instead of writing an empty file.
+        assert!(cmd_recover("nope.tmp", Some(root), false, false, None).is_err());
+        assert!(!root.join("nope.tmp.recovered").exists());
     }
 }
 

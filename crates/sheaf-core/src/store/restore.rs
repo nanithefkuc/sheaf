@@ -33,7 +33,7 @@ use super::{
 };
 use crate::error::{Result, SheafError};
 use crate::events::{Batch, EventKind, FsEvent};
-use crate::ignore::IgnoreSet;
+use crate::ignore::ExcludesRel;
 
 /// Restart marker; written and fsync'd before the first worktree mutation.
 const INTENT_FILE: &str = "restore.intent";
@@ -638,7 +638,7 @@ fn build_plan(
     target_entries: &BTreeMap<String, Entry>,
     scope: &[String],
     interval_renames: &[(String, String)],
-    ignore: &IgnoreSet,
+    ignore: &dyn ExcludesRel,
     degraded: bool,
 ) -> Result<RestorePlan> {
     let user_scope = canonical_scope(scope)?;
@@ -872,7 +872,7 @@ pub(super) fn expand_names(
 /// Non-ignored regular files currently in the worktree, as document keys,
 /// restricted to `scope`. Ignored subtrees (`.git/`, `target/`, `.sheaf/`, …)
 /// are pruned rather than filtered, so build output costs nothing to skip.
-pub(super) fn live_files(root: &Path, ignore: &IgnoreSet, scope: &[String]) -> Vec<String> {
+pub(super) fn live_files(root: &Path, ignore: &dyn ExcludesRel, scope: &[String]) -> Vec<String> {
     let starts: Vec<PathBuf> = if scope.is_empty() {
         vec![root.to_path_buf()]
     } else {
@@ -891,7 +891,7 @@ pub(super) fn live_files(root: &Path, ignore: &IgnoreSet, scope: &[String]) -> V
                 entry
                     .path()
                     .strip_prefix(root)
-                    .map(|rel| rel.as_os_str().is_empty() || !ignore.is_ignored_rel(rel))
+                    .map(|rel| rel.as_os_str().is_empty() || !ignore.excludes_rel(rel))
                     .unwrap_or(false)
             });
         for entry in walker.filter_map(std::result::Result::ok) {
@@ -959,7 +959,7 @@ impl TimelineReader {
         &self,
         reference: &str,
         scope: &[String],
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<RestorePlan> {
         let target = self.resolve(reference)?;
         let base = self.resolve("@")?;
@@ -992,7 +992,7 @@ impl ProjectStore {
         &self,
         reference: &str,
         scope: &[String],
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<RestorePlan> {
         let target = self.resolve(reference)?;
         self.plan_restore_at(&target, scope, ignore)
@@ -1004,7 +1004,7 @@ impl ProjectStore {
         &self,
         target: &ResolvedPoint,
         scope: &[String],
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<RestorePlan> {
         let target_frontier = decode_frontier(&target.frontier)?;
         let base = self.resolve("@")?;
@@ -1036,7 +1036,7 @@ impl ProjectStore {
     pub fn apply_restore(
         &mut self,
         plan: &RestorePlan,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
     ) -> Result<RestoreOutcome> {
         self.run_restore(plan, ignore, false)
     }
@@ -1056,7 +1056,7 @@ impl ProjectStore {
     /// means the operator asked for the rewind by name.
     pub fn resume_restore(
         &mut self,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
         force: bool,
         max_resume_age_ms: i64,
     ) -> Result<Option<RestoreOutcome>> {
@@ -1096,7 +1096,7 @@ impl ProjectStore {
     /// exactly as it is; whatever the interrupted restore had already
     /// written becomes ordinary history through the standard two-sided
     /// reconciliation, so nothing on disk is uncaptured afterward.
-    pub fn abandon_restore(&mut self, ignore: &IgnoreSet) -> Result<Option<Capture>> {
+    pub fn abandon_restore(&mut self, ignore: &dyn ExcludesRel) -> Result<Option<Capture>> {
         let had = self.pending_restore();
         self.clear_intent();
         tracing::warn!(
@@ -1111,7 +1111,7 @@ impl ProjectStore {
     fn run_restore(
         &mut self,
         plan: &RestorePlan,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
         resumed: bool,
     ) -> Result<RestoreOutcome> {
         if !plan.applicable() {
@@ -1533,13 +1533,13 @@ impl ProjectStore {
     /// Two-sided worktree↔document reconciliation: disk∖store becomes
     /// Touched, store∖disk becomes Removed, and known-but-changed bytes become
     /// Touched. Returns the capture appended, or `None` when already converged.
-    pub fn reconcile_worktree(&mut self, ignore: &IgnoreSet) -> Result<Option<Capture>> {
+    pub fn reconcile_worktree(&mut self, ignore: &dyn ExcludesRel) -> Result<Option<Capture>> {
         self.reconcile_tagged(ignore, None)
     }
 
     pub(super) fn reconcile_tagged(
         &mut self,
-        ignore: &IgnoreSet,
+        ignore: &dyn ExcludesRel,
         origin: Option<CaptureOrigin>,
     ) -> Result<Option<Capture>> {
         let known = self.known_paths();
@@ -1552,7 +1552,7 @@ impl ProjectStore {
             .filter_entry(|e| {
                 e.path()
                     .strip_prefix(&root)
-                    .map(|rel| rel.as_os_str().is_empty() || !ignore.is_ignored_rel(rel))
+                    .map(|rel| rel.as_os_str().is_empty() || !ignore.excludes_rel(rel))
                     .unwrap_or(false)
             })
             .filter_map(std::result::Result::ok)
@@ -1582,7 +1582,7 @@ impl ProjectStore {
             let now_ignored = path
                 .strip_prefix(&root)
                 .ok()
-                .map(|rel| !rel.as_os_str().is_empty() && ignore.is_ignored_rel(rel))
+                .map(|rel| !rel.as_os_str().is_empty() && ignore.excludes_rel(rel))
                 .unwrap_or(false);
             if now_ignored || !path.exists() {
                 events.push(FsEvent::now(EventKind::Removed { path: path.clone() }));
@@ -1660,6 +1660,7 @@ fn describe(obstructions: &[Obstruction]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ignore::IgnoreSet;
 
     #[test]
     fn scope_keys_normalize_and_refuse_escapes() {

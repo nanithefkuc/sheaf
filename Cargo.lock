@@ -1582,6 +1582,7 @@ dependencies = [
  "inotify",
  "libc",
  "loro",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",

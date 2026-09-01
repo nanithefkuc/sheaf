@@ -148,6 +148,23 @@ impl IgnoreSet {
     }
 }
 
+/// Predicate: does this root-relative path lie outside what the timeline
+/// models? Implemented by [`IgnoreSet`] (pattern-union semantics — tests,
+/// degraded callers) and by [`crate::classify::Classifier`] (three-tier
+/// semantics — the daemon's live path, where durable overrides can rescue
+/// a path a volatile pattern matched). Store surfaces that walk the
+/// worktree — restore baselines, reconciliation, merge scoping — take this
+/// instead of a concrete set so both semantics slot in.
+pub trait ExcludesRel {
+    fn excludes_rel(&self, rel: &Path) -> bool;
+}
+
+impl ExcludesRel for IgnoreSet {
+    fn excludes_rel(&self, rel: &Path) -> bool {
+        self.is_ignored_rel(rel)
+    }
+}
+
 /// Collect ignore patterns from every `.gitignore` under `root` and from
 /// the repository's `.git/info/exclude`, translated into this module's
 /// pattern grammar and anchored to each file's directory.
@@ -161,7 +178,7 @@ impl IgnoreSet {
 /// otherwise each contribute patterns like `Cargo.lock` or `.*` to the
 /// project-wide set. This is a best-effort read: an unreadable
 /// `.gitignore` is skipped, never fatal.
-fn gitignore_patterns(root: &Path, config_patterns: &[String]) -> Vec<String> {
+pub fn gitignore_patterns(root: &Path, config_patterns: &[String]) -> Vec<String> {
     // Names we never descend into while hunting for .gitignore files. These are
     // the always-ignored store/vcs dirs plus the common regenerable trees; a
     // .gitignore inside them is irrelevant to what sheaf should track.
@@ -224,7 +241,7 @@ fn gitignore_patterns(root: &Path, config_patterns: &[String]) -> Vec<String> {
 
 /// Read one rule file (`.gitignore` grammar) and append its translated
 /// patterns to `out`. Missing or unreadable files contribute nothing.
-fn append_rule_file(file: &Path, prefix: &str, out: &mut Vec<String>) {
+pub fn append_rule_file(file: &Path, prefix: &str, out: &mut Vec<String>) {
     let Ok(text) = std::fs::read_to_string(file) else {
         return;
     };

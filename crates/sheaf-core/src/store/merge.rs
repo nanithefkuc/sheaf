@@ -17,7 +17,7 @@ use super::timeline::{capture_id_at, decode_frontier, encode_frontier, CaptureOr
 use super::{blobs, fsutil, ActionKind, ContentKind, ProjectStore, ResolvedPoint};
 use crate::error::{Result, SheafError};
 use crate::events::{Batch, EventKind, FsEvent};
-use crate::ignore::IgnoreSet;
+use crate::ignore::ExcludesRel;
 
 const INTENT_FILE: &str = "merge.intent";
 
@@ -443,7 +443,11 @@ impl ProjectStore {
         Ok(outcome.capture)
     }
 
-    pub fn apply_merge(&mut self, plan: &MergePlan, ignore: &IgnoreSet) -> Result<MergeOutcome> {
+    pub fn apply_merge(
+        &mut self,
+        plan: &MergePlan,
+        ignore: &dyn ExcludesRel,
+    ) -> Result<MergeOutcome> {
         if !plan.conflicts.is_empty() {
             return Err(SheafError::TimelineMergeConflict(format!(
                 "{} unresolved path conflict(s)",
@@ -516,6 +520,7 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::events::{Batch, EventKind, FsEvent};
+    use crate::ignore::IgnoreSet;
     use crate::store::StoreLimits;
 
     fn capture_file(store: &mut ProjectStore, root: &Path, path: &str, added: bool) -> String {

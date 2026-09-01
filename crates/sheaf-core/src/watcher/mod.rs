@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use crate::error::{Result, SheafError};
 use crate::events::FsEvent;
-use crate::ignore::IgnoreSet;
 pub use inotify_source::InotifySource;
 
 /// Stop flag shared with watcher threads.
@@ -92,9 +91,13 @@ impl Drop for Watch {
 /// 1. **Paths**: every emitted [`FsEvent`] path is absolute and lies under
 ///    `root`. Events name *files*; directory creations may additionally be
 ///    reported as `Added`, but directory churn alone must not flood events.
-/// 2. **Ignores**: paths matching the provided `IgnoreSet` are never
-///    reported, in any event kind. (`.sheaf/` is always included by the
-///    caller's set — the watcher never observes its own store.)
+/// 2. **Classification**: `Never`-classified paths are never reported, in
+///    any event kind (the store's own directory and `.git` are `Never` by
+///    construction — the watcher never observes its own store). `Volatile`
+///    paths ARE reported when their events reach a watched directory; the
+///    OWNER routes them to the recovery ring, not the timeline. Watch
+///    registration itself only descends into `Durable` directories: heavy
+///    regenerable trees stay dark, exactly as they were under ignore.
 /// 3. **Discoverability**: new files under NEW subdirectories surface
 ///    without an out-of-band rescan, even when the file landed before the
 ///    backend could register the directory (the classic inotify
@@ -113,24 +116,28 @@ pub trait WatchBackend: Send + 'static {
     fn run(self: Box<Self>, tx: Sender<FsEvent>, stop: StopFlag);
 }
 
-/// The ignore set the backend filters against, shared with its owner.
+/// The classifier the backend filters against, shared with its owner.
 ///
-/// Rule sources are files (`.gitignore`, `.git/info/exclude`, config) that
-/// users edit while the daemon runs, and a snapshot taken at watch start
-/// silently goes stale the moment they do. Both sides hold this handle: the
-/// backend read-locks it per event/scan, and the daemon swaps in a rebuilt
-/// set when it observes a rule-file edit. A `RwLock` (not `Mutex`) because
-/// the backend's read side sits on the hot event path.
-pub type SharedIgnores = std::sync::Arc<std::sync::RwLock<IgnoreSet>>;
+/// Rule sources are files (`.gitignore`, `config.toml`) users edit while
+/// the daemon runs; a snapshot taken at watch start silently goes stale the
+/// moment they do. Both sides hold this handle: the backend read-locks it
+/// per event/scan, and the daemon swaps in a rebuilt classifier when it
+/// observes a rule-file edit. `parking_lot::RwLock` because the backend's
+/// read side sits on the hot event path and its guards need no poisoning
+/// dance.
+pub type SharedClassifier = std::sync::Arc<parking_lot::RwLock<crate::classify::Classifier>>;
 
-/// Wrap a compiled set in the shared handle.
-pub fn shared_ignores(set: IgnoreSet) -> SharedIgnores {
-    std::sync::Arc::new(std::sync::RwLock::new(set))
+/// Wrap a compiled classifier in the shared handle.
+pub fn shared_classifier(set: crate::classify::Classifier) -> SharedClassifier {
+    std::sync::Arc::new(parking_lot::RwLock::new(set))
 }
 
 /// Convenience: build the platform default backend.
-pub fn default_backend(root: PathBuf, ignores: SharedIgnores) -> Result<Box<dyn WatchBackend>> {
-    Ok(Box::new(InotifySource::new(root, ignores)?))
+pub fn default_backend(
+    root: PathBuf,
+    classifier: SharedClassifier,
+) -> Result<Box<dyn WatchBackend>> {
+    Ok(Box::new(InotifySource::new(root, classifier)?))
 }
 
 #[cfg(test)]
@@ -155,11 +162,14 @@ mod tests {
         }
     }
     #[test]
-    fn stop_flag_and_shared_ignores_have_expected_defaults() {
+    fn stop_flag_and_shared_classifier_have_expected_defaults() {
         let stop = new_stop_flag();
         assert!(!stop.load(std::sync::atomic::Ordering::SeqCst));
-        let shared = shared_ignores(IgnoreSet::empty());
-        assert!(shared.read().is_ok());
+        let shared = shared_classifier(crate::classify::Classifier::all_durable());
+        assert!(
+            shared.read().classify_rel(std::path::Path::new("x.rs"))
+                == crate::classify::PathClass::Durable
+        );
     }
 
     #[test]
@@ -179,7 +189,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("file");
         std::fs::write(&file, "x").unwrap();
-        let result = default_backend(file, shared_ignores(IgnoreSet::empty()));
+        let result = default_backend(
+            file,
+            shared_classifier(crate::classify::Classifier::all_durable()),
+        );
         assert!(matches!(result, Err(SheafError::WatchInit { .. })));
     }
 

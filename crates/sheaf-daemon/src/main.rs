@@ -28,7 +28,6 @@ use serde_json::json;
 use sheaf_core::config::sheaf_dir;
 use sheaf_core::config::{self, ProjectConfig};
 use sheaf_core::debounce::{Debouncer, DebouncerConfig};
-use sheaf_core::ignore::IgnoreSet;
 use sheaf_core::ipc::{self, IpcError, Request, Response, MAX_ENVELOPE, PROTO_MAJOR, PROTO_MINOR};
 use sheaf_core::registry::Registry;
 use sheaf_core::store::{ProjectStore, StoreLimits};
@@ -662,7 +661,7 @@ fn open_store_locked(
 fn resume_interrupted_restore(
     root: &Path,
     store: &mut ProjectStore,
-    ignore: &IgnoreSet,
+    ignore: &dyn sheaf_core::ignore::ExcludesRel,
     max_resume_age_ms: i64,
 ) -> Option<sheaf_core::store::RestoreOutcome> {
     match store.resume_restore(ignore, false, max_resume_age_ms) {
@@ -771,24 +770,41 @@ fn global_git_ignore_candidates() -> Vec<PathBuf> {
     out.into_iter().filter(|p| p.is_file()).collect()
 }
 
-/// Rebuild a project's ignore rules and swap them into the shared handle
+/// Build the effective classifier for a project root, leniently: config
+/// (`[classify]` + legacy `[ignore]`) ∪ repository gitignore sources ∪
+/// git's machine-global ignore. A build failure keeps the watch alive with
+/// an all-durable classifier (watch everything) — dropping work silently is
+/// the worse failure; the enrollment path still fails closed.
+fn classifier_for(root: &Path) -> sheaf_core::classify::Classifier {
+    let cfg = config::load(root).unwrap_or_default();
+    match sheaf_core::classify::Classifier::for_project_with(
+        root,
+        &cfg,
+        &global_git_ignore_candidates(),
+    ) {
+        Ok(classifier) => classifier,
+        Err(error) => {
+            tracing::warn!(
+                root = %root.display(),
+                %error,
+                "classification failed; treating every path as durable until the rules parse"
+            );
+            sheaf_core::classify::Classifier::all_durable()
+        }
+    }
+}
+
+/// Rebuild a project's classification and swap it into the shared handle
 /// the watcher backend filters against. Config is re-read too, so edits to
-/// `[ignore] patterns` in `config.toml` land without a restart.
+/// `[classify]`/`[ignore]` in `config.toml` land without a restart.
 ///
 /// Refresh is event-driven (a `.gitignore` save); `.git/info/exclude` and
 /// the global file live outside the watched tree and piggyback on any
 /// `.gitignore`-triggered rebuild plus daemon restarts.
-fn refresh_ignore_rules(root: &Path, shared: &watcher::SharedIgnores) {
-    let patterns = config::load(root)
-        .map(|c| c.ignore.patterns)
-        .unwrap_or_default();
-    match IgnoreSet::for_project_with(root, &patterns, &global_git_ignore_candidates()) {
-        Ok(set) => {
-            *shared.write().unwrap() = set;
-            tracing::info!(root = %root.display(), "ignore rules refreshed");
-        }
-        Err(e) => tracing::warn!(root = %root.display(), error = %e, "ignore refresh failed"),
-    }
+fn refresh_classifications(root: &Path, shared: &watcher::SharedClassifier) {
+    let classifier = classifier_for(root);
+    *shared.write() = classifier;
+    tracing::info!(root = %root.display(), "classification refreshed");
 }
 
 fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool {
@@ -814,27 +830,27 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             }
         }
     };
-    // Effective rules = config ∪ repository .gitignore files ∪
-    // .git/info/exclude ∪ git's global ignore (default locations only).
+    // Effective rules = config ([classify] + legacy [ignore]) ∪ repository
+    // gitignore sources ∪ git's global ignore (default locations only).
     // The global file is a daemon-level input on purpose: its content
     // varies per machine, and library callers (tests, degraded CLI) must
     // stay deterministic.
-    let ignores = {
-        let set = match IgnoreSet::for_project_with(
+    let classifier = {
+        let compiled = match sheaf_core::classify::Classifier::for_project_with(
             &root_n,
-            &cfg.ignore.patterns,
+            &cfg,
             &global_git_ignore_candidates(),
         ) {
-            Ok(s) => s,
+            Ok(c) => c,
             Err(e) => {
-                tracing::error!(root = %root_n.display(), error = %e, "bad ignore patterns");
+                tracing::error!(root = %root_n.display(), error = %e, "bad classify patterns");
                 return false;
             }
         };
-        watcher::shared_ignores(set)
+        watcher::shared_classifier(compiled)
     };
 
-    let backend = match watcher::default_backend(root_n.clone(), ignores.clone()) {
+    let backend = match watcher::default_backend(root_n.clone(), classifier.clone()) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(root = %root_n.display(), error = %e, "backend init failed");
@@ -861,22 +877,23 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
         .into_iter()
         .filter(|item| item.present)
     {
-        let linked_ignores = match IgnoreSet::for_project_with(
+        let linked_classifier = match sheaf_core::classify::Classifier::for_project_with(
             &linked.path,
-            &cfg.ignore.patterns,
+            &cfg,
             &global_git_ignore_candidates(),
         ) {
-            Ok(set) => watcher::shared_ignores(set),
+            Ok(c) => watcher::shared_classifier(c),
             Err(error) => {
                 tracing::warn!(
                     root = %linked.path.display(),
                     %error,
-                    "managed worktree ignore rules failed; worktree not watched"
+                    "managed worktree classification failed; worktree not watched"
                 );
                 continue;
             }
         };
-        let linked_backend = match watcher::default_backend(linked.path.clone(), linked_ignores) {
+        let linked_backend = match watcher::default_backend(linked.path.clone(), linked_classifier)
+        {
             Ok(backend) => backend,
             Err(error) => {
                 tracing::warn!(
@@ -937,9 +954,10 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
     // while cold is exclusively the lazy parked state.
     let cold = Arc::new(AtomicBool::new(matches!(policy, OpenPolicy::Lazy)));
     let collector_stop = stop_flag.clone();
+    let scratch_cfg = cfg.scratch.clone();
     let collector_thread = {
         let root_n2 = root_n.clone();
-        let ignores2 = ignores.clone();
+        let classifier2 = classifier.clone();
         let ready2 = ready.clone();
         let cold2 = cold.clone();
         std::thread::Builder::new()
@@ -947,9 +965,9 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             .spawn(move || {
                 let (store, lock_file, initial_mute) = match eager_pair {
                     Some((mut store, lock_file)) => {
-                        let ig = ignores2.read().unwrap().clone();
+                        let cls = classifier2.read().clone();
                         let mute =
-                            boot_reconcile_store(&root_n2, &mut store, &ig, max_resume_age_ms);
+                            boot_reconcile_store(&root_n2, &mut store, &cls, max_resume_age_ms);
                         ready2.store(true, Ordering::Release);
                         (store, lock_file, mute)
                     }
@@ -964,9 +982,9 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
                         ) else {
                             return; // stopped before any activity; nothing to flush
                         };
-                        let ig = ignores2.read().unwrap().clone();
+                        let cls = classifier2.read().clone();
                         let mute =
-                            boot_reconcile_store(&root_n2, &mut store, &ig, max_resume_age_ms);
+                            boot_reconcile_store(&root_n2, &mut store, &cls, max_resume_age_ms);
                         cold2.store(false, Ordering::Release);
                         ready2.store(true, Ordering::Release);
                         // The wake channel has served its purpose; letting it
@@ -989,7 +1007,8 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
                     control_rx,
                     deb_cfg,
                     store,
-                    ignores2,
+                    classifier2,
+                    scratch_cfg,
                     initial_mute,
                     lock_file,
                     max_resume_age_ms,
@@ -1020,7 +1039,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
 fn boot_reconcile_store(
     root: &Path,
     store: &mut ProjectStore,
-    primary_ignore: &IgnoreSet,
+    primary_classifier: &sheaf_core::classify::Classifier,
     max_resume_age_ms: i64,
 ) -> Option<RestoreMute> {
     let mut roots = vec![root.to_path_buf()];
@@ -1037,17 +1056,12 @@ fn boot_reconcile_store(
             tracing::error!(root = %worktree.display(), %error, "worktree activation failed");
             continue;
         }
-        let owned_ignore;
-        let ignore = if worktree == root {
-            primary_ignore
+        let owned_classifier;
+        let classifier: &sheaf_core::classify::Classifier = if worktree == root {
+            primary_classifier
         } else {
-            let patterns = config::load(&worktree)
-                .map(|project| project.ignore.patterns)
-                .unwrap_or_default();
-            owned_ignore =
-                IgnoreSet::for_project_with(&worktree, &patterns, &global_git_ignore_candidates())
-                    .unwrap_or_else(|_| IgnoreSet::empty());
-            &owned_ignore
+            owned_classifier = classifier_for(&worktree);
+            &owned_classifier
         };
         if sheaf_core::store::pending_merge_at(&worktree).is_some() {
             match store.resume_merge() {
@@ -1068,8 +1082,8 @@ fn boot_reconcile_store(
                 }
             }
         }
-        let resumed = resume_interrupted_restore(&worktree, store, ignore, max_resume_age_ms);
-        match store.reconcile_worktree(ignore) {
+        let resumed = resume_interrupted_restore(&worktree, store, classifier, max_resume_age_ms);
+        match store.reconcile_worktree(classifier) {
             Ok(None) => {}
             Ok(Some(capture)) => tracing::info!(
                 root = %worktree.display(),
@@ -1190,6 +1204,12 @@ impl RestoreMute {
 /// Per-project debouncer sink: batches persist through the Loro-backed
 /// store, falling back to log-only when persistence fails. This
 /// thread is the project's sole writer, so restores execute here too.
+///
+/// Events route by classification: `Durable` feeds the debouncer (and so
+/// the timeline), `Volatile` feeds the scratch ring (never the timeline),
+/// `Never` is dropped defensively — the backend already refuses to emit
+/// it. The ring flushes when durable work flushes, on its own cadence
+/// (`[scratch] flush_ms`), and at shutdown.
 #[allow(clippy::too_many_arguments)]
 fn collect_loop(
     root: PathBuf,
@@ -1197,18 +1217,52 @@ fn collect_loop(
     control: Receiver<StoreCommand>,
     cfg: DebouncerConfig,
     mut store: ProjectStore,
-    ignore: watcher::SharedIgnores,
+    classifier: watcher::SharedClassifier,
+    scratch_cfg: sheaf_core::config::ScratchConfig,
     initial_mute: Option<RestoreMute>,
     _lock_guard: std::fs::File,
     max_resume_age_ms: i64,
 ) {
+    use sheaf_core::classify::PathClass;
+    use sheaf_core::events::EventKind;
+    use sheaf_core::scratch::ScratchWriter;
+    use std::collections::BTreeSet;
+
     let poll = (cfg.window / 4).max(Duration::from_millis(20));
     let mut debouncers = HashMap::from([(root.clone(), Debouncer::new(root.clone(), cfg.clone()))]);
-    let mut ignores = HashMap::from([(root.clone(), ignore)]);
+    let mut classifiers = HashMap::from([(root.clone(), classifier)]);
     let mut mutes = HashMap::new();
     if let Some(mute) = initial_mute {
         mutes.insert(root.clone(), mute);
     }
+    // The recovery ring lives under the STORE's `.sheaf/scratch/` (shared
+    // by every worktree of the project; records are tagged by the worktree
+    // that observed them).
+    let scratch_dir = sheaf_dir(&root).join("scratch");
+    let mut scratch = if scratch_cfg.enabled {
+        ScratchWriter::open(
+            &scratch_dir,
+            scratch_cfg.max_bytes,
+            scratch_cfg.max_file_bytes,
+        )
+    } else {
+        ScratchWriter::disabled()
+    };
+    // Volatile paths awaiting a ring flush: (worktree root, absolute path).
+    let mut scratch_dirty: BTreeSet<(PathBuf, PathBuf)> = BTreeSet::new();
+    let mut last_scratch_flush = Instant::now();
+    let scratch_period = Duration::from_millis(scratch_cfg.flush_ms.max(1));
+
+    let flush_scratch = |scratch: &mut ScratchWriter, dirty: &mut BTreeSet<(PathBuf, PathBuf)>| {
+        for (event_root, abs) in dirty.iter() {
+            if let Ok(rel) = abs.strip_prefix(event_root) {
+                scratch.snapshot(event_root, abs, &rel.to_string_lossy());
+            }
+        }
+        dirty.clear();
+        scratch.flush();
+    };
+
     // Plans handed out but not yet applied. Bounded and collector-local:
     // the single writer is the only thing entitled to honour a token.
     let mut plans: Vec<sheaf_core::store::RestorePlan> = Vec::new();
@@ -1224,18 +1278,6 @@ fn collect_loop(
                     Debouncer::new(command_root.clone(), cfg.clone()),
                 );
             }
-            if !ignores.contains_key(&command_root) {
-                let patterns = config::load(&command_root)
-                    .map(|project| project.ignore.patterns)
-                    .unwrap_or_default();
-                let compiled = IgnoreSet::for_project_with(
-                    &command_root,
-                    &patterns,
-                    &global_git_ignore_candidates(),
-                )
-                .unwrap_or_else(|_| IgnoreSet::empty());
-                ignores.insert(command_root.clone(), watcher::shared_ignores(compiled));
-            }
             let mut flush_error = None;
             let memory_heavy = command.is_memory_heavy();
             if command.crosses_debounce_boundary() {
@@ -1246,11 +1288,16 @@ fn collect_loop(
                 if !pending.is_empty() {
                     flush_error = persist_batch_checked(&mut store, &pending).err();
                 }
+                // A boundary means "everything up to now" — durable or not.
+                // Immediate markers (volatile disappearances) sitting in the
+                // ring's buffer reach disk here even with no durable batch.
+                flush_scratch(&mut scratch, &mut scratch_dirty);
+                last_scratch_flush = Instant::now();
             }
-            let ig = ignores[&command_root].read().unwrap().clone();
+            let cls = classifiers[&command_root].read().clone();
             if let Some(outcome) = handle_store_command(
                 &mut store,
-                &ig,
+                &cls,
                 &mut plans,
                 &mut fragment_plans,
                 &mut merge_plans,
@@ -1290,36 +1337,61 @@ fn collect_loop(
                         Debouncer::new(event_root.clone(), cfg.clone()),
                     );
                 }
-                if !ignores.contains_key(&event_root) {
-                    let patterns = config::load(&event_root)
-                        .map(|project| project.ignore.patterns)
-                        .unwrap_or_default();
-                    let compiled = IgnoreSet::for_project_with(
-                        &event_root,
-                        &patterns,
-                        &global_git_ignore_candidates(),
-                    )
-                    .unwrap_or_else(|_| IgnoreSet::empty());
-                    ignores.insert(event_root.clone(), watcher::shared_ignores(compiled));
+                if !classifiers.contains_key(&event_root) {
+                    let compiled = watcher::shared_classifier(classifier_for(&event_root));
+                    classifiers.insert(event_root.clone(), compiled);
                 }
                 if ev
                     .path()
                     .file_name()
                     .is_some_and(|name| name == ".gitignore")
                 {
-                    refresh_ignore_rules(&event_root, &ignores[&event_root]);
+                    refresh_classifications(&event_root, &classifiers[&event_root]);
                 }
-                let swallowed = store.activate_worktree(&event_root).is_ok()
-                    && mutes
-                        .get(&event_root)
-                        .is_some_and(|mute| mute.swallows(&ev, &store));
-                if !swallowed {
-                    if let Some(batch) = debouncers
-                        .get_mut(&event_root)
-                        .expect("event debouncer exists")
-                        .feed(ev)
-                    {
-                        persist_batch(&mut store, &batch);
+                // Route by classification. The probe path is the event's
+                // primary path (rename destinations); a rename whose
+                // SOURCE was volatile leaves a `gone` marker so the ring
+                // records the disappearance, not just the arrival.
+                let class = classifiers[&event_root]
+                    .read()
+                    .classify_event_path(&event_root, ev.path());
+                match (class, &ev.kind) {
+                    (PathClass::Never, _) => {}
+                    (PathClass::Volatile, EventKind::Removed { path }) => {
+                        if let Ok(rel) = path.strip_prefix(&event_root) {
+                            scratch.gone(&event_root, &rel.to_string_lossy());
+                        }
+                    }
+                    (PathClass::Volatile, EventKind::Renamed { from, .. }) => {
+                        let from_class = classifiers[&event_root]
+                            .read()
+                            .classify_event_path(&event_root, from);
+                        if from_class == PathClass::Volatile {
+                            if let Ok(rel) = from.strip_prefix(&event_root) {
+                                scratch.gone(&event_root, &rel.to_string_lossy());
+                            }
+                        }
+                        scratch_dirty.insert((event_root.clone(), ev.path().to_path_buf()));
+                    }
+                    (PathClass::Volatile, _) => {
+                        scratch_dirty.insert((event_root.clone(), ev.path().to_path_buf()));
+                    }
+                    (PathClass::Durable, _) => {
+                        let swallowed = store.activate_worktree(&event_root).is_ok()
+                            && mutes
+                                .get(&event_root)
+                                .is_some_and(|mute| mute.swallows(&ev, &store));
+                        if !swallowed {
+                            if let Some(batch) = debouncers
+                                .get_mut(&event_root)
+                                .expect("event debouncer exists")
+                                .feed(ev)
+                            {
+                                persist_batch(&mut store, &batch);
+                                flush_scratch(&mut scratch, &mut scratch_dirty);
+                                last_scratch_flush = Instant::now();
+                            }
+                        }
                     }
                 }
             }
@@ -1332,6 +1404,14 @@ fn collect_loop(
             .collect();
         for batch in ready {
             persist_batch(&mut store, &batch);
+            flush_scratch(&mut scratch, &mut scratch_dirty);
+            last_scratch_flush = Instant::now();
+        }
+        // Cadence: volatile-only activity still reaches the ring at least
+        // every `flush_ms`, so an editor crash loses at most one window.
+        if last_scratch_flush.elapsed() >= scratch_period && !scratch_dirty.is_empty() {
+            flush_scratch(&mut scratch, &mut scratch_dirty);
+            last_scratch_flush = Instant::now();
         }
         mutes.retain(|_, mute| Instant::now() < mute.until);
     }
@@ -1344,6 +1424,7 @@ fn collect_loop(
         tracing::info!(root = %tail.root.display(), events = tail.len(), "final drain on shutdown");
         persist_batch(&mut store, &tail);
     }
+    flush_scratch(&mut scratch, &mut scratch_dirty);
 }
 
 impl StoreCommand {
@@ -1511,7 +1592,7 @@ fn disable_thp_for_this_process() {
 /// filesystem echo.
 fn handle_store_command(
     store: &mut ProjectStore,
-    ignore: &IgnoreSet,
+    ignore: &dyn sheaf_core::ignore::ExcludesRel,
     plans: &mut Vec<sheaf_core::store::RestorePlan>,
     fragment_plans: &mut Vec<sheaf_core::store::FragmentPlan>,
     merge_plans: &mut Vec<sheaf_core::store::MergePlan>,
@@ -3304,12 +3385,16 @@ fn worktree_list(shared: &Shared, req: &Request, rid: String) -> Response {
 }
 
 fn attach_linked_watch(shared: &Shared, store_root: &Path, worktree: &Path) -> Result<()> {
-    let patterns = config::load(store_root)?.ignore.patterns;
-    let ignores = watcher::shared_ignores(
-        IgnoreSet::for_project_with(worktree, &patterns, &global_git_ignore_candidates())
-            .map_err(anyhow::Error::msg)?,
+    let cfg = config::load(store_root)?;
+    let classifier = watcher::shared_classifier(
+        sheaf_core::classify::Classifier::for_project_with(
+            worktree,
+            &cfg,
+            &global_git_ignore_candidates(),
+        )
+        .map_err(anyhow::Error::msg)?,
     );
-    let backend = watcher::default_backend(worktree.to_path_buf(), ignores)?;
+    let backend = watcher::default_backend(worktree.to_path_buf(), classifier)?;
     let mut table = shared.table.lock().unwrap();
     let entry = table
         .get_mut(&normalize(store_root))
@@ -4087,7 +4172,7 @@ mod tests {
 
     fn run_command(
         store: &mut ProjectStore,
-        ignore: &IgnoreSet,
+        ignore: &dyn sheaf_core::ignore::ExcludesRel,
         plans: &mut Vec<sheaf_core::store::RestorePlan>,
         frags: &mut Vec<sheaf_core::store::FragmentPlan>,
         command: StoreCommand,
@@ -4106,11 +4191,17 @@ mod tests {
     }
 
     /// Open a real writer-locked store over a skeleton project.
-    fn opened_store(root: &Path) -> (ProjectStore, IgnoreSet, std::fs::File) {
-        let ignore = IgnoreSet::from_patterns(&[]).unwrap();
+    fn opened_store(
+        root: &Path,
+    ) -> (
+        ProjectStore,
+        sheaf_core::classify::Classifier,
+        std::fs::File,
+    ) {
+        let classifier = sheaf_core::classify::Classifier::from_volatile_patterns(&[]).unwrap();
         let (store, lock) =
             open_store_locked(root, StoreLimits::default(), 8 * 1024 * 1024).unwrap();
-        (store, ignore, lock)
+        (store, classifier, lock)
     }
 
     #[test]
@@ -4690,7 +4781,10 @@ mod tests {
                     cap_events: 100,
                 },
                 store,
-                watcher::shared_ignores(ignore),
+                watcher::shared_classifier(
+                    sheaf_core::classify::Classifier::from_volatile_patterns(&[]).unwrap(),
+                ),
+                sheaf_core::config::ScratchConfig::default(),
                 None,
                 lock,
                 60_000,
@@ -4723,6 +4817,152 @@ mod tests {
 
         // Dropping both senders disconnects the loop; the final drain runs
         // and the thread exits instead of leaking.
+        drop(control_tx);
+        drop(event_tx);
+        collector.join().unwrap();
+    }
+
+    /// The classification contract end to end: durable events reach the
+    /// timeline, volatile events reach the scratch ring and ONLY the ring,
+    /// and a volatile disappearance leaves a `gone` marker instead of a
+    /// timeline removal. This is the daemon-level guarantee the watcher
+    /// tests defer to ("litter flows; routing is the daemon's job").
+    #[test]
+    fn volatile_events_feed_the_ring_and_never_the_timeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = skeleton_project(tmp.path(), "scratch-routing");
+        std::fs::write(root.join("real.txt"), "seed\n").unwrap();
+        std::fs::write(root.join("notes.md.swp"), "unsaved buffer\n").unwrap();
+        let (mut store, _baseline, lock) = opened_store(&root);
+        let classifier = sheaf_core::classify::Classifier::from_volatile_patterns(
+            &sheaf_core::config::default_volatile_patterns(),
+        )
+        .unwrap();
+        store.reconcile_worktree(&classifier).unwrap();
+
+        let (event_tx, event_rx) = channel::<sheaf_core::events::FsEvent>();
+        let (control_tx, control_rx) = channel::<StoreCommand>();
+        let loop_root = root.clone();
+        let shared = watcher::shared_classifier(classifier);
+        let collector = std::thread::spawn(move || {
+            collect_loop(
+                loop_root,
+                event_rx,
+                control_rx,
+                DebouncerConfig {
+                    window: Duration::from_millis(40),
+                    max_hold: Duration::from_millis(80),
+                    cap_events: 100,
+                },
+                store,
+                shared,
+                sheaf_core::config::ScratchConfig {
+                    enabled: true,
+                    max_bytes: 1 << 20,
+                    max_file_bytes: 1 << 20,
+                    flush_ms: 50,
+                },
+                None,
+                lock,
+                60_000,
+            )
+        });
+
+        // One burst: a durable edit plus editor litter.
+        event_tx
+            .send(sheaf_core::events::FsEvent::now(
+                sheaf_core::events::EventKind::Touched {
+                    path: sheaf_core::events::TouchedPath::from(root.join("real.txt")),
+                },
+            ))
+            .unwrap();
+        event_tx
+            .send(sheaf_core::events::FsEvent::now(
+                sheaf_core::events::EventKind::Added {
+                    path: root.join("notes.md.swp"),
+                },
+            ))
+            .unwrap();
+        event_tx
+            .send(sheaf_core::events::FsEvent::now(
+                sheaf_core::events::EventKind::Touched {
+                    path: sheaf_core::events::TouchedPath::from(root.join("notes.md.swp")),
+                },
+            ))
+            .unwrap();
+
+        // Let the burst route and the quiescence window (40 ms) close
+        // before commanding: control commands are drained ahead of events,
+        // so an immediate checkpoint could flush an empty window.
+        std::thread::sleep(Duration::from_millis(250));
+
+        // A checkpoint crosses the debounce boundary: the durable batch (and
+        // the piggybacked ring flush) complete before its reply.
+        let (tx, rx) = channel();
+        control_tx
+            .send(StoreCommand::CreateCheckpoint {
+                name: "after-burst".into(),
+                reference: None,
+                reply: tx,
+            })
+            .unwrap();
+        rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+
+        // Timeline: the durable edit landed; the swap never appears.
+        let (tx, rx) = channel();
+        control_tx
+            .send(StoreCommand::TimelineLog {
+                all: false,
+                path: None,
+                follow: false,
+                limit: 50,
+                reply: tx,
+            })
+            .unwrap();
+        let (entries, _) = rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|c| c.paths.iter().any(|p| p == "real.txt")),
+            "the durable edit must be captured"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|c| !c.paths.iter().any(|p| p.contains("notes.md.swp"))),
+            "volatile litter must never reach the timeline: {:?}",
+            entries.iter().map(|c| c.paths.clone()).collect::<Vec<_>>()
+        );
+
+        // Ring: the swap's snapshot round-trips.
+        let ring = sheaf_dir(&root).join("scratch");
+        let latest = sheaf_core::scratch::latest_snapshot(&ring, &root, "notes.md.swp")
+            .expect("the ring holds the swap's snapshot");
+        std::thread::sleep(Duration::from_millis(150));
+
+        // A volatile disappearance leaves a gone marker, never a removal.
+        event_tx
+            .send(sheaf_core::events::FsEvent::now(
+                sheaf_core::events::EventKind::Removed {
+                    path: root.join("notes.md.swp"),
+                },
+            ))
+            .unwrap();
+        let (tx, rx) = channel();
+        control_tx
+            .send(StoreCommand::CreateCheckpoint {
+                name: "after-gone".into(),
+                reference: None,
+                reply: tx,
+            })
+            .unwrap();
+        rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        let history = sheaf_core::scratch::history(&ring, &root, "notes.md.swp");
+        assert!(
+            history.iter().any(|r| r.gone),
+            "disappearance must be recorded as a gone marker: {history:?}"
+        );
+
         drop(control_tx);
         drop(event_tx);
         collector.join().unwrap();
@@ -4763,7 +5003,7 @@ mod tests {
         base: &Path,
     ) -> (
         ProjectStore,
-        IgnoreSet,
+        sheaf_core::classify::Classifier,
         std::fs::File,
         PathBuf,
         PathBuf,
@@ -5269,7 +5509,10 @@ mod tests {
                     cap_events: 100,
                 },
                 store,
-                watcher::shared_ignores(ignore),
+                watcher::shared_classifier(
+                    sheaf_core::classify::Classifier::from_volatile_patterns(&[]).unwrap(),
+                ),
+                sheaf_core::config::ScratchConfig::default(),
                 None,
                 lock,
                 60_000,
@@ -5633,7 +5876,9 @@ mod tests {
         let entries = resp.result.unwrap()["entries"].as_array().unwrap().clone();
         assert!(!entries.is_empty());
         assert!(
-            entries.iter().any(|e| !e["paths"].as_array().unwrap().is_empty()),
+            entries
+                .iter()
+                .any(|e| !e["paths"].as_array().unwrap().is_empty()),
             "the baseline reply carries real path lists"
         );
 
