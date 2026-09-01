@@ -15,7 +15,7 @@
 //! with an update. Format-1 stores contain only update frames and load
 //! unchanged; format 2 additionally carries `[tag][json]` records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -270,6 +270,10 @@ pub struct LedgerState {
     pub checkpoints: BTreeMap<String, CheckpointRec>,
     #[serde(default)]
     pub branches: BTreeMap<String, BranchRec>,
+    /// Names explicitly removed or renamed away. This prevents automatic
+    /// defaults from resurrecting a branch the user deleted.
+    #[serde(default)]
+    pub deleted_branches: BTreeSet<String>,
     #[serde(default)]
     pub epochs: Vec<EpochRec>,
 }
@@ -378,10 +382,13 @@ impl LedgerState {
             } => {
                 if let Some(previous) = previous_name {
                     self.branches.remove(&previous);
+                    self.deleted_branches.insert(previous);
                 }
                 if deleted {
                     self.branches.remove(&name);
+                    self.deleted_branches.insert(name);
                 } else {
+                    self.deleted_branches.remove(&name);
                     self.branches.insert(
                         name,
                         BranchRec {

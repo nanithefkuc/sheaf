@@ -293,6 +293,11 @@ fn checkpoint_create_writes_names_and_the_log_annotates_them() {
 #[test]
 fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
     let fx = fixture("branch", V1);
+    let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
+    assert!(ok, "{err}");
+    let initial = json_out(&out);
+    assert_eq!(initial["branches"].as_array().unwrap().len(), 1);
+    assert_eq!(initial["branches"][0]["name"], "main");
 
     let (ok, out, err) = sheaf(
         &fx,
@@ -328,7 +333,8 @@ fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
     let value = json_out(&out);
     assert_eq!(value["degraded"], serde_json::json!(false));
     let branches = value["branches"].as_array().unwrap();
-    assert_eq!(branches.len(), 2, "{value:#}");
+    assert_eq!(branches.len(), 3, "{value:#}");
+    assert!(branches.iter().any(|branch| branch["name"] == "main"));
     let primary = branches
         .iter()
         .find(|branch| branch["name"] == "primary")
@@ -354,8 +360,10 @@ fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
     let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
     assert!(ok, "{err}");
     let value = json_out(&out);
-    assert_eq!(value["branches"].as_array().unwrap().len(), 1);
-    assert_eq!(value["branches"][0]["name"], "primary");
+    let remaining = value["branches"].as_array().unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|branch| branch["name"] == "main"));
+    assert!(remaining.iter().any(|branch| branch["name"] == "primary"));
 }
 
 // ------------------------------------------------------------- status/log

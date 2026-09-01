@@ -202,8 +202,9 @@ complete or ready to share. It is simply a point that you may want to return to.
 
 ## Branches
 
-Branches are mutable names for timeline points. They can carry arbitrary
-string metadata without creating a capture:
+The original timeline is named `main` automatically. Branches are mutable
+names for timeline points and can carry arbitrary string metadata without
+creating a capture:
 
 ```sh
 # Name the current timeline point and attach metadata.
@@ -221,11 +222,11 @@ sheaf branch delete alternate
 ```
 
 Branch names resolve anywhere a timeline reference is accepted, either bare
-(`parser-v2`) or explicit (`branch:parser-v2`). When editing creates a
-divergent timeline automatically, Sheaf names previously unnamed tips
-`branch-<capture-id>` so every resulting branch is addressable. Deleting a
-branch removes only its name and metadata; append-only timeline history
-remains intact.
+(`parser-v2`) or explicit (`branch:parser-v2`). `main` follows the original
+timeline. When editing creates a divergent timeline automatically, Sheaf names
+previously unnamed tips `branch-<capture-id>` so every resulting branch is
+addressable. Deleting a branch removes only its name and metadata; append-only
+timeline history remains intact.
 
 ## Squashing Changes into Commits
 

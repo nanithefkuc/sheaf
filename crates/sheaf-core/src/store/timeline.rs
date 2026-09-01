@@ -557,16 +557,6 @@ impl ProjectStore {
                 capture_id: capture_id_at(&self.doc, &current),
             },
         };
-        if self
-            .ledger
-            .branches
-            .values()
-            .any(|branch| branch.frontier == target.frontier)
-        {
-            return Err(SheafError::Config(
-                "that timeline point already has a branch name".into(),
-            ));
-        }
         let record = super::ledger::LedgerRecord::Branch {
             name: name.to_owned(),
             previous_name: None,
@@ -1352,7 +1342,12 @@ pub(super) fn branch_records_after_capture(
     capture: &Capture,
 ) -> Vec<super::ledger::LedgerRecord> {
     let mut records = Vec::new();
-    let mut names: BTreeSet<String> = ledger.branches.keys().cloned().collect();
+    let mut names: BTreeSet<String> = ledger
+        .branches
+        .keys()
+        .chain(ledger.deleted_branches.iter())
+        .cloned()
+        .collect();
     let mut named_frontiers: BTreeSet<String> = ledger
         .branches
         .values()
@@ -1371,6 +1366,28 @@ pub(super) fn branch_records_after_capture(
             });
             named_frontiers.insert(capture.frontier.clone());
         }
+    }
+
+    // A fresh, linear timeline has one conventional name. Existing
+    // single-tip stores without branch records acquire it on their next
+    // capture. An explicit rename/delete of `main` is remembered in the
+    // folded ledger and is never silently undone.
+    let original_timeline = ledger.branches.is_empty()
+        && !ledger.deleted_branches.contains("main")
+        && records.is_empty()
+        && (prior_tips.is_empty()
+            || (prior_tips.len() == 1 && prior_tips[0].frontier == parent_frontier));
+    if original_timeline {
+        records.push(super::ledger::LedgerRecord::Branch {
+            name: "main".to_owned(),
+            previous_name: None,
+            frontier: capture.frontier.clone(),
+            capture_id: Some(capture.id.clone()),
+            metadata: BTreeMap::new(),
+            deleted: false,
+        });
+        names.insert("main".to_owned());
+        named_frontiers.insert(capture.frontier.clone());
     }
 
     let diverged =
@@ -1816,6 +1833,12 @@ mod tests {
         let root = tmp.path();
         let mut store = opened(root);
         store.apply_batch(&touch(root, "src/a.rs")).unwrap();
+        let main = store
+            .branches()
+            .into_iter()
+            .find(|branch| branch.name == "main")
+            .expect("genesis timeline is main");
+        assert_eq!(main.capture_id, store.resolve("@").unwrap().capture_id);
         let target = store.resolve("@").unwrap();
         let metadata = BTreeMap::from([
             ("description".to_owned(), "parser experiment".to_owned()),
@@ -1856,11 +1879,27 @@ mod tests {
 
         let deleted = store.delete_branch("parser-work").unwrap();
         assert_eq!(deleted.name, "parser-work");
-        assert!(store.branches().is_empty());
+        assert_eq!(
+            store
+                .branches()
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main"]
+        );
         assert!(matches!(
             store.delete_branch("parser-work"),
             Err(SheafError::BranchNotFound(_))
         ));
+        store.delete_branch("main").unwrap();
+        store.compact().unwrap();
+        drop(store);
+        let mut store = ProjectStore::open(root, limits()).unwrap();
+        store.apply_batch(&touch(root, "src/b.rs")).unwrap();
+        assert!(
+            store.branches().is_empty(),
+            "a persisted explicit deletion must not recreate the default"
+        );
     }
 
     #[test]
@@ -1891,9 +1930,10 @@ mod tests {
 
         let branches = store.branches();
         assert_eq!(branches.len(), 2);
+        assert!(branches.iter().any(|branch| branch.name == "main"));
         assert!(branches
             .iter()
-            .all(|branch| branch.name.starts_with("branch-")));
+            .any(|branch| branch.name.starts_with("branch-")));
         assert!(branches
             .iter()
             .any(|branch| branch.capture_id.as_deref() == Some(second.id.as_str())));
