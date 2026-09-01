@@ -723,6 +723,14 @@ impl ProjectStore {
                     renames.push((from.clone(), to.clone()));
                     removals.remove(to);
                     upserts.remove(to);
+                    // The rename owns its source: whatever add/touch/remove
+                    // the window recorded for `from` is subsumed by the move
+                    // (an atomic-save temp's whole life is becoming `to`).
+                    // Without this, pass 4 re-reads `from`, finds it renamed
+                    // away, and scars the capture with a phantom
+                    // `touched {gone}` for a path the document never admitted.
+                    upserts.remove(from);
+                    removals.remove(from);
                 }
                 EventKind::Removed { path } => {
                     removals.insert(path.clone());
@@ -2116,6 +2124,76 @@ mod tests {
             "the exported delta must stay bounded, got {} bytes",
             outcome.update_bytes
         );
+    }
+
+    /// An atomic-save editor writes a temp file, touches it, and renames it
+    /// over the real file — all inside one debounce window. The temp path's
+    /// whole observed life was becoming the destination, so the capture must
+    /// carry exactly the rename (plus the destination's content) and no
+    /// phantom `touched {gone}` scar for a path the document never admitted.
+    #[test]
+    fn rename_source_subsumes_same_window_temp_churn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        config::write_skeleton(root).unwrap();
+        // Disk truth at flush time: the temp is gone, the real file holds
+        // the saved bytes.
+        std::fs::write(root.join("notes.md.tmp"), b"saved bytes\n").unwrap();
+        std::fs::rename(root.join("notes.md.tmp"), root.join("notes.md")).unwrap();
+
+        let mut store = ProjectStore::open(root, StoreLimits::default()).unwrap();
+        let outcome = store
+            .apply_batch(&Batch {
+                root: root.to_path_buf(),
+                events: vec![
+                    FsEvent::now(EventKind::Added {
+                        path: root.join("notes.md.tmp"),
+                    }),
+                    FsEvent::now(EventKind::Touched {
+                        path: root.join("notes.md.tmp").into(),
+                    }),
+                    FsEvent::now(EventKind::Renamed {
+                        from: root.join("notes.md.tmp"),
+                        to: root.join("notes.md"),
+                    }),
+                ],
+                started_at: chrono::Utc::now(),
+                flushed_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        // Exactly two tree records: the truthful rename, plus the content
+        // admission of the destination (`added notes.md`). The phantom
+        // `touched {gone}` for the temp path is what must NOT appear.
+        assert_eq!(
+            outcome.tree_records, 2,
+            "rename + destination admission only: {outcome:?}"
+        );
+        let events = store.tree_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let mut kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"]["kind"].as_str().unwrap_or(""))
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, vec!["added", "renamed"], "{events:?}");
+        let rename = events
+            .iter()
+            .find(|e| e["event"]["kind"] == "renamed")
+            .expect("rename record present");
+        assert_eq!(rename["event"]["from"], "notes.md.tmp");
+        assert_eq!(rename["event"]["to"], "notes.md");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["event"]["kind"] != "renamed" && e["event"]["path"] == "notes.md.tmp"),
+            "no standalone event may name the subsumed temp path: {events:?}"
+        );
+        assert_eq!(
+            store.current_text("notes.md").as_deref(),
+            Some("saved bytes\n"),
+            "the destination content must be admitted at flush"
+        );
+        assert_eq!(outcome.text_created, 1);
     }
 
     #[test]
