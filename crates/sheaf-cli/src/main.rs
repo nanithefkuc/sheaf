@@ -3,6 +3,7 @@
 //! retention/gc, and the squash collapse (preview by default, `--` to commit
 //! + stamp).
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -205,6 +206,11 @@ EXAMPLES:
         at: Option<String>,
         #[arg(long, short = 'C', requires = "name")]
         project: Option<PathBuf>,
+    },
+    /// Manage named timeline branches and their metadata.
+    Branch {
+        #[command(subcommand)]
+        command: BranchCmd,
     },
     /// Put the worktree back to an earlier point, non-destructively.
     ///
@@ -495,6 +501,52 @@ enum CheckpointCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum BranchCmd {
+    /// List named branches.
+    List {
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Name a timeline point as a branch.
+    Create {
+        name: String,
+        /// Capture ID, checkpoint, branch, @, or @~N (default: @).
+        #[arg(long)]
+        at: Option<String>,
+        /// Attach arbitrary metadata; repeat for multiple KEY=VALUE pairs.
+        #[arg(long = "metadata", value_name = "KEY=VALUE", value_parser = parse_branch_metadata)]
+        metadata: Vec<(String, String)>,
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+    },
+    /// Rename a branch without changing its timeline point or metadata.
+    Rename {
+        old_name: String,
+        new_name: String,
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+    },
+    /// Delete a branch label. Timeline history remains append-only.
+    Delete {
+        name: String,
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+    },
+}
+
+fn parse_branch_metadata(raw: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err("metadata must use KEY=VALUE".into());
+    };
+    if key.is_empty() {
+        return Err("metadata key must not be empty".into());
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
 /// When to color human-facing output. `auto` means: a terminal, and no
 /// `NO_COLOR` (the de-facto no-color convention, empty value allowed).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -539,6 +591,9 @@ impl Cmd {
             Cmd::Checkpoint {
                 command: Some(CheckpointCmd::List { json, .. }),
                 ..
+            } => *json,
+            Cmd::Branch {
+                command: BranchCmd::List { json, .. },
             } => *json,
             _ => false,
         }
@@ -752,6 +807,26 @@ fn main() -> ExitCode {
                     Err(ExitErr::SilentCode(2))
                 }
             },
+        },
+        Cmd::Branch { command } => match command {
+            BranchCmd::List { project, json } => cmd_branch_list(project.as_deref(), json, color),
+            BranchCmd::Create {
+                name,
+                at,
+                metadata,
+                project,
+            } => cmd_branch_create(
+                project.as_deref(),
+                &name,
+                at.as_deref(),
+                metadata.into_iter().collect(),
+            ),
+            BranchCmd::Rename {
+                old_name,
+                new_name,
+                project,
+            } => cmd_branch_rename(project.as_deref(), &old_name, &new_name),
+            BranchCmd::Delete { name, project } => cmd_branch_delete(project.as_deref(), &name),
         },
         Cmd::Restore {
             args,
@@ -2123,6 +2198,135 @@ fn cmd_checkpoint_create(project: Option<&Path>, name: &str, at: Option<&str>) -
         .unwrap_or("------------");
     println!("checkpoint {} -> {}", checkpoint.name, id);
     Ok(())
+}
+
+fn cmd_branch_list(project: Option<&Path>, as_json: bool, color: ColorWhen) -> CliResult {
+    let root = timeline_root(project)?;
+    let socket = sheaf_core::paths::control_socket_path();
+    let (branches, degraded) = match Client::connect(&socket, Duration::from_secs(2)) {
+        Ok(mut client) => {
+            let reply = client.call("branch.list", Some(&root), serde_json::json!({}), None)?;
+            if !reply.response.ok {
+                return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+            }
+            let value = reply.response.result.unwrap_or_default();
+            let branches =
+                serde_json::from_value(value.get("branches").cloned().unwrap_or_default())
+                    .context("daemon returned invalid branches")?;
+            (branches, false)
+        }
+        Err(_) => {
+            let _guard = shared_read_guard(&root)?;
+            let reader = sheaf_core::store::TimelineReader::open(&root)?;
+            (reader.branches(), true)
+        }
+    };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"branches": branches, "degraded": degraded})
+            )
+            .context("serialize branches")?
+        );
+        return Ok(());
+    }
+    if degraded {
+        eprintln!("note: daemon unavailable; showing a read-only store snapshot");
+    }
+    let color_on = color.enabled(std::io::stdout().is_terminal());
+    for branch in branches {
+        let id = branch
+            .capture_id
+            .as_deref()
+            .map(|value| &value[..12.min(value.len())])
+            .unwrap_or("------------");
+        let marker = if branch.on_current { "*" } else { " " };
+        let metadata = branch
+            .metadata
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!(
+            "{marker} {:<24}  {}{}",
+            branch.name,
+            paint(color_on, "36", id),
+            if metadata.is_empty() {
+                String::new()
+            } else {
+                format!("  {metadata}")
+            }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_branch_create(
+    project: Option<&Path>,
+    name: &str,
+    at: Option<&str>,
+    metadata: BTreeMap<String, String>,
+) -> CliResult {
+    let branch = branch_mutation(
+        project,
+        "branch.create",
+        serde_json::json!({"name": name, "at": at, "metadata": metadata}),
+    )?;
+    println!(
+        "branch {} -> {}",
+        branch.name,
+        branch
+            .capture_id
+            .as_deref()
+            .map(|id| &id[..12.min(id.len())])
+            .unwrap_or("------------")
+    );
+    Ok(())
+}
+
+fn cmd_branch_rename(project: Option<&Path>, old_name: &str, new_name: &str) -> CliResult {
+    let branch = branch_mutation(
+        project,
+        "branch.rename",
+        serde_json::json!({"old_name": old_name, "new_name": new_name}),
+    )?;
+    println!("branch {old_name} renamed to {}", branch.name);
+    Ok(())
+}
+
+fn cmd_branch_delete(project: Option<&Path>, name: &str) -> CliResult {
+    branch_mutation(project, "branch.delete", serde_json::json!({"name": name}))?;
+    println!("deleted branch {name}");
+    Ok(())
+}
+
+fn branch_mutation(
+    project: Option<&Path>,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<sheaf_core::store::Branch, ExitErr> {
+    let root = timeline_root(project)?;
+    let socket = sheaf_core::paths::control_socket_path();
+    let mut client = Client::connect(&socket, Duration::from_secs(2)).map_err(|_| {
+        anyhow::anyhow!(
+            "branch mutation requires the running daemon; no offline writer fallback is allowed"
+        )
+    })?;
+    client.set_timeout(Duration::from_secs(120))?;
+    let reply = client.call(method, Some(&root), params, None)?;
+    if !reply.response.ok {
+        return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    }
+    serde_json::from_value(
+        reply
+            .response
+            .result
+            .and_then(|value| value.get("branch").cloned())
+            .unwrap_or_default(),
+    )
+    .context("daemon returned invalid branch")
+    .map_err(Into::into)
 }
 // --------------------------------------------------------------- worktrees
 

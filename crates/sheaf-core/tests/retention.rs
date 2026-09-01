@@ -85,6 +85,9 @@ fn expiry_trims_old_history_and_keeps_everything_protected() {
     flush_aged(&mut store, root, "a.txt", b"v3\n", hour * 3);
     let pinned = capture_id_at(&store, "@");
     store.create_checkpoint("pin", None).unwrap();
+    store
+        .create_branch("release", None, Default::default())
+        .unwrap();
     flush_aged(&mut store, root, "b.txt", b"keep\n", hour);
     flush_aged(&mut store, root, "b.txt", b"keep2\n", Duration::zero());
 
@@ -113,6 +116,13 @@ fn expiry_trims_old_history_and_keeps_everything_protected() {
             .iter()
             .any(|p| p.reason.contains("pin")),
         "checkpoint appears in the protected set"
+    );
+    assert!(
+        plan.retention
+            .protected
+            .iter()
+            .any(|point| point.reason == "branch 'release'"),
+        "named branch appears in the protected set"
     );
 
     let pruned_ids: Vec<String> = plan

@@ -39,8 +39,8 @@ and forward through your work at any time.
 
 ## Features
 - **Persistent undo** - restore previous states long after closing your editor.
-- **Automatic timeline branching** - restoring an old state and making changes 
-  never destroys future history
+- **Automatic timeline branching** - restoring an old state and making changes
+  never destroys future history; divergent tips receive stable generated names.
 - **Editor-independent history** - edit in one editor and restore from another.
 - **Works without editor integrations** - watches filesystem changes
   automatically.
@@ -54,6 +54,8 @@ and forward through your work at any time.
 - **Branch worktrees** - materialize any timeline point as a live linked
   worktree that shares the store, turning a divergent branch into a real
   directory you can build and edit in.
+- **Named branches** - list, create, rename, and delete branch labels, with
+  arbitrary key-value metadata for descriptions, test results, and tooling.
 - **Timeline merge** - squash a divergent timeline onto your current worktree
   as one capture; conflicting paths are reported and block the merge until
   resolved.
@@ -198,6 +200,33 @@ Check points are useful when:
 Unlike a traditional commit, a checkpoint does not imply that your work is
 complete or ready to share. It is simply a point that you may want to return to.
 
+## Branches
+
+Branches are mutable names for timeline points. They can carry arbitrary
+string metadata without creating a capture:
+
+```sh
+# Name the current timeline point and attach metadata.
+sheaf branch create parser-experiment \
+  --metadata 'description=try the new parser' \
+  --metadata 'tests=cargo test --workspace: pass'
+
+# Name another capture, checkpoint, or branch.
+sheaf branch create alternate --at @~5
+
+sheaf branch list
+sheaf branch list --json
+sheaf branch rename parser-experiment parser-v2
+sheaf branch delete alternate
+```
+
+Branch names resolve anywhere a timeline reference is accepted, either bare
+(`parser-v2`) or explicit (`branch:parser-v2`). When editing creates a
+divergent timeline automatically, Sheaf names previously unnamed tips
+`branch-<capture-id>` so every resulting branch is addressable. Deleting a
+branch removes only its name and metadata; append-only timeline history
+remains intact.
+
 ## Squashing Changes into Commits
 
 Sheaf records changes at a much finer granularity than a typical Git commit.
@@ -332,9 +361,9 @@ Sheaf is intended to become more than just a local undo system. Our roadmap
 includes:
 - **Editor integrations:** Record fine-grained editing operations directly
   in editors, before they are flushed to disk.
-- **A more intuitive branch viewer:** The current timeline viewer makes it
-  hard to see where the timeline branches and how parallel branches run
-  alongside each other; a dedicated branching view is planned.
+- **A graphical branch viewer:** `sheaf branch list` provides the dedicated
+  command-line branch view; richer visualization of parallel timelines is
+  planned.
 - **Agentic Integration:** Allow AI agents to use Sheaf; restore changes
   within an agent turn.
 - **Platform Support:** Future support for MacOS and Windows.

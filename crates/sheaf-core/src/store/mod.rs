@@ -60,8 +60,8 @@ pub use grep::{
 };
 pub use journal::{list_segments, read_records};
 pub use ledger::{
-    classify_payload, CaptureRec, CheckpointRec, EpochRec, Frame, LedgerRecord, LedgerState,
-    PruneCause, TombstoneRec,
+    classify_payload, BranchRec, CaptureRec, CheckpointRec, EpochRec, Frame, LedgerRecord,
+    LedgerState, PruneCause, TombstoneRec,
 };
 pub use maintenance::{
     doctor, doctor_fix, gc_apply, gc_plan, gc_run, gc_run_store, retention_mark, AppliedFix, Check,
@@ -94,8 +94,8 @@ pub use squash::{
     span_stats, split_range, SpanStats,
 };
 pub use timeline::{
-    decode_frontier, encode_frontier, BranchTip, Capture, CaptureInfo, CaptureOrigin, Checkpoint,
-    OriginKind, ResolvedPoint, TimelineReader,
+    decode_frontier, encode_frontier, Branch, BranchTip, Capture, CaptureInfo, CaptureOrigin,
+    Checkpoint, OriginKind, ResolvedPoint, TimelineReader,
 };
 pub use worktree::{linked_worktrees, WorktreeInfo};
 
@@ -692,6 +692,24 @@ impl ProjectStore {
             });
         }
 
+        // Branch labels follow the exact worktree head they named before this
+        // batch. The global tips snapshot also tells us whether this capture
+        // creates a new divergent lineage that needs automatic names.
+        let (branch_parent, prior_branch_tips) = if self.num_edits == 0 {
+            // Reading Loro frontiers commits the fresh document's bootstrap
+            // operations. The genesis capture must keep an empty parent for
+            // cache-chain correctness, and there cannot yet be a branch label
+            // to advance.
+            (
+                timeline::encode_frontier(&loro::Frontiers::default()),
+                Vec::new(),
+            )
+        } else {
+            let parent = self.current_frontier();
+            let tips = self.branch_tips()?;
+            (parent, tips)
+        };
+
         // ---- pass 1: classify into deterministic buckets ---------------
         // BTree* keeps processing order stable regardless of arrival order.
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -880,10 +898,27 @@ impl ProjectStore {
             blobs,
         };
         let encoded = record.encode();
+        let branch_records = timeline::branch_records_after_capture(
+            &self.ledger,
+            &prior_branch_tips,
+            &branch_parent,
+            &capture,
+        );
+        let branch_payloads: Vec<Vec<u8>> = branch_records
+            .iter()
+            .map(ledger::LedgerRecord::encode)
+            .collect();
+        let mut payloads: Vec<&[u8]> = Vec::with_capacity(2 + branch_payloads.len());
+        payloads.push(&delta);
+        payloads.push(&encoded);
+        payloads.extend(branch_payloads.iter().map(Vec::as_slice));
         self.journal
-            .append_batch_synced(&[&delta, &encoded])
+            .append_batch_synced(&payloads)
             .map_err(io_err)?;
         self.ledger.fold(record);
+        for record in branch_records {
+            self.ledger.fold(record);
+        }
         // Derived grep rows publish only after the authoritative update and
         // capture record are durable. Cache failure never rolls back history;
         // a later query falls back to exact point materialization and repairs
@@ -908,7 +943,9 @@ impl ProjectStore {
         // desynchronize it. Zero disables cadence snapshots (a `% 0` would
         // panic; nobody who disables the cadence wants one per edit).
         self.num_edits += 1;
-        self.bytes_since_snapshot += (delta.len() + encoded.len()) as u64;
+        self.bytes_since_snapshot +=
+            (delta.len() + encoded.len() + branch_payloads.iter().map(Vec::len).sum::<usize>())
+                as u64;
         outcome.snapshotted = false;
         if (self.limits.snapshot_edit_size > 0
             && self.num_edits % self.limits.snapshot_edit_size == 0)

@@ -128,6 +128,19 @@ pub struct BranchTip {
     pub capture_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    pub frontier: String,
+    pub capture_id: Option<String>,
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub on_current: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
 /// A capture plus the file-level difference from its exact parent frontier.
 /// This preserves the distinction between one debounced multi-file capture
 /// and an arbitrary range diff.
@@ -312,6 +325,14 @@ impl TimelineReader {
         checkpoints_from(&self.doc, &self.ledger, Some(&current))
     }
 
+    pub fn branches(&self) -> Vec<Branch> {
+        branches_from(
+            &self.doc,
+            &self.ledger,
+            Some(&decode_frontier(&self.current_frontier()).unwrap_or_default()),
+        )
+    }
+
     pub fn resolve(&self, reference: &str) -> Result<ResolvedPoint> {
         resolve_in_doc(
             &self.doc,
@@ -461,6 +482,14 @@ impl ProjectStore {
         )
     }
 
+    pub fn branches(&self) -> Vec<Branch> {
+        branches_from(
+            &self.doc,
+            &self.ledger,
+            Some(&self.materialized_frontiers()),
+        )
+    }
+
     /// Append a checkpoint label without creating a user-visible capture.
     /// Labels are ledger records (format 2): navigation state
     /// belongs in the mutable layer, and the old replicated `_sheaf.meta`
@@ -507,6 +536,100 @@ impl ProjectStore {
             timestamp_ms: pinned.as_ref().map(|c| c.timestamp_ms),
             on_current: true,
         })
+    }
+
+    pub fn create_branch(
+        &mut self,
+        name: &str,
+        reference: Option<&str>,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<Branch> {
+        validate_branch_name(name)?;
+        validate_branch_metadata(&metadata)?;
+        if self.ledger.branches.contains_key(name) {
+            return Err(SheafError::BranchExists(name.to_owned()));
+        }
+        let current = self.materialized_frontiers();
+        let target = match reference {
+            Some(reference) => resolve_in_doc(&self.doc, &self.ledger, &current, reference)?,
+            None => ResolvedPoint {
+                frontier: encode_frontier(&current),
+                capture_id: capture_id_at(&self.doc, &current),
+            },
+        };
+        if self
+            .ledger
+            .branches
+            .values()
+            .any(|branch| branch.frontier == target.frontier)
+        {
+            return Err(SheafError::Config(
+                "that timeline point already has a branch name".into(),
+            ));
+        }
+        let record = super::ledger::LedgerRecord::Branch {
+            name: name.to_owned(),
+            previous_name: None,
+            frontier: target.frontier,
+            capture_id: target.capture_id,
+            metadata,
+            deleted: false,
+        };
+        self.append_branch_record(record)?;
+        self.branch_named(name)
+    }
+
+    pub fn rename_branch(&mut self, old_name: &str, new_name: &str) -> Result<Branch> {
+        validate_branch_name(new_name)?;
+        let old = self
+            .ledger
+            .branches
+            .get(old_name)
+            .cloned()
+            .ok_or_else(|| SheafError::BranchNotFound(old_name.to_owned()))?;
+        if old_name != new_name && self.ledger.branches.contains_key(new_name) {
+            return Err(SheafError::BranchExists(new_name.to_owned()));
+        }
+        let record = super::ledger::LedgerRecord::Branch {
+            name: new_name.to_owned(),
+            previous_name: (old_name != new_name).then(|| old_name.to_owned()),
+            frontier: old.frontier,
+            capture_id: old.capture_id,
+            metadata: old.metadata,
+            deleted: false,
+        };
+        self.append_branch_record(record)?;
+        self.branch_named(new_name)
+    }
+
+    pub fn delete_branch(&mut self, name: &str) -> Result<Branch> {
+        let branch = self.branch_named(name)?;
+        let record = super::ledger::LedgerRecord::Branch {
+            name: name.to_owned(),
+            previous_name: None,
+            frontier: String::new(),
+            capture_id: None,
+            metadata: BTreeMap::new(),
+            deleted: true,
+        };
+        self.append_branch_record(record)?;
+        Ok(branch)
+    }
+
+    fn append_branch_record(&mut self, record: super::ledger::LedgerRecord) -> Result<()> {
+        let payload = record.encode();
+        self.journal
+            .append_batch_synced(&[payload.as_slice()])
+            .map_err(super::io_err)?;
+        self.ledger.fold(record);
+        Ok(())
+    }
+
+    fn branch_named(&self, name: &str) -> Result<Branch> {
+        self.branches()
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .ok_or_else(|| SheafError::BranchNotFound(name.to_owned()))
     }
 
     /// Move only the CRDT materialized state, leaving the worktree and the
@@ -849,6 +972,13 @@ pub(super) fn resolve_in_doc(
             capture_id: cp.capture_id,
         });
     }
+    if let Some(name) = reference.strip_prefix("branch:") {
+        let branch = ledger
+            .branches
+            .get(name)
+            .ok_or_else(|| SheafError::TimelineReference(format!("unknown branch `{name}`")))?;
+        return resolved_branch(ledger, name, branch);
+    }
     let explicit_time = reference.strip_prefix("time:");
     if let Some(spec) = explicit_time {
         let timestamp = parse_timestamp_spec(spec)
@@ -893,6 +1023,9 @@ pub(super) fn resolve_in_doc(
             frontier: cp.frontier,
             capture_id: cp.capture_id,
         });
+    }
+    if let Some((name, branch)) = ledger.branches.get_key_value(reference) {
+        return resolved_branch(ledger, name, branch);
     }
     if reference.len() < MIN_ID_PREFIX || !reference.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(SheafError::TimelineReference(format!(
@@ -1068,6 +1201,65 @@ fn parse_absolute_timestamp(spec: &str) -> Option<i64> {
     None
 }
 
+fn resolved_branch(
+    ledger: &super::ledger::LedgerState,
+    name: &str,
+    branch: &super::ledger::BranchRec,
+) -> Result<ResolvedPoint> {
+    if let Some(id) = &branch.capture_id {
+        if let Some(tomb) = ledger.tombstone(id) {
+            return Err(SheafError::TimelineReference(format!(
+                "branch `{name}` points to capture {}, which was pruned by {}",
+                &id[..12.min(id.len())],
+                tomb.cause.as_str(),
+            )));
+        }
+    }
+    Ok(ResolvedPoint {
+        frontier: branch.frontier.clone(),
+        capture_id: branch.capture_id.clone(),
+    })
+}
+
+fn branches_from(
+    doc: &LoroDoc,
+    ledger: &super::ledger::LedgerState,
+    current: Option<&Frontiers>,
+) -> Vec<Branch> {
+    let lineage: Option<BTreeSet<String>> = current.map(|frontier| {
+        captures_from(doc, ledger, frontier, None, None, usize::MAX)
+            .map(|captures| {
+                captures
+                    .into_iter()
+                    .map(|capture| capture.frontier)
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    ledger
+        .branches
+        .iter()
+        .map(|(name, branch)| {
+            let capture = decode_frontier(&branch.frontier)
+                .ok()
+                .and_then(|frontier| capture_at_frontier(doc, &frontier));
+            Branch {
+                name: name.clone(),
+                frontier: branch.frontier.clone(),
+                capture_id: capture
+                    .as_ref()
+                    .map(|capture| capture.id.clone())
+                    .or_else(|| branch.capture_id.clone()),
+                timestamp_ms: capture.as_ref().map(|capture| capture.timestamp_ms),
+                on_current: lineage
+                    .as_ref()
+                    .is_none_or(|lineage| lineage.contains(&branch.frontier)),
+                metadata: branch.metadata.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Checkpoints are labels over the whole version graph, not over whichever
 /// point the worktree happens to sit on. Reading them from the materialized
 /// state would make every name created after a restore target vanish the
@@ -1153,6 +1345,70 @@ fn checkpoint_labels(doc: &LoroDoc) -> Vec<(String, String)> {
     out
 }
 
+pub(super) fn branch_records_after_capture(
+    ledger: &super::ledger::LedgerState,
+    prior_tips: &[BranchTip],
+    parent_frontier: &str,
+    capture: &Capture,
+) -> Vec<super::ledger::LedgerRecord> {
+    let mut records = Vec::new();
+    let mut names: BTreeSet<String> = ledger.branches.keys().cloned().collect();
+    let mut named_frontiers: BTreeSet<String> = ledger
+        .branches
+        .values()
+        .map(|branch| branch.frontier.clone())
+        .collect();
+
+    for (name, branch) in &ledger.branches {
+        if branch.frontier == parent_frontier {
+            records.push(super::ledger::LedgerRecord::Branch {
+                name: name.clone(),
+                previous_name: None,
+                frontier: capture.frontier.clone(),
+                capture_id: Some(capture.id.clone()),
+                metadata: branch.metadata.clone(),
+                deleted: false,
+            });
+            named_frontiers.insert(capture.frontier.clone());
+        }
+    }
+
+    let diverged =
+        !prior_tips.is_empty() && !prior_tips.iter().any(|tip| tip.frontier == parent_frontier);
+    if !diverged {
+        return records;
+    }
+
+    for tip in prior_tips.iter().cloned().chain(std::iter::once(BranchTip {
+        frontier: capture.frontier.clone(),
+        capture_id: Some(capture.id.clone()),
+    })) {
+        if named_frontiers.contains(&tip.frontier) {
+            continue;
+        }
+        let basis = tip.capture_id.as_deref().unwrap_or(&tip.frontier);
+        let prefix = &basis[..12.min(basis.len())];
+        let base = format!("branch-{prefix}");
+        let mut name = base.clone();
+        let mut suffix = 2usize;
+        while names.contains(&name) {
+            name = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        names.insert(name.clone());
+        named_frontiers.insert(tip.frontier.clone());
+        records.push(super::ledger::LedgerRecord::Branch {
+            name,
+            previous_name: None,
+            frontier: tip.frontier,
+            capture_id: tip.capture_id,
+            metadata: BTreeMap::new(),
+            deleted: false,
+        });
+    }
+    records
+}
+
 pub(super) fn branch_tips_from(doc: &LoroDoc) -> Result<Vec<BranchTip>> {
     let mut out = Vec::new();
     for id in doc.oplog_frontiers().iter() {
@@ -1184,6 +1440,27 @@ fn validate_checkpoint_name(name: &str) -> Result<()> {
             "invalid checkpoint name `{name}`"
         )))
     }
+}
+
+fn validate_branch_name(name: &str) -> Result<()> {
+    validate_checkpoint_name(name)
+        .map_err(|_| SheafError::Config(format!("invalid branch name `{name}`")))
+}
+
+fn validate_branch_metadata(metadata: &BTreeMap<String, String>) -> Result<()> {
+    for (key, value) in metadata {
+        let valid_key = !key.is_empty()
+            && key.len() <= 128
+            && key == key.trim()
+            && key.chars().all(|c| !c.is_control());
+        let valid_value = value.len() <= 16 * 1024 && value.chars().all(|c| c != '\0');
+        if !valid_key || !valid_value {
+            return Err(SheafError::Config(format!(
+                "invalid branch metadata `{key}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn frontier_id(frontier: &Frontiers) -> String {
@@ -1531,6 +1808,99 @@ mod tests {
         assert_eq!(cp.name, "before work");
         assert!(cp.on_current);
         assert!(store.checkpoints().iter().any(|c| c.name == "before work"));
+    }
+
+    #[test]
+    fn branch_lifecycle_preserves_metadata_and_reference() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let mut store = opened(root);
+        store.apply_batch(&touch(root, "src/a.rs")).unwrap();
+        let target = store.resolve("@").unwrap();
+        let metadata = BTreeMap::from([
+            ("description".to_owned(), "parser experiment".to_owned()),
+            (
+                "tests".to_owned(),
+                "cargo test --workspace: pass".to_owned(),
+            ),
+        ]);
+
+        let created = store
+            .create_branch("experiment", None, metadata.clone())
+            .unwrap();
+        assert_eq!(created.metadata, metadata);
+        assert_eq!(store.resolve("branch:experiment").unwrap(), target);
+        assert!(matches!(
+            store.create_branch("experiment", None, BTreeMap::new()),
+            Err(SheafError::BranchExists(_))
+        ));
+
+        let renamed = store.rename_branch("experiment", "parser-work").unwrap();
+        assert_eq!(renamed.metadata, metadata);
+        assert!(matches!(
+            store.resolve("branch:experiment"),
+            Err(SheafError::TimelineReference(_))
+        ));
+
+        store.compact().unwrap();
+        drop(store);
+        let mut store = ProjectStore::open(root, limits()).unwrap();
+        let reopened = store
+            .branches()
+            .into_iter()
+            .find(|branch| branch.name == "parser-work")
+            .unwrap();
+        assert_eq!(reopened.metadata, metadata);
+        assert_eq!(store.resolve("branch:parser-work").unwrap(), target);
+        assert_eq!(store.resolve("parser-work").unwrap(), target);
+
+        let deleted = store.delete_branch("parser-work").unwrap();
+        assert_eq!(deleted.name, "parser-work");
+        assert!(store.branches().is_empty());
+        assert!(matches!(
+            store.delete_branch("parser-work"),
+            Err(SheafError::BranchNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn divergent_capture_generates_names_for_both_tips() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let mut store = opened(root);
+        let first = store
+            .apply_batch(&touch(root, "src/a.rs"))
+            .unwrap()
+            .capture
+            .unwrap();
+        let second = store
+            .apply_batch(&touch(root, "src/b.rs"))
+            .unwrap()
+            .capture
+            .unwrap();
+
+        store.checkout_for_branch(&first.frontier).unwrap();
+        store
+            .write_head_point(Some(&first.id), &first.frontier, 0)
+            .unwrap();
+        let divergent = store
+            .apply_batch(&touch(root, "src/c.rs"))
+            .unwrap()
+            .capture
+            .unwrap();
+
+        let branches = store.branches();
+        assert_eq!(branches.len(), 2);
+        assert!(branches
+            .iter()
+            .all(|branch| branch.name.starts_with("branch-")));
+        assert!(branches
+            .iter()
+            .any(|branch| branch.capture_id.as_deref() == Some(second.id.as_str())));
+        assert!(branches
+            .iter()
+            .any(|branch| branch.capture_id.as_deref() == Some(divergent.id.as_str())));
+        assert_eq!(store.branch_tips().unwrap().len(), 2);
     }
 
     #[test]

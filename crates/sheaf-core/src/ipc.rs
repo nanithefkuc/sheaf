@@ -48,8 +48,8 @@ use crate::error::{Result, SheafError};
 /// Additive only.
 
 pub const PROTO_MAJOR: u32 = 1;
-/// Minor 1.9: live timeline worktrees and explicit squash merges.
-pub const PROTO_MINOR: u32 = 9;
+/// Minor 1.10: named branches, lifecycle operations, and branch metadata.
+pub const PROTO_MINOR: u32 = 10;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;

@@ -288,6 +288,76 @@ fn checkpoint_create_writes_names_and_the_log_annotates_them() {
     assert!(out.contains("scope:       whole worktree"), "{out}");
 }
 
+// ------------------------------------------------------------- branch CRUD
+
+#[test]
+fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
+    let fx = fixture("branch", V1);
+
+    let (ok, out, err) = sheaf(
+        &fx,
+        &[
+            "branch",
+            "create",
+            "experiment",
+            "--metadata",
+            "description=parser work",
+            "--metadata",
+            "tests=pass",
+        ],
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("branch experiment -> "), "{out}");
+
+    let (ok, out, err) = sheaf(&fx, &["branch", "rename", "experiment", "primary"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("branch experiment renamed to primary"),
+        "{out}"
+    );
+
+    write_file(&fx.root, "src/lib.rs", V2);
+    wait_caught_up(&fx);
+    let (ok, _, err) = sheaf(&fx, &["restore", "@~1"]);
+    assert!(ok, "{err}");
+    write_file(&fx.root, "src/lib.rs", V3);
+    wait_caught_up(&fx);
+
+    let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
+    assert!(ok, "{err}");
+    let value = json_out(&out);
+    assert_eq!(value["degraded"], serde_json::json!(false));
+    let branches = value["branches"].as_array().unwrap();
+    assert_eq!(branches.len(), 2, "{value:#}");
+    let primary = branches
+        .iter()
+        .find(|branch| branch["name"] == "primary")
+        .expect("renamed branch");
+    assert_eq!(primary["metadata"]["description"], "parser work");
+    assert_eq!(primary["metadata"]["tests"], "pass");
+    let automatic = branches
+        .iter()
+        .find(|branch| {
+            branch["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("branch-"))
+        })
+        .expect("automatic branch name");
+    let automatic_name = automatic["name"].as_str().unwrap();
+
+    let (ok, out, err) = sheaf(&fx, &["branch", "delete", automatic_name]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("deleted branch {automatic_name}")),
+        "{out}"
+    );
+    let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
+    assert!(ok, "{err}");
+    let value = json_out(&out);
+    assert_eq!(value["branches"].as_array().unwrap().len(), 1);
+    assert_eq!(value["branches"][0]["name"], "primary");
+}
+
 // ------------------------------------------------------------- status/log
 
 #[test]

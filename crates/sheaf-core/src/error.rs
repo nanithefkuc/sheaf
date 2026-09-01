@@ -40,6 +40,11 @@ pub enum SheafError {
 
     #[error("checkpoint `{0}` already exists")]
     CheckpointExists(String),
+    #[error("branch `{0}` already exists")]
+    BranchExists(String),
+
+    #[error("unknown branch `{0}`")]
+    BranchNotFound(String),
 
     #[error("invalid timeline reference: {0}")]
     TimelineReference(String),
@@ -80,6 +85,8 @@ impl SheafError {
             SheafError::Ipc(_) => "internal",
             SheafError::WatchInit { .. } => "unsupported",
             SheafError::CheckpointExists(_) => "exists",
+            SheafError::BranchExists(_) => "exists",
+            SheafError::BranchNotFound(_) => "state.not_found",
             SheafError::TimelineReference(_) => "state.bad_reference",
             SheafError::BadCursor(_) => "state.bad_cursor",
             SheafError::RestorePlanStale(_) => "restore.plan_stale",
@@ -130,6 +137,8 @@ mod tests {
                 "unsupported",
             ),
             (SheafError::CheckpointExists("name".into()), "exists"),
+            (SheafError::BranchExists("name".into()), "exists"),
+            (SheafError::BranchNotFound("name".into()), "state.not_found"),
             (
                 SheafError::TimelineReference("nope".into()),
                 "state.bad_reference",

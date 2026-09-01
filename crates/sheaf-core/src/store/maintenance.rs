@@ -1056,6 +1056,13 @@ pub(super) fn plan_retention(
             reason: format!("checkpoint '{}'", checkpoint.name),
         });
     }
+    for (name, branch) in &ledger.branches {
+        seeds.push(ProtectedPoint {
+            frontier: branch.frontier.clone(),
+            capture_id: branch.capture_id.clone(),
+            reason: format!("branch '{name}'"),
+        });
+    }
     if let Some(intent) = pending_restore_at(root) {
         seeds.push(ProtectedPoint {
             capture_id: intent.target.capture_id.clone(),

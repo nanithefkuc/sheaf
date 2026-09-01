@@ -13,7 +13,7 @@
 //!     collector, covering timeline, checkpoint, diff, grep, restore, and
 //!     squash methods.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -168,6 +168,24 @@ enum StoreCommand {
         name: String,
         reference: Option<String>,
         reply: Sender<std::result::Result<sheaf_core::store::Checkpoint, sheaf_core::SheafError>>,
+    },
+    ListBranches {
+        reply: Sender<std::result::Result<Vec<sheaf_core::store::Branch>, sheaf_core::SheafError>>,
+    },
+    CreateBranch {
+        name: String,
+        reference: Option<String>,
+        metadata: BTreeMap<String, String>,
+        reply: Sender<std::result::Result<sheaf_core::store::Branch, sheaf_core::SheafError>>,
+    },
+    RenameBranch {
+        old_name: String,
+        new_name: String,
+        reply: Sender<std::result::Result<sheaf_core::store::Branch, sheaf_core::SheafError>>,
+    },
+    DeleteBranch {
+        name: String,
+        reply: Sender<std::result::Result<sheaf_core::store::Branch, sheaf_core::SheafError>>,
     },
     /// Dry-run a restore. Pure computation; never touches the worktree.
     PlanRestore {
@@ -1342,6 +1360,9 @@ impl StoreCommand {
         match self {
             StoreCommand::InWorktree { command, .. } => command.crosses_debounce_boundary(),
             StoreCommand::CreateCheckpoint { .. }
+            | StoreCommand::CreateBranch { .. }
+            | StoreCommand::RenameBranch { .. }
+            | StoreCommand::DeleteBranch { .. }
             | StoreCommand::ApplyRestore { .. }
             | StoreCommand::ResumeRestore { .. }
             | StoreCommand::ApplyFragment { .. }
@@ -1387,6 +1408,14 @@ impl StoreCommand {
                 let _ = reply.send(Err(error));
             }
             StoreCommand::CreateCheckpoint { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            StoreCommand::ListBranches { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            StoreCommand::CreateBranch { reply, .. }
+            | StoreCommand::RenameBranch { reply, .. }
+            | StoreCommand::DeleteBranch { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             StoreCommand::PlanRestore { reply, .. } => {
@@ -1529,6 +1558,39 @@ fn handle_store_command(
             let result = match flush_error {
                 Some(error) => Err(error),
                 None => store.create_checkpoint(&name, reference.as_deref()),
+            };
+            let _ = reply.send(result);
+        }
+        StoreCommand::ListBranches { reply } => {
+            let _ = reply.send(Ok(store.branches()));
+        }
+        StoreCommand::CreateBranch {
+            name,
+            reference,
+            metadata,
+            reply,
+        } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => store.create_branch(&name, reference.as_deref(), metadata),
+            };
+            let _ = reply.send(result);
+        }
+        StoreCommand::RenameBranch {
+            old_name,
+            new_name,
+            reply,
+        } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => store.rename_branch(&old_name, &new_name),
+            };
+            let _ = reply.send(result);
+        }
+        StoreCommand::DeleteBranch { name, reply } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => store.delete_branch(&name),
             };
             let _ = reply.send(result);
         }
@@ -1904,6 +1966,10 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                     "timeline.info",
                     "checkpoint.list",
                     "checkpoint.create",
+                    "branch.list",
+                    "branch.create",
+                    "branch.rename",
+                    "branch.delete",
                     "restore.plan",
                     "restore.apply",
                     "restore.resume",
@@ -1931,6 +1997,10 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
         "timeline.info" => plain(timeline_info(shared, req, rid)),
         "checkpoint.list" => plain(checkpoint_list(shared, req, rid)),
         "checkpoint.create" => plain(checkpoint_create(shared, req, rid)),
+        "branch.list" => plain(branch_list(shared, req, rid)),
+        "branch.create" => plain(branch_create(shared, req, rid)),
+        "branch.rename" => plain(branch_rename(shared, req, rid)),
+        "branch.delete" => plain(branch_delete(shared, req, rid)),
         // Plans stream through the body-chunk channel: the envelope carries
         // a bounded summary, the full plan the bytes.
         "restore.plan" => bytes(restore_plan_streamed(shared, req, rid)),
@@ -2321,6 +2391,138 @@ fn checkpoint_create(shared: &Shared, req: &Request, rid: String) -> Response {
             rid,
             IpcError::new("internal", "checkpoint request timed out"),
         ),
+    }
+}
+fn branch_list(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(project) => normalize(project),
+        Err(response) => return response,
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::ListBranches { reply: reply_tx })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(branches)) => Response::ok(rid, json!({"branches": branches, "degraded": false})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "branch list timed out")),
+    }
+}
+
+fn branch_create(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(project) => normalize(project),
+        Err(response) => return response,
+    };
+    let Some(name) = req.params.get("name").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`name` is required"));
+    };
+    let reference = req
+        .params
+        .get("at")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let metadata = match req.params.get("metadata") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return Response::err(
+                    rid,
+                    IpcError::new("bad.params", "`metadata` must be a string-to-string object"),
+                )
+            }
+        },
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::CreateBranch {
+            name: name.to_owned(),
+            reference,
+            metadata,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(branch)) => Response::ok(rid, json!({"branch": branch})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "branch create timed out")),
+    }
+}
+
+fn branch_rename(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(project) => normalize(project),
+        Err(response) => return response,
+    };
+    let Some(old_name) = req.params.get("old_name").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`old_name` is required"));
+    };
+    let Some(new_name) = req.params.get("new_name").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`new_name` is required"));
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::RenameBranch {
+            old_name: old_name.to_owned(),
+            new_name: new_name.to_owned(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(branch)) => Response::ok(rid, json!({"branch": branch})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "branch rename timed out")),
+    }
+}
+
+fn branch_delete(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(project) => normalize(project),
+        Err(response) => return response,
+    };
+    let Some(name) = req.params.get("name").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`name` is required"));
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::DeleteBranch {
+            name: name.to_owned(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(branch)) => Response::ok(rid, json!({"branch": branch})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "branch delete timed out")),
     }
 }
 

@@ -11,7 +11,7 @@
 //!
 //! Journal payloads are self-describing: every Loro export starts with the
 //! `b"loro"` magic (loro-internal `encoding.rs` decode path), so a payload
-//! beginning with a ledger tag byte (0x01..=0x05) can never be confused
+//! beginning with a ledger tag byte (0x01..=0x06) can never be confused
 //! with an update. Format-1 stores contain only update frames and load
 //! unchanged; format 2 additionally carries `[tag][json]` records.
 
@@ -24,13 +24,14 @@ use crate::error::{Result, SheafError};
 /// First byte of every Loro-encoded export payload.
 const LORO_MAGIC: &[u8; 4] = b"loro";
 /// Framing tag bytes for each ledger record variant. Chosen in the range
-/// `0x01..=0x05` so no ledger frame can begin with the `b"loro"` magic and be
+/// `0x01..=0x06` so no ledger frame can begin with the `b"loro"` magic and be
 /// mistaken for an update delta.
 pub const TAG_CAPTURE: u8 = 0x01;
 pub const TAG_CHECKPOINT: u8 = 0x02;
 pub const TAG_MARK: u8 = 0x03;
 pub const TAG_TOMBSTONE: u8 = 0x04;
 pub const TAG_EPOCH: u8 = 0x05;
+pub const TAG_BRANCH: u8 = 0x06;
 
 /// What one journal payload holds.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +56,7 @@ pub fn classify_payload(payload: &[u8]) -> Option<Frame> {
         TAG_MARK,
         TAG_TOMBSTONE,
         TAG_EPOCH,
+        TAG_BRANCH,
     ]
     .contains(&tag)
     {
@@ -71,6 +73,7 @@ pub fn classify_payload(payload: &[u8]) -> Option<Frame> {
             | (LedgerRecord::Mark { .. }, TAG_MARK)
             | (LedgerRecord::Tombstone { .. }, TAG_TOMBSTONE)
             | (LedgerRecord::Epoch { .. }, TAG_EPOCH)
+            | (LedgerRecord::Branch { .. }, TAG_BRANCH)
     );
     agrees.then_some(Frame::Record(record))
 }
@@ -99,6 +102,22 @@ pub enum LedgerRecord {
         frontier: String,
         #[serde(default)]
         capture_id: Option<String>,
+    },
+    /// Mutable branch label and its arbitrary user metadata. `previous_name`
+    /// makes rename one atomic ledger frame; `deleted` removes the folded
+    /// label without rewriting the append-only journal.
+    Branch {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_name: Option<String>,
+        #[serde(default)]
+        frontier: String,
+        #[serde(default)]
+        capture_id: Option<String>,
+        #[serde(default)]
+        metadata: BTreeMap<String, String>,
+        #[serde(default)]
+        deleted: bool,
     },
     /// Explicit user mark: this point is collectable even though
     /// reachability would protect it — the one sanctioned way to bypass the
@@ -181,6 +200,22 @@ impl LedgerRecord {
                     capture_id.as_deref().map(short).unwrap_or("?")
                 )
             }
+            LedgerRecord::Branch {
+                name,
+                capture_id,
+                deleted,
+                ..
+            } => {
+                if *deleted {
+                    format!("branch delete '{name}'")
+                } else {
+                    format!(
+                        "branch '{}' at {}",
+                        name,
+                        capture_id.as_deref().map(short).unwrap_or("?")
+                    )
+                }
+            }
             LedgerRecord::Mark { capture_id, .. } => format!("mark {}", short(capture_id)),
             LedgerRecord::Tombstone {
                 capture_id, cause, ..
@@ -205,6 +240,7 @@ impl LedgerRecord {
         let tag = match self {
             LedgerRecord::Capture { .. } => TAG_CAPTURE,
             LedgerRecord::Checkpoint { .. } => TAG_CHECKPOINT,
+            LedgerRecord::Branch { .. } => TAG_BRANCH,
             LedgerRecord::Mark { .. } => TAG_MARK,
             LedgerRecord::Tombstone { .. } => TAG_TOMBSTONE,
             LedgerRecord::Epoch { .. } => TAG_EPOCH,
@@ -233,6 +269,8 @@ pub struct LedgerState {
     #[serde(default)]
     pub checkpoints: BTreeMap<String, CheckpointRec>,
     #[serde(default)]
+    pub branches: BTreeMap<String, BranchRec>,
+    #[serde(default)]
     pub epochs: Vec<EpochRec>,
 }
 
@@ -256,6 +294,15 @@ pub struct CheckpointRec {
     pub frontier: String,
     #[serde(default)]
     pub capture_id: Option<String>,
+}
+/// Folded mutable branch label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchRec {
+    pub frontier: String,
+    #[serde(default)]
+    pub capture_id: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Folded ghost of a pruned capture: enough metadata to name what was lost
@@ -320,6 +367,30 @@ impl LedgerState {
                         capture_id,
                     },
                 );
+            }
+            LedgerRecord::Branch {
+                name,
+                previous_name,
+                frontier,
+                capture_id,
+                metadata,
+                deleted,
+            } => {
+                if let Some(previous) = previous_name {
+                    self.branches.remove(&previous);
+                }
+                if deleted {
+                    self.branches.remove(&name);
+                } else {
+                    self.branches.insert(
+                        name,
+                        BranchRec {
+                            frontier,
+                            capture_id,
+                            metadata,
+                        },
+                    );
+                }
             }
             LedgerRecord::Mark {
                 capture_id,
@@ -416,6 +487,14 @@ mod tests {
                 name: "before refactoring".into(),
                 frontier: "ff00".into(),
                 capture_id: Some("abc".into()),
+            },
+            LedgerRecord::Branch {
+                name: "parser".into(),
+                previous_name: None,
+                frontier: "ff00".into(),
+                capture_id: Some("abc".into()),
+                metadata: BTreeMap::from([("tests".into(), "pass".into())]),
+                deleted: false,
             },
             LedgerRecord::Mark {
                 capture_id: "abc".into(),
