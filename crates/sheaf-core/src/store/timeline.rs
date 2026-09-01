@@ -1317,7 +1317,14 @@ pub(super) fn checkpoints_from(
             }
         })
         .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Newest first, matching `sheaf log`; the pinned capture's timestamp is
+    // the creation-time proxy (the ledger record carries none of its own),
+    // with name as the tiebreak and unknown timestamps sinking to the end.
+    out.sort_by(|a, b| {
+        b.timestamp_ms
+            .cmp(&a.timestamp_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out
 }
 

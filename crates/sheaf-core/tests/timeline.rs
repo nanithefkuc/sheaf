@@ -186,6 +186,25 @@ fn checkpoints_bind_exact_frontiers_and_survive_reopen() {
 }
 
 #[test]
+fn checkpoint_listing_is_chronological_not_alphabetical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    skeleton(root);
+    let mut store = ProjectStore::open(root, limits()).unwrap();
+    capture(&mut store, root, "f.txt", "old", 1_700_000_000_100);
+    store.create_checkpoint("zzz-older", None).unwrap();
+    capture(&mut store, root, "f.txt", "new", 1_700_000_001_100);
+    store.create_checkpoint("aaa-newer", None).unwrap();
+
+    let names: Vec<_> = store
+        .checkpoints()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, vec!["aaa-newer", "zzz-older"]);
+}
+
+#[test]
 fn checkout_then_edit_keeps_abandoned_future_reachable() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -338,6 +357,11 @@ fn checkpoints_carry_timestamps_and_lineage() {
     store.apply_restore(&plan, &ignore).unwrap();
 
     let cps = store.checkpoints();
+    // Listing is chronological (newest first), not alphabetical.
+    assert_eq!(
+        cps.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["after-wreck", "before-wreck"]
+    );
     let before = cps.iter().find(|c| c.name == "before-wreck").unwrap();
     assert_eq!(before.timestamp_ms, Some(1_700_000_000_100));
     assert!(before.on_current);

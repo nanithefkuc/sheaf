@@ -2098,6 +2098,12 @@ fn cmd_checkpoint_list(project: Option<&Path>, as_json: bool, color: ColorWhen) 
     let socket = sheaf_core::paths::control_socket_path();
     let (checkpoints, degraded) = match Client::connect(&socket, Duration::from_secs(2)) {
         Ok(mut client) => {
+            // The daemon lazily opens the project store on first activity
+            // and then folds every checkpoint over the whole timeline; on a
+            // large store that legitimately outlives the 2s handshake
+            // budget (the daemon allows itself REQUEST_SOFT = 10s). Widen
+            // the read budget before asking, mirroring checkpoint create.
+            client.set_timeout(Duration::from_secs(30))?;
             let reply = client.call("checkpoint.list", Some(&root), serde_json::json!({}), None)?;
             if !reply.response.ok {
                 return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
