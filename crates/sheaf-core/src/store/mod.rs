@@ -19,12 +19,15 @@ mod grep;
 mod grep_trigram;
 mod journal;
 mod ledger;
+
 mod maintenance;
 mod restore;
 mod selection;
 mod smart;
 mod squash;
 mod timeline;
+mod worktree;
+
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +68,7 @@ pub use maintenance::{
     DoctorReply, GcOutcome, GcPlan, GcReport, IntegrityReport, MarkedCapture, ProtectedPoint,
     PrunableCapture, Refusal, RepairOutcome, RetentionFacts,
 };
+
 pub use restore::{
     pending_restore_at, scope_key, ActionKind, ContentKind, Obstacle, Obstruction, RestoreAction,
     RestoreIntent, RestoreMode, RestoreOutcome, RestorePlan,
@@ -90,6 +94,8 @@ pub use timeline::{
     decode_frontier, encode_frontier, BranchTip, Capture, CaptureInfo, CaptureOrigin, Checkpoint,
     OriginKind, ResolvedPoint, TimelineReader,
 };
+pub use worktree::{linked_worktrees, WorktreeInfo};
+
 
 use crate::config::{self, sheaf_dir};
 use crate::error::{Result, SheafError};
@@ -212,6 +218,9 @@ struct Manifest {
 
 pub struct ProjectStore {
     root: PathBuf,
+    /// Primary project root which owns `.sheaf/` and the single writer lock.
+    store_root: PathBuf,
+
     sdir: PathBuf,
     doc: LoroDoc,
     last_vv: VersionVector,
@@ -489,6 +498,8 @@ impl ProjectStore {
         );
 
         let mut store = ProjectStore {
+            store_root: config::store_root(root),
+
             root: root.to_path_buf(),
             sdir,
             doc,
@@ -543,6 +554,53 @@ impl ProjectStore {
     /// Project root this store belongs to.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Primary worktree which owns the shared store.
+    pub fn store_root(&self) -> &Path {
+        &self.store_root
+    }
+
+    /// Reposition the in-memory document onto one registered physical
+    /// worktree before reading or authoring its branch.
+    pub fn activate_worktree(&mut self, root: &Path) -> Result<()> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if root == self.root {
+            return Ok(());
+        }
+        if config::store_root(&root) != self.store_root || !self.is_registered_worktree(&root)? {
+            return Err(SheafError::Config(format!(
+                "{} is not a managed worktree of {}",
+                root.display(),
+                self.store_root.display()
+            )));
+        }
+        let frontier = timeline::read_head_frontier(&root)
+            .ok_or_else(|| SheafError::StoreCorrupt(format!(
+                "managed worktree {} has no head state",
+                root.display()
+            )))?;
+        let frontier = timeline::decode_frontier(&frontier)?;
+        if self.doc.frontiers_to_vv(&frontier).is_none() {
+            return Err(SheafError::StoreCorrupt(format!(
+                "managed worktree {} points outside recorded history",
+                root.display()
+            )));
+        }
+        self.doc.checkout(&frontier).map_err(store_err)?;
+        self.doc.set_detached_editing(true);
+        self.doc.free_history_cache();
+        self.doc.free_diff_calculator();
+        self.root = root;
+        self.tracked_text_bytes = 0;
+        self.doc.get_map(FILES_MAP).for_each(|_, value| {
+            if let loro::ValueOrContainer::Container(loro::Container::Text(text)) = value {
+                self.tracked_text_bytes = self
+                    .tracked_text_bytes
+                    .saturating_add(text.to_string().len() as u64);
+            }
+        });
+        Ok(())
     }
 
     /// Folded timeline ledger (checkpoints, marks, tombstones).
@@ -1272,18 +1330,9 @@ impl ProjectStore {
             "flushed_at": Utc::now().to_rfc3339(),
             "root": self.root.display().to_string(),
         });
-        let dir = state_dir(&self.root);
-        let tmp = dir.join(".worktree.head.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(head.to_string_pretty_or_compact().as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(tmp, dir.join("worktree.head")).map_err(io_err)?;
-        // The rename is the publish point; its directory entry must be on
-        // stable storage too or a power cut reverts the head while committed
-        // journal frames survive (parent-dir fsync).
-        fsutil::sync_parent_dir(&dir.join("worktree.head")).map_err(io_err)
+        let path = config::worktree_head_path(&self.root);
+        fsutil::atomic_write(&path, head.to_string_pretty_or_compact().as_bytes()).map_err(io_err)
+
     }
 
     /// Structural records as currently materialized (`tree_events`).

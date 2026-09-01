@@ -28,6 +28,9 @@ pub const FORMAT_FILE: &str = "FORMAT_VERSION";
 pub const CONFIG_FILE: &str = "config.toml";
 /// Name of the per-project store directory at the project root.
 pub const SHEAF_DIR_NAME: &str = ".sheaf";
+/// Format version of the lightweight `.sheaf` link file in managed worktrees.
+pub const WORKTREE_LINK_VERSION: u32 = 1;
+
 
 /// Debounce and buffering knobs that govern how filesystem activity is
 /// coalesced into captured batches.
@@ -96,6 +99,8 @@ pub struct IgnoreConfig {
 pub fn default_patterns() -> Vec<String> {
     vec![
         ".sheaf/".into(),
+        ".sheaf".into(), // managed worktrees carry a link file, not a store directory
+
         ".git/".into(),
         "node_modules/".into(),
         "target/".into(),
@@ -232,11 +237,74 @@ pub struct ProjectConfig {
 fn default_format_version() -> u32 {
     STORE_FORMAT_VERSION
 }
-
-/// `<root>/.sheaf`
-pub fn sheaf_dir(root: &Path) -> PathBuf {
-    root.join(SHEAF_DIR_NAME)
+/// A managed worktree's `.sheaf` file points at the primary worktree whose
+/// store and daemon writer it shares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeLink {
+    pub version: u32,
+    pub store_root: PathBuf,
+    pub id: String,
 }
+
+/// Parse a managed-worktree link. A directory-valued `.sheaf` is the primary
+/// store and therefore not a link.
+pub fn worktree_link(root: &Path) -> Option<WorktreeLink> {
+    let marker = root.join(SHEAF_DIR_NAME);
+    if !marker.is_file() {
+        return None;
+    }
+    let link: WorktreeLink = serde_json::from_slice(&std::fs::read(marker).ok()?).ok()?;
+    (link.version == WORKTREE_LINK_VERSION
+        && link.store_root.is_absolute()
+        && !link.id.is_empty()
+        && !link.id.chars().any(char::is_whitespace))
+    .then_some(link)
+}
+
+/// Primary project root which owns the shared store.
+pub fn store_root(root: &Path) -> PathBuf {
+    worktree_link(root)
+        .map(|link| link.store_root)
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+/// Stable worktree identity. The primary worktree has no explicit ID.
+pub fn worktree_id(root: &Path) -> Option<String> {
+    worktree_link(root).map(|link| link.id)
+}
+
+/// Advisory head file belonging to this physical worktree.
+pub fn worktree_head_path(root: &Path) -> PathBuf {
+    let state = sheaf_dir(root).join("state");
+    match worktree_id(root) {
+        Some(id) => state.join("worktrees").join(format!("{id}.head")),
+        None => state.join("worktree.head"),
+    }
+}
+
+/// Write the managed-worktree marker after its directory has been
+/// materialized. The caller owns path collision and atomic-directory rules.
+pub fn write_worktree_link(root: &Path, link: &WorktreeLink) -> Result<()> {
+    if link.version != WORKTREE_LINK_VERSION
+        || !link.store_root.is_absolute()
+        || link.id.is_empty()
+        || link.id.chars().any(char::is_whitespace)
+    {
+        return Err(SheafError::Config("invalid worktree link".into()));
+    }
+    let bytes = serde_json::to_vec_pretty(link)
+        .map_err(|e| SheafError::Config(format!("worktree link serialize: {e}")))?;
+    std::fs::write(root.join(SHEAF_DIR_NAME), bytes)?;
+    Ok(())
+}
+
+
+/// `<root>/.sheaf` for a primary worktree, or the shared store directory
+/// named by a managed worktree's `.sheaf` link file.
+pub fn sheaf_dir(root: &Path) -> PathBuf {
+    store_root(root).join(SHEAF_DIR_NAME)
+}
+
 
 /// Path to the retired legacy `FORMAT_VERSION` marker, `<root>/.sheaf/FORMAT_VERSION`.
 pub fn format_file_path(root: &Path) -> PathBuf {
@@ -367,6 +435,141 @@ mod tests {
         let rendered = render_default();
         assert!(rendered.contains("[store]"));
         assert!(rendered.contains("snapshot_edit_size = 512"));
+    }
+
+    #[test]
+    fn managed_worktree_resolves_shared_store_and_own_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        write_skeleton(&primary).unwrap();
+        let link = WorktreeLink {
+            version: WORKTREE_LINK_VERSION,
+            store_root: primary.clone(),
+            id: "branch-a".into(),
+        };
+        write_worktree_link(&linked, &link).unwrap();
+
+        assert_eq!(worktree_link(&linked), Some(link));
+        assert_eq!(store_root(&linked), primary);
+        assert_eq!(config_file_path(&linked), config_file_path(&primary));
+        assert_eq!(read_store_format(&linked).unwrap(), STORE_FORMAT_VERSION);
+        assert_eq!(
+            worktree_head_path(&linked),
+            sheaf_dir(&primary)
+                .join("state/worktrees")
+                .join("branch-a.head")
+        );
+        assert_eq!(
+            worktree_head_path(&primary),
+            sheaf_dir(&primary).join("state/worktree.head")
+        );
+    }
+
+    #[test]
+    fn worktree_id_distinguishes_primary_from_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        write_skeleton(&primary).unwrap();
+        // The primary worktree has a directory-valued `.sheaf` marker: no link,
+        // no id, and it resolves to itself.
+        assert_eq!(worktree_id(&primary), None);
+        assert_eq!(worktree_link(&primary), None);
+        assert_eq!(store_root(&primary), primary);
+        assert_eq!(
+            worktree_head_path(&primary),
+            sheaf_dir(&primary).join("state/worktree.head")
+        );
+
+        write_worktree_link(
+            &linked,
+            &WorktreeLink {
+                version: WORKTREE_LINK_VERSION,
+                store_root: primary.clone(),
+                id: "branch-z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(worktree_id(&linked).as_deref(), Some("branch-z"));
+        assert_eq!(store_root(&linked), primary);
+        assert_eq!(
+            worktree_head_path(&linked),
+            sheaf_dir(&primary).join("state/worktrees/branch-z.head")
+        );
+        assert_ne!(worktree_head_path(&linked), worktree_head_path(&primary));
+    }
+
+    #[test]
+    fn write_worktree_link_rejects_malformed_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let good = || WorktreeLink {
+            version: WORKTREE_LINK_VERSION,
+            store_root: root.to_path_buf(),
+            id: "abc123".into(),
+        };
+        // Wrong version.
+        let mut bad = good();
+        bad.version = WORKTREE_LINK_VERSION + 1;
+        assert!(write_worktree_link(root, &bad).is_err());
+        // Relative store root.
+        let mut bad = good();
+        bad.store_root = PathBuf::from("relative/path");
+        assert!(write_worktree_link(root, &bad).is_err());
+        // Empty id.
+        let mut bad = good();
+        bad.id = String::new();
+        assert!(write_worktree_link(root, &bad).is_err());
+        // Whitespace in id.
+        let mut bad = good();
+        bad.id = "bad id".into();
+        assert!(write_worktree_link(root, &bad).is_err());
+        // A valid link writes and round-trips.
+        write_worktree_link(root, &good()).unwrap();
+        assert_eq!(worktree_link(root), Some(good()));
+    }
+
+    #[test]
+    fn worktree_link_rejects_corrupt_marker_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let marker = root.join(SHEAF_DIR_NAME);
+        // Not JSON at all.
+        std::fs::write(&marker, b"not json").unwrap();
+        assert_eq!(worktree_link(root), None);
+        // Well-formed JSON but a stale link version is rejected.
+        std::fs::write(
+            &marker,
+            serde_json::json!({
+                "version": WORKTREE_LINK_VERSION + 1,
+                "store_root": "/abs/primary",
+                "id": "abc",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(worktree_link(root), None);
+        // A relative store_root is refused.
+        std::fs::write(
+            &marker,
+            serde_json::json!({
+                "version": WORKTREE_LINK_VERSION,
+                "store_root": "relative",
+                "id": "abc",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(worktree_link(root), None);
+        // An unlinked root (no marker at all) is simply primary.
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(worktree_link(root), None);
+        assert_eq!(store_root(root), root);
     }
 
     #[test]

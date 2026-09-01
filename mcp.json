@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "sheaf": {
+      "command": "sheaf-mcp"
+    }
+  }
+}

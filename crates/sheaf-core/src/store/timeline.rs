@@ -10,9 +10,8 @@ use loro::{CommitOptions, Frontiers, LoroDoc, ID};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{
-    import_err, journal, log_pending, newest_manifest, state_dir, store_dir, ProjectStore, META_MAP,
-};
+use super::{import_err, journal, log_pending, newest_manifest, store_dir, ProjectStore, META_MAP};
+
 use crate::config;
 use crate::error::{Result, SheafError};
 use crate::events::{Batch, EventKind};
@@ -52,6 +51,9 @@ pub enum OriginKind {
     /// The forward capture a selection-scoped fragment restore appended;
     /// its `selections` carry the handle IDs that produced it.
     FragmentRestore,
+    /// A divergent source branch squashed onto the active worktree.
+    Merge,
+
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1201,7 +1203,7 @@ pub fn decode_frontier(encoded: &str) -> Result<Frontiers> {
 }
 
 pub(super) fn read_head_frontier(root: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(state_dir(root).join("worktree.head")).ok()?;
+    let raw = std::fs::read_to_string(crate::config::worktree_head_path(root)).ok()?;
     serde_json::from_str::<serde_json::Value>(&raw)
         .ok()?
         .get("frontier")?

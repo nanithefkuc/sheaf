@@ -172,10 +172,14 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 fn sheaf(fx: &Fixture, args: &[&str]) -> (bool, String, String) {
+    sheaf_at(fx, &fx.root, args)
+}
+
+fn sheaf_at(fx: &Fixture, root: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(SHEAF)
         .env("SHEAF_SOCKET", &fx.socket)
         .args(args)
-        .current_dir(&fx.root)
+        .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -187,6 +191,7 @@ fn sheaf(fx: &Fixture, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+
 fn write_file(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -195,12 +200,16 @@ fn write_file(root: &Path, rel: &str, contents: &str) {
 
 /// Block until the daemon has captured the current worktree state.
 fn wait_caught_up(fx: &Fixture) {
+    wait_caught_up_at(fx, &fx.root);
+}
+
+fn wait_caught_up_at(fx: &Fixture, root: &Path) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(mut client) = Client::connect(&fx.socket, Duration::from_secs(2)) {
             if let Ok(reply) = client.call(
                 "diff",
-                Some(&fx.root),
+                Some(root),
                 serde_json::json!({ "from": "@", "to": null, "paths": [] }),
                 None,
             ) {
@@ -520,3 +529,107 @@ fn restore_resume_and_abandon_report_daemon_errors_without_pending_intent() {
     assert!(ok, "abandon should be idempotent: {err}");
     assert!(out.contains("restore intent abandoned"), "{out}");
 }
+
+// --------------------------------------------------- worktree list / add (human)
+
+#[test]
+fn worktree_list_human_marks_primary_and_shows_linked_tips() {
+    let fx = fixture("wt-list-human", V1);
+    let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "base"]);
+    assert!(ok, "{err}");
+
+    let linked = fx._env.base.join("branch");
+    // The human `worktree add` report names the destination and confirms the
+    // daemon is watching the new physical worktree.
+    let (ok, add_out, err) = sheaf(
+        &fx,
+        &["worktree", "add", "checkpoint:base", linked.to_str().unwrap()],
+    );
+    assert!(ok, "{err}");
+    assert!(
+        add_out.starts_with(&format!("worktree {}", linked.display())),
+        "add report names the worktree: {add_out}"
+    );
+    assert!(add_out.contains("watching: yes"), "{add_out}");
+
+    let (ok, out, err) = sheaf(&fx, &["worktree", "list"]);
+    assert!(ok, "{err}");
+    let primary = out
+        .lines()
+        .find(|l| l.contains(fx.root.to_string_lossy().as_ref()))
+        .expect("primary listed");
+    assert!(primary.starts_with("* "), "primary marked `*`: {out}");
+    let branch = out
+        .lines()
+        .find(|l| l.contains(linked.to_string_lossy().as_ref()))
+        .expect("linked listed");
+    assert!(branch.starts_with("  "), "linked left unmarked: {out}");
+    assert!(!branch.contains("(missing)"), "present worktree: {out}");
+
+    // Each human line shows the 12-char tip of that worktree, and it matches
+    // the JSON view's full capture id.
+    let (ok, jout, err) = sheaf(&fx, &["worktree", "list", "--json"]);
+    assert!(ok, "{err}");
+    let json = json_out(&jout);
+    for item in json.as_array().unwrap() {
+        let path = item["path"].as_str().unwrap();
+        let tip = &item["capture_id"].as_str().unwrap()[..12];
+        let line = out.lines().find(|l| l.contains(path)).expect("listed");
+        assert!(line.contains(tip), "tip {tip} shown for {path}: {out}");
+    }
+}
+
+#[test]
+fn worktree_add_to_existing_destination_fails_clearly() {
+    let fx = fixture("wt-add-clash", V1);
+    let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "base"]);
+    assert!(ok, "{err}");
+
+    // A destination that already exists must be refused, untouched.
+    let occupied = fx._env.base.join("occupied");
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("keep.txt"), b"mine").unwrap();
+
+    let (ok, _, err) = sheaf(
+        &fx,
+        &["worktree", "add", "checkpoint:base", occupied.to_str().unwrap()],
+    );
+    assert!(!ok, "add over an existing dir must fail");
+    assert!(err.contains("already exists"), "{err}");
+    // The pre-existing content is untouched and no `.sheaf` link was planted.
+    assert_eq!(std::fs::read(occupied.join("keep.txt")).unwrap(), b"mine");
+    assert!(!occupied.join(".sheaf").exists(), "no link created: {err}");
+}
+
+#[test]
+fn worktree_add_resolves_relative_destination_against_cwd() {
+    let fx = fixture("wt-add-rel", V1);
+    let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "base"]);
+    assert!(ok, "{err}");
+
+    // Run from `base` with a relative destination and an explicit `-C`
+    // project; the CLI resolves the destination against the current
+    // directory, not the project root.
+    let base = fx._env.base.clone();
+    let (ok, out, err) = sheaf_at(
+        &fx,
+        &base,
+        &[
+            "worktree",
+            "add",
+            "-C",
+            fx.root.to_str().unwrap(),
+            "checkpoint:base",
+            "reldir",
+            "--json",
+        ],
+    );
+    assert!(ok, "{err}");
+    let created = base.join("reldir");
+    assert_eq!(
+        json_out(&out)["worktree"]["path"],
+        created.to_string_lossy().as_ref()
+    );
+    assert!(created.join(".sheaf").is_file(), "link planted at cwd-relative dest");
+}
+

@@ -42,11 +42,14 @@ use crate::error::{Result, SheafError};
 /// field (coordinate/selection/episode) selects one followed episode. The
 /// `timeline.grep.anchors` capability gates it because an older daemon
 /// silently drops the unknown field and would answer unanchored.
+///
+/// Minor 9: live managed worktrees (`worktree.list` / `worktree.add`) and
+/// explicit squash merge planning/application/resume join the catalog.
+/// Additive only.
+
 pub const PROTO_MAJOR: u32 = 1;
-/// Minor 1.8: additive grep-acceleration fields — `SearchUsage.trigram_skipped`
-/// and `GrepBackfillReport.trigram_index_bytes`. Both are serde-default, so a
-/// 1.7 client reads a 1.8 reply unchanged; the bump is informational.
-pub const PROTO_MINOR: u32 = 8;
+/// Minor 1.9: live timeline worktrees and explicit squash merges.
+pub const PROTO_MINOR: u32 = 9;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;

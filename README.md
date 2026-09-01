@@ -51,6 +51,9 @@ and forward through your work at any time.
 - **Git-compatible** - use Sheaf alongside Git without changing your workflow.
 - **Squash** - collapse a range of edits into a commit-sized change; previewed
   by default, committed only through an explicit `--` passthrough.
+- **Branch worktrees** - materialize any timeline point as a live linked
+  worktree that shares the store, turning a divergent branch into a real
+  directory you can build and edit in.
 - **Checkpoints** - create meaningful restore points for branching or 
   semantically indicating a new phase.
 - **Respects ignore rules** - anything git ignores — `.gitignore` files,
@@ -89,6 +92,39 @@ Initialize Sheaf inside a project:
 cd my-project
 sheaf init
 ```
+
+## Agent integration (MCP)
+
+`install.sh` installs `sheaf-mcp` alongside `sheaf` and `sheafd`. The MCP
+protocol standardizes communication with a server, but not a configuration
+file name or discovery location shared by every client. Clients also do not
+discover local servers by scanning `$PATH`.
+
+This repository therefore keeps the durable, client-neutral server definition
+in the project-root [`mcp.json`](mcp.json):
+
+```json
+{
+  "mcpServers": {
+    "sheaf": {
+      "command": "sheaf-mcp"
+    }
+  }
+}
+```
+
+Use the root file directly when the client supports project `mcp.json`
+discovery. Otherwise, import or copy the `sheaf` entry into that client's
+documented **project-level** MCP configuration. Keep `command` as `sheaf-mcp`
+when the installed binary is on the harness process's `$PATH`; use an absolute
+path when it is not. No special installation directory is required. Reload or
+reconnect MCP servers in the client after changing the definition.
+
+The server uses stdio and resolves the project from its working directory by
+default. It exposes status, log, diff, checkpoint, restore planning, worktree
+materialization, doctor, and retention tools. Worktree/store rewrites are
+denied by default; clients that need them must explicitly add
+SHEAF_MCP_ALLOW_WRITE=1 to the server's environment.
 
 ## Checking Changes
 
@@ -182,6 +218,26 @@ Every squash commit is stamped: sheaf records a `git-<sha>` checkpoint and
 appends a frame to `.sheaf/frames.jsonl` pairing the commit with the exact
 span of captures it collapsed. The next squash anchors there automatically,
 so the worktree, git history, and the sheaf timeline stay in agreement.
+
+## Branch Worktrees
+
+Timelines branch automatically, but sometimes you want a divergent branch as a
+real directory you can build and edit in — without disturbing your main
+worktree. `worktree add` materializes any timeline point as a live linked
+worktree that shares the same Sheaf store.
+
+```sh
+# List the primary worktree and every linked one, with each timeline tip
+sheaf worktree list
+
+# Materialize a checkpoint (or capture / branch tip) as a new worktree
+sheaf worktree add "before refactoring" ../my-project-experiment
+```
+
+The daemon watches every linked worktree the same way it watches the primary,
+so edits in either are captured on their own head. Each worktree diverges
+independently; nothing is copied and nothing is overwritten.
+
 
 ## Maintenance
 

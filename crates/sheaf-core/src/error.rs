@@ -79,6 +79,7 @@ impl SheafError {
             SheafError::BadCursor(_) => "state.bad_cursor",
             SheafError::RestorePlanStale(_) => "restore.plan_stale",
             SheafError::RestoreObstructed(_) => "restore.obstructed",
+
             SheafError::Other(_) => "internal",
         }
     }

@@ -111,6 +111,9 @@ struct WatchEntry {
     ready: Arc<AtomicBool>,
     /// Watcher thread(s): event producers. They exit on the stop flag.
     watch_handles: Vec<std::thread::JoinHandle<()>>,
+    /// Every physical worktree feeds the same collector through this channel.
+    events: Sender<sheaf_core::events::FsEvent>,
+
     /// The project's sole writer. It exits when the event channel hangs up,
     /// then flushes its debounce tail — hence the separate, longer grace.
     collector: Option<std::thread::JoinHandle<()>>,
@@ -136,6 +139,13 @@ enum IpcBody {
 }
 
 enum StoreCommand {
+    /// Run one command with the document checked out at this physical
+    /// worktree's advisory head.
+    InWorktree {
+        root: PathBuf,
+        command: Box<StoreCommand>,
+    },
+
     TimelineLog {
         all: bool,
         path: Option<PathBuf>,
@@ -146,8 +156,11 @@ enum StoreCommand {
         >,
     },
     ListCheckpoints {
-        reply: Sender<Vec<sheaf_core::store::Checkpoint>>,
+        reply: Sender<
+            std::result::Result<Vec<sheaf_core::store::Checkpoint>, sheaf_core::SheafError>,
+        >,
     },
+
     CaptureInfo {
         reference: String,
         reply: Sender<std::result::Result<sheaf_core::store::CaptureInfo, sheaf_core::SheafError>>,
@@ -254,6 +267,18 @@ enum StoreCommand {
         selections: Vec<sheaf_core::store::SelectionHandle>,
         head_texts: Option<std::collections::BTreeMap<String, String>>,
         reply: Sender<std::result::Result<SmartPlanReply, sheaf_core::SheafError>>,
+    },
+    ListWorktrees {
+        reply: Sender<
+            std::result::Result<Vec<sheaf_core::store::WorktreeInfo>, sheaf_core::SheafError>,
+        >,
+    },
+    AddWorktree {
+        reference: String,
+        destination: PathBuf,
+        reply: Sender<
+            std::result::Result<sheaf_core::store::WorktreeInfo, sheaf_core::SheafError>,
+        >,
     },
 }
 
@@ -486,7 +511,16 @@ fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener) -> Result<()> 
     {
         let mut table = shared.table.lock().unwrap();
         for (root, mut entry) in table.drain() {
-            if let Some(h) = entry.collector.take() {
+            let collector = entry.collector.take();
+            // Release this entry's stored event sender before waiting. The
+            // watcher threads (joined in phase 1) already dropped their
+            // clones; this `events` handle is the last sender keeping the
+            // collector's channel open. Held here, the collector never sees
+            // its channel disconnect and blocks the full tail-flush grace on
+            // every shutdown. Dropping the entry frees it so the collector
+            // drains its tail and exits at once.
+            drop(entry);
+            if let Some(h) = collector {
                 wait_bounded(h, TAIL_FLUSH_GRACE, &root.display().to_string());
             }
         }
@@ -789,11 +823,56 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
 
     let watch_thread = {
         let root_log = root_n.display().to_string();
+        let event_tx = tx_ev.clone();
         std::thread::Builder::new()
             .name(format!("inotify:{root_log}"))
-            .spawn(move || backend.run(tx_ev, backend_stop))
+            .spawn(move || backend.run(event_tx, backend_stop))
             .expect("spawn watch thread")
     };
+    let mut watch_handles = vec![watch_thread];
+    for linked in sheaf_core::store::linked_worktrees(&root_n)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| item.present)
+    {
+        let linked_ignores = match IgnoreSet::for_project_with(
+            &linked.path,
+            &cfg.ignore.patterns,
+            &global_git_ignore_candidates(),
+        ) {
+            Ok(set) => watcher::shared_ignores(set),
+            Err(error) => {
+                tracing::warn!(
+                    root = %linked.path.display(),
+                    %error,
+                    "managed worktree ignore rules failed; worktree not watched"
+                );
+                continue;
+            }
+        };
+        let linked_backend = match watcher::default_backend(linked.path.clone(), linked_ignores) {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::warn!(
+                    root = %linked.path.display(),
+                    %error,
+                    "managed worktree backend failed"
+                );
+                continue;
+            }
+        };
+        let linked_stop = stop_flag.clone();
+        let linked_tx = tx_ev.clone();
+        let root_log = linked.path.display().to_string();
+        match std::thread::Builder::new()
+            .name(format!("inotify:{root_log}"))
+            .spawn(move || linked_backend.run(linked_tx, linked_stop))
+        {
+            Ok(handle) => watch_handles.push(handle),
+            Err(error) => tracing::warn!(root = %root_log, %error, "managed worktree thread failed"),
+        }
+    }
+
 
     let deb_cfg = DebouncerConfig {
         window: Duration::from_millis(cfg.watch.debounce_ms as u64),
@@ -898,7 +977,8 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             stop: stop_flag,
             cold,
             ready,
-            watch_handles: vec![watch_thread],
+            watch_handles,
+            events: tx_ev,
             collector: Some(collector_thread),
             control: control_tx,
             wake: wake_tx,
@@ -908,31 +988,66 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
     true
 }
 
-/// Finish a young interrupted restore first, then heal the dead gap in
-/// bounded batches — the boot sequence shared by the eager and lazy open
-/// paths. The watcher is always registered before this runs, so
-/// concurrent edits queue behind it in the event channel.
+/// Resume crash-safe mutations and reconcile every physical worktree before
+/// the project becomes ready. One writer walks the heads serially.
 fn boot_reconcile_store(
     root: &Path,
     store: &mut ProjectStore,
-    ignore: &IgnoreSet,
+    primary_ignore: &IgnoreSet,
     max_resume_age_ms: i64,
 ) -> Option<RestoreMute> {
-    let resumed = resume_interrupted_restore(root, store, ignore, max_resume_age_ms);
-    match store.reconcile_worktree(ignore) {
-        Ok(None) => {}
-        Ok(Some(capture)) => tracing::info!(
-            root = %root.display(),
-            capture = capture.short_id(),
-            "boot reconciliation complete"
-        ),
-        Err(e) => tracing::warn!(root = %root.display(), error = %e, "boot reconciliation failed"),
+    let mut roots = vec![root.to_path_buf()];
+    roots.extend(
+        sheaf_core::store::linked_worktrees(root)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|worktree| worktree.present)
+            .map(|worktree| worktree.path),
+    );
+    let mut primary_mute = None;
+    for worktree in roots {
+        if let Err(error) = store.activate_worktree(&worktree) {
+            tracing::error!(root = %worktree.display(), %error, "worktree activation failed");
+            continue;
+        }
+        let owned_ignore;
+        let ignore = if worktree == root {
+            primary_ignore
+        } else {
+            let patterns = config::load(&worktree)
+                .map(|project| project.ignore.patterns)
+                .unwrap_or_default();
+            owned_ignore = IgnoreSet::for_project_with(
+                &worktree,
+                &patterns,
+                &global_git_ignore_candidates(),
+            )
+            .unwrap_or_else(|_| IgnoreSet::empty());
+            &owned_ignore
+        };
+        let resumed =
+            resume_interrupted_restore(&worktree, store, ignore, max_resume_age_ms);
+        match store.reconcile_worktree(ignore) {
+            Ok(None) => {}
+            Ok(Some(capture)) => tracing::info!(
+                root = %worktree.display(),
+                capture = capture.short_id(),
+                "boot reconciliation complete"
+            ),
+            Err(error) => tracing::warn!(
+                root = %worktree.display(),
+                %error,
+                "boot reconciliation failed"
+            ),
+        }
+        if worktree == root {
+            primary_mute = resumed
+                .as_ref()
+                .map(|outcome| RestoreMute::new(root, outcome));
+        }
     }
-    // Our own resume writes are already in history; inotify will still
-    // report them because it was started first.
-    resumed
-        .as_ref()
-        .map(|outcome| RestoreMute::new(root, outcome))
+    let _ = store.activate_worktree(root);
+    primary_mute
 }
 
 /// How long the cold collector sleeps between wake-channel polls. Only
@@ -1046,34 +1161,50 @@ fn collect_loop(
     max_resume_age_ms: i64,
 ) {
     let poll = (cfg.window / 4).max(Duration::from_millis(20));
-    let mut deb = Debouncer::new(root.clone(), cfg);
+    let mut debouncers = HashMap::from([(root.clone(), Debouncer::new(root.clone(), cfg.clone()))]);
+    let mut ignores = HashMap::from([(root.clone(), ignore)]);
+    let mut mutes = HashMap::new();
+    if let Some(mute) = initial_mute {
+        mutes.insert(root.clone(), mute);
+    }
     // Plans handed out but not yet applied. Bounded and collector-local:
     // the single writer is the only thing entitled to honour a token.
     let mut plans: Vec<sheaf_core::store::RestorePlan> = Vec::new();
     let mut fragment_plans: Vec<sheaf_core::store::FragmentPlan> = Vec::new();
-    let mut mute = initial_mute;
-    // Set when an event touched a rule file; the rebuild then runs at the
-    // top of the next loop iteration, AFTER the editing batch was handled
-    // under the rules that were live when it happened.
-    let mut ignores_dirty = false;
+
     loop {
-        if ignores_dirty {
-            ignores_dirty = false;
-            refresh_ignore_rules(&root, &ignore);
-        }
         while let Ok(command) = control.try_recv() {
+            let command_root = command.worktree_root().unwrap_or(&root).to_path_buf();
+            if !debouncers.contains_key(&command_root) {
+                debouncers.insert(
+                    command_root.clone(),
+                    Debouncer::new(command_root.clone(), cfg.clone()),
+                );
+            }
+            if !ignores.contains_key(&command_root) {
+                let patterns = config::load(&command_root)
+                    .map(|project| project.ignore.patterns)
+                    .unwrap_or_default();
+                let compiled = IgnoreSet::for_project_with(
+                    &command_root,
+                    &patterns,
+                    &global_git_ignore_candidates(),
+                )
+                .unwrap_or_else(|_| IgnoreSet::empty());
+                ignores.insert(command_root.clone(), watcher::shared_ignores(compiled));
+            }
             let mut flush_error = None;
             let memory_heavy = command.is_memory_heavy();
             if command.crosses_debounce_boundary() {
-                // A checkpoint means "what I have now", and a restore must not
-                // race an open write burst: cross the debounce durability
-                // boundary first, and never report success if it failed.
-                let pending = deb.force_flush();
+                let pending = debouncers
+                    .get_mut(&command_root)
+                    .expect("command debouncer exists")
+                    .force_flush();
                 if !pending.is_empty() {
                     flush_error = persist_batch_checked(&mut store, &pending).err();
                 }
             }
-            let ig = ignore.read().unwrap().clone();
+            let ig = ignores[&command_root].read().unwrap().clone();
             if let Some(outcome) = handle_store_command(
                 &mut store,
                 &ig,
@@ -1083,7 +1214,7 @@ fn collect_loop(
                 flush_error,
                 max_resume_age_ms,
             ) {
-                mute = Some(RestoreMute::new(&root, &outcome));
+                mutes.insert(command_root.clone(), RestoreMute::new(&command_root, &outcome));
             }
             if memory_heavy {
                 trim_process_heap();
@@ -1091,12 +1222,52 @@ fn collect_loop(
         }
         match rx.recv_timeout(poll) {
             Ok(ev) => {
-                if ev.path().file_name().is_some_and(|n| n == ".gitignore") {
-                    ignores_dirty = true;
+                let start = ev.path().parent().unwrap_or_else(|| ev.path());
+                let Some(event_root) =
+                    sheaf_core::init::resolve_project_root(start).map(|path| normalize(&path))
+                else {
+                    tracing::warn!(path = %ev.path().display(), "event has no project root");
+                    continue;
+                };
+                if !store.is_registered_worktree(&event_root).unwrap_or(false) {
+                    tracing::warn!(
+                        root = %event_root.display(),
+                        path = %ev.path().display(),
+                        "event from unregistered worktree ignored"
+                    );
+                    continue;
                 }
-                let swallowed = mute.as_ref().is_some_and(|m| m.swallows(&ev, &store));
+                if !debouncers.contains_key(&event_root) {
+                    debouncers.insert(
+                        event_root.clone(),
+                        Debouncer::new(event_root.clone(), cfg.clone()),
+                    );
+                }
+                if !ignores.contains_key(&event_root) {
+                    let patterns = config::load(&event_root)
+                        .map(|project| project.ignore.patterns)
+                        .unwrap_or_default();
+                    let compiled = IgnoreSet::for_project_with(
+                        &event_root,
+                        &patterns,
+                        &global_git_ignore_candidates(),
+                    )
+                    .unwrap_or_else(|_| IgnoreSet::empty());
+                    ignores.insert(event_root.clone(), watcher::shared_ignores(compiled));
+                }
+                if ev.path().file_name().is_some_and(|name| name == ".gitignore") {
+                    refresh_ignore_rules(&event_root, &ignores[&event_root]);
+                }
+                let swallowed = store.activate_worktree(&event_root).is_ok()
+                    && mutes
+                        .get(&event_root)
+                        .is_some_and(|mute| mute.swallows(&ev, &store));
                 if !swallowed {
-                    if let Some(batch) = deb.feed(ev) {
+                    if let Some(batch) = debouncers
+                        .get_mut(&event_root)
+                        .expect("event debouncer exists")
+                        .feed(ev)
+                    {
                         persist_batch(&mut store, &batch);
                     }
                 }
@@ -1104,34 +1275,48 @@ fn collect_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if let Some(batch) = deb.take_if_quiescent() {
+        let ready: Vec<_> = debouncers
+            .values_mut()
+            .filter_map(Debouncer::take_if_quiescent)
+            .collect();
+        for batch in ready {
             persist_batch(&mut store, &batch);
         }
-        if mute.as_ref().is_some_and(|m| Instant::now() >= m.until) {
-            mute = None;
-        }
-        // If nobody feeds us anymore (watch thread gone) and buffer is empty,
-        // the disconnected branch exits on next recv.
+        mutes.retain(|_, mute| Instant::now() < mute.until);
     }
-    let tail = deb.force_flush();
-    if !tail.is_empty() {
+    let tails: Vec<_> = debouncers
+        .values_mut()
+        .map(Debouncer::force_flush)
+        .filter(|batch| !batch.is_empty())
+        .collect();
+    for tail in tails {
         tracing::info!(root = %tail.root.display(), events = tail.len(), "final drain on shutdown");
         persist_batch(&mut store, &tail);
     }
 }
 
 impl StoreCommand {
+    fn worktree_root(&self) -> Option<&Path> {
+        match self {
+            StoreCommand::InWorktree { root, .. } => Some(root),
+            _ => None,
+        }
+    }
+
     /// Mutations that mean "everything up to now" must first close the open
     /// debounce window.
     fn crosses_debounce_boundary(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            StoreCommand::InWorktree { command, .. } => command.crosses_debounce_boundary(),
             StoreCommand::CreateCheckpoint { .. }
-                | StoreCommand::ApplyRestore { .. }
-                | StoreCommand::ResumeRestore { .. }
-                | StoreCommand::ApplyFragment { .. }
-        )
+            | StoreCommand::ApplyRestore { .. }
+            | StoreCommand::ResumeRestore { .. }
+            | StoreCommand::ApplyFragment { .. }
+            | StoreCommand::AddWorktree { .. } => true,
+            _ => false,
+        }
     }
+
 
     /// Commands whose work allocates large transients: doctor and gc open
     /// a whole second document (fresh reader), diff and grep build forked
@@ -1142,14 +1327,43 @@ impl StoreCommand {
     /// time this matters, so returning the freed pages immediately after
     /// keeps the resident set honest without costing the caller anything.
     fn is_memory_heavy(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            StoreCommand::InWorktree { command, .. } => command.is_memory_heavy(),
             StoreCommand::Doctor { .. }
-                | StoreCommand::Gc { .. }
-                | StoreCommand::Diff { .. }
-                | StoreCommand::Grep { .. }
-                | StoreCommand::CacheBackfill { .. }
-        )
+            | StoreCommand::Gc { .. }
+            | StoreCommand::Diff { .. }
+            | StoreCommand::Grep { .. }
+            | StoreCommand::CacheBackfill { .. }
+            | StoreCommand::AddWorktree { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn send_error(self, error: sheaf_core::SheafError) {
+        match self {
+            StoreCommand::InWorktree { command, .. } => command.send_error(error),
+            StoreCommand::TimelineLog { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ListCheckpoints { reply } => { let _ = reply.send(Err(error)); }
+            StoreCommand::CaptureInfo { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::CreateCheckpoint { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::PlanRestore { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ApplyRestore { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ResumeRestore { reply } => { let _ = reply.send(Err(error)); }
+            StoreCommand::AbandonRestore { reply } => { let _ = reply.send(Err(error)); }
+            StoreCommand::Gc { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::Mark { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::Doctor { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::Diff { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::Grep { reply, .. } => {
+                let _ = reply.send(GrepStreamItem::Done(Err(error)));
+            }
+            StoreCommand::CacheBackfill { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::PlanFragment { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ApplyFragment { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::PlanSmart { reply, .. } => { let _ = reply.send(Err(error)); }
+            StoreCommand::ListWorktrees { reply } => { let _ = reply.send(Err(error)); }
+            StoreCommand::AddWorktree { reply, .. } => { let _ = reply.send(Err(error)); }
+        }
     }
 }
 
@@ -1195,7 +1409,18 @@ fn handle_store_command(
     flush_error: Option<sheaf_core::SheafError>,
     max_resume_age_ms: i64,
 ) -> Option<sheaf_core::store::RestoreOutcome> {
+    let command = match command {
+        StoreCommand::InWorktree { root, command } => {
+            if let Err(error) = store.activate_worktree(&root) {
+                command.send_error(error);
+                return None;
+            }
+            *command
+        }
+        command => command,
+    };
     match command {
+
         StoreCommand::TimelineLog {
             all,
             path,
@@ -1211,7 +1436,7 @@ fn handle_store_command(
             );
         }
         StoreCommand::ListCheckpoints { reply } => {
-            let _ = reply.send(store.checkpoints());
+            let _ = reply.send(Ok(store.checkpoints()));
         }
         StoreCommand::CaptureInfo { reference, reply } => {
             let _ = reply.send(store.capture_info(&reference));
@@ -1374,6 +1599,22 @@ fn handle_store_command(
         StoreCommand::CacheBackfill { opts, reply } => {
             let _ = reply.send(store.grep_cache_backfill(opts));
         }
+        StoreCommand::ListWorktrees { reply } => {
+            let _ = reply.send(store.worktrees());
+        }
+        StoreCommand::AddWorktree {
+            reference,
+            destination,
+            reply,
+        } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => store.add_worktree(&reference, &destination),
+            };
+            let _ = reply.send(result);
+        }
+        StoreCommand::InWorktree { .. } => unreachable!("worktree wrapper was unwrapped"),
+
     }
     None
 }
@@ -1386,6 +1627,8 @@ fn persist_batch_checked(
     store: &mut ProjectStore,
     batch: &sheaf_core::events::Batch,
 ) -> std::result::Result<(), sheaf_core::SheafError> {
+    store.activate_worktree(&batch.root)?;
+
     match store.apply_batch(batch) {
         Ok(o) => {
             tracing::info!(
@@ -1554,6 +1797,8 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                     "timeline.grep.occurrences",
                     "timeline.grep.anchors",
                     "cache.backfill",
+                    "worktree.list",
+                    "worktree.add",
                 ],
             }),
         )),
@@ -1576,6 +1821,8 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
         "diff" => bytes(diff(shared, req, rid)),
         "timeline.grep" => grep(shared, req, rid),
         "cache.backfill" => plain(cache_backfill(shared, req, rid)),
+        "worktree.list" => plain(worktree_list(shared, req, rid)),
+        "worktree.add" => plain(worktree_add(shared, req, rid)),
         "enroll.notify" => plain(enroll_notify(shared, req, rid)),
         "shutdown" => {
             *shutting_down = true;
@@ -1603,7 +1850,13 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
         Ok(p) => normalize(p),
         Err(resp) => return resp,
     };
-    let registered = matches!(shared.registered_anywhere(&root), Ok(true));
+    let store_root = normalize(&config::store_root(&root));
+    let linked_registered = root == store_root
+        || sheaf_core::store::linked_worktrees(&store_root).is_ok_and(|items| {
+            items.into_iter().any(|item| normalize(&item.path) == root)
+        });
+    let registered =
+        linked_registered && matches!(shared.registered_anywhere(&store_root), Ok(true));
     if !registered {
         return Response::err(
             rid,
@@ -1613,6 +1866,7 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
             ),
         );
     }
+
     let format = config::read_store_format(&root).ok();
     // A restore that could not be finished is otherwise invisible: the tree
     // looks merely odd. Surfacing it here — with its age and whether it has
@@ -1637,10 +1891,12 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
         rid,
         json!({
             "root": root.display().to_string(),
+            "store_root": store_root.display().to_string(),
+            "worktree_id": config::worktree_id(&root),
             "registered": true,
-            "watching": shared.watching(&root),
-            "ready": shared.ready(&root),
-            "cold": shared.cold(&root),
+            "watching": shared.watching(&store_root),
+            "ready": shared.ready(&store_root),
+            "cold": shared.cold(&store_root),
             "store_format": format,
             "pending_restore": pending,
         }),
@@ -1653,15 +1909,48 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
 /// error, and keeps the warm-up contract intact: a mutation is never
 /// queued to execute after its caller has given up on it.
 const COLD_OPEN_BUDGET: Duration = Duration::from_millis(1250);
+#[derive(Clone, Debug)]
+
+struct ProjectControl {
+    sender: Sender<StoreCommand>,
+    worktree: PathBuf,
+}
+
+impl ProjectControl {
+    fn send(
+        &self,
+        command: StoreCommand,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<StoreCommand>> {
+        self.sender.send(StoreCommand::InWorktree {
+            root: self.worktree.clone(),
+            command: Box::new(command),
+        })
+    }
+}
+
 
 fn project_control(
     shared: &Shared,
     root: &Path,
     rid: &str,
-) -> std::result::Result<Sender<StoreCommand>, Response> {
+) -> std::result::Result<ProjectControl, Response> {
+    let worktree = normalize(root);
+    let store_root = normalize(&config::store_root(&worktree));
+    let registered_worktree = worktree == store_root
+        || sheaf_core::store::linked_worktrees(&store_root).is_ok_and(|items| {
+            items
+                .into_iter()
+                .any(|item| item.present && normalize(&item.path) == worktree)
+        });
+    if !registered_worktree {
+        return Err(Response::err(
+            rid.to_owned(),
+            IpcError::new("project.not_enrolled", "worktree is not registered with this store"),
+        ));
+    }
     let (cold, ready, wake, control) = {
         let table = shared.table.lock().unwrap();
-        let Some(entry) = table.get(root) else {
+        let Some(entry) = table.get(&store_root) else {
             return Err(Response::err(
                 rid.to_owned(),
                 IpcError::new("project.not_enrolled", "project is not currently watched"),
@@ -1677,6 +1966,7 @@ fn project_control(
         // across a cold-open wait, or one slow project would stall every
         // other IPC operation.
     };
+
     if cold.load(Ordering::Acquire) {
         // Lazy project: trigger the open and give it a bounded head start.
         // The collector boot-reconciles before draining commands, so a
@@ -1698,7 +1988,10 @@ fn project_control(
             IpcError::new("project.warming", detail),
         ));
     }
-    Ok(control)
+    Ok(ProjectControl {
+        sender: control,
+        worktree,
+    })
 }
 
 fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
@@ -1853,9 +2146,10 @@ fn checkpoint_list(shared: &Shared, req: &Request, rid: String) -> Response {
         return Response::err(rid, IpcError::new("internal", "project writer stopped"));
     }
     match reply_rx.recv_timeout(REQUEST_SOFT) {
-        Ok(checkpoints) => {
+        Ok(Ok(checkpoints)) => {
             Response::ok(rid, json!({"checkpoints": checkpoints, "degraded": false}))
         }
+        Ok(Err(error)) => core_error(rid, error),
         Err(_) => Response::err(rid, IpcError::new("internal", "checkpoint list timed out")),
     }
 }
@@ -2639,6 +2933,106 @@ fn cache_backfill(shared: &Shared, req: &Request, rid: String) -> Response {
         Err(_) => Response::err(rid, IpcError::new("internal", "backfill request timed out")),
     }
 }
+fn worktree_list(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(path) => normalize(path),
+        Err(response) => return response,
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::ListWorktrees { reply: reply_tx })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(worktrees)) => Response::ok(rid, json!({"worktrees": worktrees})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "worktree list timed out")),
+    }
+}
+
+fn attach_linked_watch(shared: &Shared, store_root: &Path, worktree: &Path) -> Result<()> {
+    let patterns = config::load(store_root)?.ignore.patterns;
+    let ignores = watcher::shared_ignores(
+        IgnoreSet::for_project_with(worktree, &patterns, &global_git_ignore_candidates())
+            .map_err(anyhow::Error::msg)?,
+    );
+    let backend = watcher::default_backend(worktree.to_path_buf(), ignores)?;
+    let mut table = shared.table.lock().unwrap();
+    let entry = table
+        .get_mut(&normalize(store_root))
+        .ok_or_else(|| anyhow::anyhow!("primary project is no longer watched"))?;
+    let stop = entry.stop.clone();
+    let events = entry.events.clone();
+    let name = worktree.display().to_string();
+    let handle = std::thread::Builder::new()
+        .name(format!("inotify:{name}"))
+        .spawn(move || backend.run(events, stop))
+        .with_context(|| format!("spawn managed worktree watcher for {name}"))?;
+    entry.watch_handles.push(handle);
+    Ok(())
+}
+
+fn worktree_add(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(path) => normalize(path),
+        Err(response) => return response,
+    };
+    let Some(reference) = req.params.get("reference").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`reference` is required"));
+    };
+    let Some(destination) = req.params.get("destination").and_then(|value| value.as_str()) else {
+        return Response::err(rid, IpcError::new("bad.params", "`destination` is required"));
+    };
+    let destination = PathBuf::from(destination);
+    if !destination.is_absolute() {
+        return Response::err(
+            rid,
+            IpcError::new("bad.params", "`destination` must be an absolute path"),
+        );
+    }
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::AddWorktree {
+            reference: reference.to_owned(),
+            destination,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(RESTORE_HARD) {
+        Ok(Ok(worktree)) => {
+            let store_root = config::store_root(&root);
+            match attach_linked_watch(shared, &store_root, &worktree.path) {
+                Ok(()) => Response::ok(rid, json!({"worktree": worktree, "watching": true})),
+                Err(error) => Response::err(
+                    rid,
+                    IpcError::new(
+                        "unsupported",
+                        format!(
+                            "worktree was created at {}, but its live watcher failed: {error}; restart sheafd to retry",
+                            worktree.path.display()
+                        ),
+                    ),
+                ),
+            }
+        }
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "worktree add timed out")),
+    }
+}
+
 
 fn enroll_notify(shared: &Shared, req: &Request, rid: String) -> Response {
     let root = match require_project(req, &rid) {
@@ -2928,7 +3322,10 @@ mod tests {
                     sheaf_core::SheafError,
                 >,
             >();
-            let (tx_ck, _) = channel::<Vec<sheaf_core::store::Checkpoint>>();
+            let (tx_ck, _) = channel::<
+                std::result::Result<Vec<sheaf_core::store::Checkpoint>, sheaf_core::SheafError>,
+            >();
+
             let (tx_info, _) = channel::<
                 std::result::Result<sheaf_core::store::CaptureInfo, sheaf_core::SheafError>,
             >();
@@ -3146,6 +3543,8 @@ mod tests {
 
         let (control_tx, _control_rx) = channel::<StoreCommand>();
         let (wake_tx, _wake_rx) = channel::<()>();
+        let (events, _events_rx) = channel();
+
         shared.table.lock().unwrap().insert(
             normalize(&root),
             WatchEntry {
@@ -3155,6 +3554,8 @@ mod tests {
                 watch_handles: Vec::new(),
                 collector: None,
                 control: control_tx,
+                events,
+
                 wake: wake_tx,
             },
         );
@@ -3257,7 +3658,16 @@ mod tests {
         frags: &mut Vec<sheaf_core::store::FragmentPlan>,
         command: StoreCommand,
     ) -> Option<sheaf_core::store::RestoreOutcome> {
-        handle_store_command(store, ignore, plans, frags, command, None, 60_000)
+        handle_store_command(
+            store,
+            ignore,
+            plans,
+            frags,
+            command,
+            None,
+            60_000,
+        )
+
     }
 
     /// Open a real writer-locked store over a skeleton project.
@@ -3356,7 +3766,8 @@ mod tests {
             &mut frags,
             StoreCommand::ListCheckpoints { reply: tx },
         );
-        assert!(rx.recv_timeout(TEN_SECS).unwrap().is_empty());
+        assert!(rx.recv_timeout(TEN_SECS).unwrap().unwrap().is_empty());
+
         let (tx, rx) = channel();
         run_command(
             &mut store,
@@ -3378,6 +3789,7 @@ mod tests {
             &ignore,
             &mut plans,
             &mut frags,
+
             StoreCommand::CreateCheckpoint {
                 name: "cp-two".into(),
                 reference: None,
@@ -3639,6 +4051,7 @@ mod tests {
             &ignore,
             &mut plans,
             &mut frags,
+
             StoreCommand::ResumeRestore { reply: tx },
             Some(sheaf_core::SheafError::Config("tail lost".into())),
             60_000,
@@ -3880,6 +4293,174 @@ mod tests {
         collector.join().unwrap();
     }
 
+    // ------------------------------------------- worktree + merge writers
+
+    /// Capture one file event into the active worktree and return the
+    /// resulting capture id. Mirrors the core merge tests' `capture_file`.
+    fn capture(store: &mut ProjectStore, root: &Path, path: &str, added: bool) -> String {
+        let now = chrono::Utc::now();
+        let kind = if added {
+            sheaf_core::events::EventKind::Added {
+                path: root.join(path),
+            }
+        } else {
+            sheaf_core::events::EventKind::Touched {
+                path: sheaf_core::events::TouchedPath::from(root.join(path)),
+            }
+        };
+        store
+            .apply_batch(&sheaf_core::events::Batch {
+                root: root.to_path_buf(),
+                started_at: now,
+                flushed_at: now,
+                events: vec![sheaf_core::events::FsEvent::now(kind)],
+            })
+            .unwrap()
+            .capture
+            .unwrap()
+            .id
+    }
+
+    /// A locked store with a primary worktree and one linked worktree that
+    /// carries a source-only capture on its own branch. Returned activated
+    /// at the primary, ready to plan a merge of `source` back onto it.
+    fn branched_store(
+        base: &Path,
+    ) -> (
+        ProjectStore,
+        IgnoreSet,
+        std::fs::File,
+        PathBuf,
+        PathBuf,
+        String,
+    ) {
+        let primary = skeleton_project(base, "primary");
+        std::fs::write(primary.join("base.txt"), "base\n").unwrap();
+        let (mut store, ignore, lock) = opened_store(&primary);
+        capture(&mut store, &primary, "base.txt", true);
+        store.create_checkpoint("base", None).unwrap();
+        let linked = base.join("linked");
+        store.add_worktree("base", &linked).unwrap();
+
+        std::fs::write(primary.join("target.txt"), "target\n").unwrap();
+        capture(&mut store, &primary, "target.txt", true);
+
+        store.activate_worktree(&linked).unwrap();
+        std::fs::write(linked.join("source.txt"), "source\n").unwrap();
+        let source = capture(&mut store, &linked, "source.txt", true);
+        store.activate_worktree(&primary).unwrap();
+        (store, ignore, lock, primary, linked, source)
+    }
+
+    #[test]
+    fn boot_reconcile_resumes_a_pending_restore_in_a_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut store, ignore, lock, primary, linked, _source) = branched_store(tmp.path());
+
+        // Plan a restore of the linked branch back one capture (dropping
+        // source.txt) and park its intent, byte-for-byte what a crashed
+        // restore leaves behind.
+        store.activate_worktree(&linked).unwrap();
+        let plan = store.plan_restore("@~1", &[], &ignore).unwrap();
+        assert!(!plan.is_noop(), "restoring one capture back drops source.txt");
+        let plan_json = serde_json::to_value(&plan).unwrap();
+        let id = sheaf_core::config::worktree_id(&linked).expect("linked worktree has an id");
+        let intent_path = sheaf_core::config::worktree_head_path(&linked)
+            .parent()
+            .unwrap()
+            .join(format!("{id}.restore.intent"));
+        std::fs::write(
+            &intent_path,
+            serde_json::json!({
+                "token": plan_json["token"],
+                "mode": "full",
+                "scope": [],
+                "target": plan_json["target"],
+                "started_ms": chrono::Utc::now().timestamp_millis(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(sheaf_core::store::pending_restore_at(&linked).is_some());
+        store.activate_worktree(&primary).unwrap();
+
+        // Reopen and boot: the primary has no intent, but the linked
+        // worktree's restore is resumed independently.
+        drop(store);
+        drop(lock);
+        let (mut store, ignore, _lock) = opened_store(&primary);
+        boot_reconcile_store(&primary, &mut store, &ignore, 60_000);
+
+        assert!(
+            !linked.join("source.txt").exists(),
+            "the resumed restore removed the source-only file"
+        );
+        assert!(
+            sheaf_core::store::pending_restore_at(&linked).is_none(),
+            "a completed restore clears its intent"
+        );
+        // The primary is untouched by the linked worktree's restore.
+        assert!(primary.join("target.txt").exists());
+    }
+
+    #[test]
+    fn dropping_the_watch_entry_lets_its_only_collector_exit_promptly() {
+        // graceful_shutdown's phase 2 takes the collector handle, then drops
+        // the WatchEntry so its stored `events` sender — the last one alive
+        // once the watcher threads have joined — hangs up. Without that drop
+        // the collector blocks the full tail-flush grace on every shutdown.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = skeleton_project(tmp.path(), "shutdown-exit");
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        let (mut store, ignore, lock) = opened_store(&root);
+        store.reconcile_worktree(&ignore).unwrap();
+
+        let (events, event_rx) = channel::<sheaf_core::events::FsEvent>();
+        let (control, control_rx) = channel::<StoreCommand>();
+        let (wake, _wake_rx) = channel::<()>();
+        let loop_root = root.clone();
+        let collector = std::thread::spawn(move || {
+            collect_loop(
+                loop_root,
+                event_rx,
+                control_rx,
+                DebouncerConfig {
+                    window: Duration::from_millis(40),
+                    max_hold: Duration::from_millis(80),
+                    cap_events: 100,
+                },
+                store,
+                watcher::shared_ignores(ignore),
+                None,
+                lock,
+                60_000,
+            )
+        });
+
+        let mut entry = WatchEntry {
+            stop: watcher::new_stop_flag(),
+            cold: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(AtomicBool::new(true)),
+            watch_handles: Vec::new(),
+            collector: Some(collector),
+            control,
+            events,
+            wake,
+        };
+
+        // Take the collector, then drop the entry: dropping frees the last
+        // event/control senders so the collector disconnects, drains its
+        // tail, and exits well within the grace.
+        let collector = entry.collector.take().unwrap();
+        drop(entry);
+        let start = Instant::now();
+        wait_bounded(collector, TAIL_FLUSH_GRACE, "shutdown-exit");
+        assert!(
+            start.elapsed() < TAIL_FLUSH_GRACE,
+            "the collector must exit once its last sender drops, not wait out the grace"
+        );
+    }
+
     // -------------------------------------------------------- IPC dispatch
 
     fn test_request(method: &str, project: Option<PathBuf>, params: serde_json::Value) -> Request {
@@ -4034,6 +4615,8 @@ mod tests {
         let entry_for = |cold: bool, ready: bool| {
             let (control_tx, _control_rx) = channel::<StoreCommand>();
             let (wake_tx, _wake_rx) = channel::<()>();
+            let (events, _events_rx) = channel();
+
             WatchEntry {
                 stop: watcher::new_stop_flag(),
                 cold: Arc::new(AtomicBool::new(cold)),
@@ -4041,6 +4624,8 @@ mod tests {
                 watch_handles: Vec::new(),
                 collector: None,
                 control: control_tx,
+                events,
+
                 wake: wake_tx,
             }
         };
@@ -4387,6 +4972,8 @@ mod tests {
         let (control, receiver) = channel::<StoreCommand>();
         drop(receiver);
         let (wake, _wake_rx) = channel();
+        let (events, _events_rx) = channel();
+
         shared.table.lock().unwrap().insert(
             normalize(&root),
             WatchEntry {
@@ -4396,6 +4983,8 @@ mod tests {
                 watch_handles: Vec::new(),
                 collector: None,
                 control,
+                events,
+
                 wake,
             },
         );
@@ -4596,6 +5185,8 @@ mod tests {
         let shared = test_shared();
         let (control, rx) = channel::<StoreCommand>();
         let (wake, _wake_rx) = channel::<()>();
+        let (events, _events_rx) = channel();
+
         shared.table.lock().unwrap().insert(
             normalize(&root),
             WatchEntry {
@@ -4605,6 +5196,8 @@ mod tests {
                 watch_handles: Vec::new(),
                 collector: None,
                 control,
+                events,
+
                 wake,
             },
         );
@@ -4615,6 +5208,10 @@ mod tests {
             while let Ok(command) = rx.recv() {
                 let failure =
                     || sheaf_core::SheafError::StoreCorrupt("canned collector failure".into());
+                let command = match command {
+                    StoreCommand::InWorktree { command, .. } => *command,
+                    other => other,
+                };
                 match command {
                     StoreCommand::PlanRestore { reply, .. } => {
                         let _ = reply.send(Err(failure()));
@@ -4668,6 +5265,8 @@ mod tests {
                 let root = PathBuf::from(format!("/tmp/sheafd-stalled-{verb}"));
                 let (control, stuck_rx) = channel::<StoreCommand>();
                 let (wake, _wake_rx) = channel::<()>();
+                let (events, _events_rx) = channel();
+
                 shared.table.lock().unwrap().insert(
                     normalize(&root),
                     WatchEntry {
@@ -4677,6 +5276,7 @@ mod tests {
                         watch_handles: Vec::new(),
                         collector: None,
                         control,
+                        events,
                         wake,
                     },
                 );
@@ -4928,4 +5528,5 @@ mod tests {
         assert_eq!(report["complete"], true);
         assert_eq!(report["root"], root.display().to_string());
     }
+
 }

@@ -352,6 +352,11 @@ EXAMPLES:
         #[arg(long)]
         json: bool,
     },
+    /// Materialize and list live physical worktrees for timeline branches.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCmd,
+    },
     /// Manage the per-user service unit (systemd user session).
     Service {
         #[command(subcommand)]
@@ -364,6 +369,29 @@ EXAMPLES:
         command: CacheCmd,
     },
 }
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// List the primary and every linked worktree.
+    List {
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Materialize one timeline point as a live linked worktree.
+    Add {
+        /// Capture, checkpoint, or branch-tip reference to materialize.
+        reference: String,
+        /// New directory. It must not already exist or overlap another worktree.
+        destination: PathBuf,
+        #[arg(long, short = 'C')]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 
 #[derive(Subcommand)]
 enum CacheCmd {
@@ -481,6 +509,9 @@ impl Cmd {
             | Cmd::Gc { json, .. }
             | Cmd::Restore { json, .. }
             | Cmd::Squash { json, .. } => *json,
+            Cmd::Worktree {
+                command: WorktreeCmd::List { json, .. } | WorktreeCmd::Add { json, .. },
+            } => *json,
             Cmd::Checkpoint {
                 command: Some(CheckpointCmd::List { json, .. }),
                 ..
@@ -744,6 +775,22 @@ fn main() -> ExitCode {
         } => match selection.as_deref() {
             Some(spec) => cmd_smart_squash(project.as_deref(), spec, &git_args, json),
             None => cmd_squash(project.as_deref(), range.as_deref(), &git_args, json),
+        },
+        Cmd::Worktree { command } => match command {
+            WorktreeCmd::List { project, json } => {
+                cmd_worktree_list(project.as_deref(), json)
+            }
+            WorktreeCmd::Add {
+                reference,
+                destination,
+                project,
+                json,
+            } => cmd_worktree_add(
+                project.as_deref(),
+                &reference,
+                &destination,
+                json,
+            ),
         },
         Cmd::Service { command } => match command {
             ServiceCmd::Install { no_start } => cmd_service_install(no_start),
@@ -2045,6 +2092,111 @@ fn cmd_checkpoint_create(project: Option<&Path>, name: &str, at: Option<&str>) -
     println!("checkpoint {} -> {}", checkpoint.name, id);
     Ok(())
 }
+// --------------------------------------------------------------- worktrees
+
+fn daemon_client(feature: &str) -> anyhow::Result<Client> {
+    Client::connect(
+        &sheaf_core::paths::control_socket_path(),
+        Duration::from_secs(2),
+    )
+    .map_err(|_| anyhow::anyhow!("{feature} requires the running daemon"))
+}
+
+fn cmd_worktree_list(project: Option<&Path>, as_json: bool) -> CliResult {
+    let root = timeline_root(project)?;
+    let mut client = daemon_client("listing live worktrees")?;
+    let reply = client.call(
+        "worktree.list",
+        Some(&root),
+        serde_json::json!({}),
+        None,
+    )?;
+    if !reply.response.ok {
+        return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    }
+    let worktrees: Vec<sheaf_core::store::WorktreeInfo> = serde_json::from_value(
+        reply
+            .response
+            .result
+            .and_then(|value| value.get("worktrees").cloned())
+            .unwrap_or_default(),
+    )
+    .context("daemon returned invalid worktree list")?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&worktrees).map_err(anyhow::Error::from)?
+        );
+
+        return Ok(());
+    }
+    for worktree in worktrees {
+        let marker = if worktree.primary { "*" } else { " " };
+        let state = if worktree.present { "" } else { " (missing)" };
+        let point = worktree
+            .capture_id
+            .as_deref()
+            .map(|id| &id[..12.min(id.len())])
+            .unwrap_or("------------");
+        println!("{marker} {}  {point}{state}", worktree.path.display());
+    }
+    Ok(())
+}
+
+fn cmd_worktree_add(
+    project: Option<&Path>,
+    reference: &str,
+    destination: &Path,
+    as_json: bool,
+) -> CliResult {
+    let root = timeline_root(project)?;
+    let destination = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(anyhow::Error::from)?
+            .join(destination)
+
+    };
+    let mut client = daemon_client("creating a live worktree")?;
+    client.set_timeout(Duration::from_secs(120))?;
+
+    let reply = client.call(
+        "worktree.add",
+        Some(&root),
+        serde_json::json!({
+            "reference": reference,
+            "destination": destination,
+        }),
+        None,
+
+    )?;
+    if !reply.response.ok {
+        return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    }
+    let result = reply.response.result.unwrap_or_default();
+    let worktree: sheaf_core::store::WorktreeInfo = serde_json::from_value(
+        result.get("worktree").cloned().unwrap_or_default(),
+    )
+    .context("daemon returned invalid worktree")?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+        );
+
+    } else {
+        let point = worktree
+            .capture_id
+            .as_deref()
+            .map(|id| &id[..12.min(id.len())])
+            .unwrap_or("------------");
+        println!("worktree {} -> {point}", worktree.path.display());
+        println!("watching: yes");
+    }
+    Ok(())
+}
+
 
 // ------------------------------------------------------------------ restore
 
@@ -2509,6 +2661,10 @@ fn origin_suffix(origin: Option<&sheaf_core::store::CaptureOrigin>) -> String {
                 None => "   [fragment restore]".to_owned(),
             }
         }
+        OriginKind::Merge => match &origin.target {
+            Some(source) => format!("   [merge \u{2190} {}]", short(source)),
+            None => "   [merge]".to_owned(),
+        },
     }
 }
 
@@ -5733,6 +5889,7 @@ mod output_and_argument_tests {
         }))
         .contains("fragment ← selection-1"));
     }
+
 }
 
 #[cfg(test)]

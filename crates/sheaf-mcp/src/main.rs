@@ -181,7 +181,10 @@ fn allow_write() -> bool {
 /// only mutates with `apply=true`; the report is a read.
 fn write_gated(name: &str, args: &Value) -> bool {
     match name {
-        "sheaf_restore_apply" | "sheaf_init" => true,
+        "sheaf_restore_apply"
+        | "sheaf_worktree_add"
+        | "sheaf_init" => true,
+
         "sheaf_gc" => bool_arg(args, "apply"),
         _ => false,
     }
@@ -288,6 +291,22 @@ fn tool_table() -> Vec<Value> {
             }), paths_prop(), project_prop()]),
             &["point"],
         ),
+        tool(
+            "sheaf_worktree_list",
+            "List the primary and every live linked worktree, including each worktree's current timeline tip.",
+            project_prop(),
+            &[],
+        ),
+        tool(
+            "sheaf_worktree_add",
+            "Materialize a timeline point as a live linked worktree sharing the project's Sheaf store. REQUIRES SHEAF_MCP_ALLOW_WRITE=1.",
+            merge_props(&[json!({
+                "point": {"type": "string", "description": "Capture, checkpoint, or branch-tip reference to materialize."},
+                "destination": {"type": "string", "description": "New non-overlapping directory for the worktree."}
+            }), project_prop()]),
+            &["point", "destination"],
+        ),
+
         tool(
             "sheaf_doctor",
             "Read-only store integrity sweep: journal framing, snapshot chain, blob presence, pending restore intents.",
@@ -466,6 +485,25 @@ fn build_command(
                 cmd.args(["-C", root]);
             }
         }
+        "sheaf_worktree_list" => {
+            cmd.args(["worktree", "list", "--json"]);
+            if let Some(root) = project {
+                cmd.args(["-C", root]);
+            }
+        }
+        "sheaf_worktree_add" => {
+            let Some(point) = str_arg(args, "point") else {
+                anyhow::bail!("sheaf_worktree_add needs a timeline point");
+            };
+            let Some(destination) = str_arg(args, "destination") else {
+                anyhow::bail!("sheaf_worktree_add needs a destination");
+            };
+            cmd.args(["worktree", "add", point, destination, "--json"]);
+            if let Some(root) = project {
+                cmd.args(["-C", root]);
+            }
+        }
+
         "sheaf_doctor" => {
             cmd.arg("doctor").arg("--json");
             if let Some(root) = project {
@@ -692,6 +730,9 @@ mod tests {
                 "sheaf_checkpoint_create",
                 "sheaf_restore_plan",
                 "sheaf_restore_apply",
+                "sheaf_worktree_list",
+                "sheaf_worktree_add",
+
                 "sheaf_doctor",
                 "sheaf_gc",
                 "sheaf_init",
@@ -721,12 +762,20 @@ mod tests {
         assert_eq!(required("sheaf_checkpoint_create"), ["name"]);
         assert_eq!(required("sheaf_restore_plan"), ["point"]);
         assert_eq!(required("sheaf_restore_apply"), ["point"]);
+        assert_eq!(required("sheaf_worktree_add"), ["point", "destination"]);
+
         assert_eq!(required("sheaf_init"), ["path"]);
     }
 
     #[test]
     fn write_gated_tools_document_the_gate_in_their_description() {
-        for name in ["sheaf_restore_apply", "sheaf_gc", "sheaf_init"] {
+        for name in [
+            "sheaf_restore_apply",
+            "sheaf_worktree_add",
+            "sheaf_gc",
+            "sheaf_init",
+        ] {
+
             let resp = handle_request("tools/list", json!(3), json!({})).unwrap();
             let desc = resp["result"]["tools"]
                 .as_array()
@@ -858,12 +907,16 @@ mod tests {
         // Annotation-only tools are not gated: they never rewrite anything.
         assert!(!write_gated("sheaf_checkpoint_create", &plain));
         assert!(!write_gated("sheaf_restore_plan", &plain));
+        assert!(!write_gated("sheaf_worktree_list", &plain));
+
         assert!(!write_gated("sheaf_doctor", &plain));
         assert!(!write_gated("sheaf_gc", &gc_report));
         assert!(!write_gated("made-up tool", &plain));
 
         assert!(write_gated("sheaf_restore_apply", &plain));
         assert!(write_gated("sheaf_init", &plain));
+        assert!(write_gated("sheaf_worktree_add", &plain));
+
         assert!(write_gated("sheaf_gc", &gc_collect));
         // String-typed booleans gate too — clients mis-type arguments.
         assert!(write_gated("sheaf_gc", &gc_collect_str));
@@ -1092,6 +1145,35 @@ mod tests {
     }
 
     #[test]
+    fn worktree_tools_map_to_their_subcommands() {
+        let cmd = build("sheaf_worktree_list", json!({"project": "/p"}), Some("/p")).unwrap();
+        assert_eq!(argv(&cmd), [BIN, "worktree", "list", "--json", "-C", "/p"]);
+
+        let cmd = build(
+            "sheaf_worktree_add",
+            json!({"point": "checkpoint:x", "destination": "/w", "project": "/p"}),
+            Some("/p"),
+        )
+        .unwrap();
+        assert_eq!(
+            argv(&cmd),
+            [BIN, "worktree", "add", "checkpoint:x", "/w", "--json", "-C", "/p"]
+        );
+    }
+
+    #[test]
+    fn worktree_tools_require_their_references() {
+        assert!(build("sheaf_worktree_add", json!({"point": "@"}), None)
+            .unwrap_err()
+            .to_string()
+            .contains("destination"));
+        assert!(build("sheaf_worktree_add", json!({"destination": "/w"}), None)
+            .unwrap_err()
+            .to_string()
+            .contains("timeline point"));
+    }
+
+    #[test]
     fn doctor_and_gc_flag_shapes() {
         let cmd = build("sheaf_doctor", json!({"project": "/p"}), Some("/p")).unwrap();
         assert_eq!(argv(&cmd), [BIN, "doctor", "--json", "-C", "/p"]);
@@ -1170,6 +1252,6 @@ mod tests {
         // The client's initialized notification is silently consumed.
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let list = handle_request("tools/list", json!(1), json!({})).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12);
     }
 }

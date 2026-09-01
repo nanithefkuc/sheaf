@@ -42,6 +42,16 @@ const PROGRESS_LOG_LIMIT: usize = 200;
 /// Staging directory for atomic installs. Lives inside the always-ignored
 /// store directory so the watcher never observes a half-written payload.
 pub(super) const STAGE_DIR: &str = "restore-stage";
+fn restore_intent_path(root: &Path) -> PathBuf {
+    match crate::config::worktree_id(root) {
+        Some(id) => crate::config::worktree_head_path(root)
+            .parent()
+            .expect("managed worktree head has parent")
+            .join(format!("{id}.{INTENT_FILE}")),
+        None => state_dir(root).join(INTENT_FILE),
+    }
+}
+
 
 // --------------------------------------------------------------- state view
 
@@ -117,8 +127,19 @@ fn doc_exec(doc: &LoroDoc, key: &str) -> bool {
 
 /// Tracked content of the document's currently materialized state.
 pub(super) fn entries_of_state(doc: &LoroDoc) -> BTreeMap<String, Entry> {
+    entries_of_state_scoped(doc, &[])
+}
+
+/// Tracked content of the materialized state restricted to `scope`.
+///
+/// Filtering before `LoroText::to_string` matters: copying every tracked text
+/// file made a one-path diff scale with the whole project.
+pub(super) fn entries_of_state_scoped(doc: &LoroDoc, scope: &[String]) -> BTreeMap<String, Entry> {
     let mut out = BTreeMap::new();
     doc.get_map(FILES_MAP).for_each(|key, value| {
+        if !in_scope(key, scope) {
+            return;
+        }
         if let loro::ValueOrContainer::Container(loro::Container::Text(text)) = value {
             out.insert(
                 key.to_string(),
@@ -127,6 +148,9 @@ pub(super) fn entries_of_state(doc: &LoroDoc) -> BTreeMap<String, Entry> {
         }
     });
     doc.get_map(BINARIES_MAP).for_each(|key, value| {
+        if !in_scope(key, scope) {
+            return;
+        }
         let Ok(raw) = value.get_deep_value().into_string() else {
             return;
         };
@@ -228,12 +252,21 @@ impl<'a> HistoryView<'a> {
 
     /// Tracked content of the document state exactly at `frontier`.
     pub(super) fn entries_at(&mut self, frontier: &Frontiers) -> Result<BTreeMap<String, Entry>> {
+        self.entries_at_scoped(frontier, &[])
+    }
+
+    /// Historical entries restricted before text containers are copied.
+    pub(super) fn entries_at_scoped(
+        &mut self,
+        frontier: &Frontiers,
+        scope: &[String],
+    ) -> Result<BTreeMap<String, Entry>> {
         if self.doc.frontiers_to_vv(frontier).is_none() {
             return Err(SheafError::TimelineReference(
                 "target point is not part of this store's history".into(),
             ));
         }
-        Ok(entries_of_state(self.fork_for(frontier)?))
+        Ok(entries_of_state_scoped(self.fork_for(frontier)?, scope))
     }
 
     /// One path exactly at `frontier`, without materializing the whole tree
@@ -545,7 +578,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn validate_key(key: &str) -> Result<()> {
+pub(super) fn validate_key(key: &str) -> Result<()> {
+
     let bad = key.is_empty()
         || key.starts_with('/')
         || key.split('/').any(|c| c == ".." || c == ".")
@@ -841,29 +875,42 @@ pub(super) fn expand_names(
 /// restricted to `scope`. Ignored subtrees (`.git/`, `target/`, `.sheaf/`, …)
 /// are pruned rather than filtered, so build output costs nothing to skip.
 pub(super) fn live_files(root: &Path, ignore: &IgnoreSet, scope: &[String]) -> Vec<String> {
+    let starts: Vec<PathBuf> = if scope.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        scope
+            .iter()
+            .map(|key| root.join(key))
+            .filter(|path| path.exists())
+            .collect()
+    };
     let mut out = Vec::new();
-    let walker = walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry
-                .path()
-                .strip_prefix(root)
-                .map(|rel| rel.as_os_str().is_empty() || !ignore.is_ignored_rel(rel))
-                .unwrap_or(false)
-        });
-    for entry in walker.filter_map(std::result::Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let key = rel.to_string_lossy().replace('\\', "/");
-        if validate_key(&key).is_ok() && in_scope(&key, scope) {
-            out.push(key);
+    for start in starts {
+        let walker = walkdir::WalkDir::new(start)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map(|rel| rel.as_os_str().is_empty() || !ignore.is_ignored_rel(rel))
+                    .unwrap_or(false)
+            });
+        for entry in walker.filter_map(std::result::Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                continue;
+            };
+            let key = rel.to_string_lossy().replace('\\', "/");
+            if validate_key(&key).is_ok() && in_scope(&key, scope) {
+                out.push(key);
+            }
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -1468,30 +1515,17 @@ impl ProjectStore {
             started_ms: Utc::now().timestamp_millis(),
             fragment: None,
         };
-        let dir = state_dir(&self.root);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(INTENT_FILE);
-        let tmp = dir.join(".restore.intent.tmp");
-        {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(
-                serde_json::to_vec_pretty(&intent)
-                    .map_err(|e| SheafError::StoreCorrupt(e.to_string()))?
-                    .as_slice(),
-            )?;
-            file.sync_all()?;
-        }
-        std::fs::rename(tmp, &path)?;
-        // Parent-dir fsync: the intent rename is the durability
-        // line every install stands behind — losing the directory entry in a
-        // power cut while installs survived is exactly the torn state this
-        // file exists to prevent.
-        fsutil::sync_parent_dir(&path)?;
+        let path = restore_intent_path(&self.root);
+        let bytes = serde_json::to_vec_pretty(&intent)
+            .map_err(|e| SheafError::StoreCorrupt(e.to_string()))?;
+        fsutil::atomic_write(&path, &bytes)?;
+
         Ok(())
     }
 
     pub(super) fn clear_intent(&self) {
-        let path = state_dir(&self.root).join(INTENT_FILE);
+        let path = restore_intent_path(&self.root);
+
         if std::fs::remove_file(&path).is_ok() {
             let _ = fsutil::sync_parent_dir(&path);
         }
@@ -1599,7 +1633,7 @@ impl ProjectStore {
 /// in place it would be retried and skipped on every single start, hiding a
 /// half-restored worktree behind silence.
 pub fn pending_restore_at(root: &Path) -> Option<RestoreIntent> {
-    let path = state_dir(root).join(INTENT_FILE);
+    let path = restore_intent_path(root);
     let raw = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str(&raw) {
         Ok(intent) => Some(intent),
@@ -2427,5 +2461,55 @@ mod tests {
             batched.len() >= 2,
             "a 301-event reconcile must span multiple captures: {batched:#?}"
         );
+    }
+
+    #[test]
+    fn linked_worktree_restore_intent_is_independent_of_primary() {
+        let root = tmp("wt-intent");
+        skeleton(&root);
+        let mut store = open(&root);
+        write(&root, "a.txt", V1.as_bytes());
+        flush(&mut store, &root, vec![added(&root, "a.txt")]);
+        let p1 = store.resolve("@").unwrap();
+        write(&root, "a.txt", V2.as_bytes());
+        flush(&mut store, &root, vec![touched(&root, "a.txt")]);
+
+        // Materialize a linked worktree sharing this store.
+        let linked = root
+            .parent()
+            .unwrap()
+            .join(format!("{}-linked", root.file_name().unwrap().to_string_lossy()));
+        store.add_worktree("@", &linked).unwrap();
+
+        // A plan is enough to author an intent; the on-disk path is the contract.
+        let plan = store.plan_restore_at(&p1, &[], &ignores()).unwrap();
+        assert_ne!(restore_intent_path(&root), restore_intent_path(&linked));
+
+        // The primary intent lands at the primary's own path only.
+        store.write_intent(&plan).unwrap();
+        assert!(pending_restore_at(&root).is_some());
+        assert!(
+            pending_restore_at(&linked).is_none(),
+            "linked worktree has no intent of its own yet"
+        );
+
+        // The linked worktree writes its own, independent intent.
+        store.activate_worktree(&linked).unwrap();
+        store.write_intent(&plan).unwrap();
+        assert!(pending_restore_at(&linked).is_some());
+        assert!(
+            pending_restore_at(&root).is_some(),
+            "writing the linked intent must not disturb the primary's"
+        );
+
+        // Clearing the linked intent removes only that worktree's marker.
+        store.clear_intent();
+        assert!(pending_restore_at(&linked).is_none());
+        assert!(pending_restore_at(&root).is_some());
+
+        // The primary clears its own independently.
+        store.activate_worktree(&root).unwrap();
+        store.clear_intent();
+        assert!(pending_restore_at(&root).is_none());
     }
 }

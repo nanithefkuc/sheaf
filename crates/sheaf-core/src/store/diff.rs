@@ -23,7 +23,9 @@ use std::path::Path;
 use loro::{Frontiers, LoroDoc};
 use serde::{Deserialize, Serialize};
 
-use super::restore::{canonical_scope, in_scope, live_files, Content, Entry, HistoryView};
+use super::restore::{
+    canonical_scope, entries_of_state_scoped, in_scope, live_files, Content, Entry, HistoryView,
+};
 use super::timeline::{decode_frontier, resolve_in_doc, ResolvedPoint};
 use super::{ProjectStore, TimelineReader};
 use crate::error::Result;
@@ -191,25 +193,36 @@ pub(super) fn compute_diff_points(
         None => None,
     };
     let from_frontier = decode_frontier(&from_point.frontier)?;
-
-    // One shared view (fork at the tip, checkout per point) serves both
-    // sides and the rename scan; forking each point directly would re-encode
-    // the history in between and cost seconds on a large tree.
-    let mut view = HistoryView::open(doc)?;
-    let from_entries = view.entries_at(&from_frontier)?;
-    let to_entries = match &to_frontier {
-        Some(frontier) => view.entries_at(frontier)?,
-        None => worktree_entries(root, ignore)?,
-    };
-
     let scope = canonical_scope(paths)?;
+
+    // Materializing a historical fork is the dominant cost on a long
+    // timeline. The common `diff @` path already has that exact state in the
+    // live document, so read it directly. Scope filtering happens before text
+    // copies and before the worktree walk, keeping a one-path diff independent
+    // of unrelated source trees and large binary artifacts.
+    let mut view = HistoryView::open(doc)?;
+    let from_entries = if &from_frontier == current {
+        entries_of_state_scoped(doc, &scope)
+    } else {
+        view.entries_at_scoped(&from_frontier, &scope)?
+    };
+    let to_entries = match &to_frontier {
+        Some(frontier) if frontier == current => entries_of_state_scoped(doc, &scope),
+        Some(frontier) => view.entries_at_scoped(frontier, &scope)?,
+        None => worktree_entries(root, ignore, &scope)?,
+    };
 
     // Renames recorded between the two sides pair names ahead of content.
     // For a worktree comparison the recorded interval ends at the
     // materialized head; a rename still sitting in an open debounce window
-    // simply falls through to identity pairing below.
+    // simply falls through to identity pairing below. Equal endpoints have no
+    // interval and, importantly, need no historical forks.
     let rename_base = to_frontier.as_ref().unwrap_or(current);
-    let interval = interval_renames(&mut view, &from_frontier, rename_base)?;
+    let interval = if &from_frontier == rename_base {
+        Vec::new()
+    } else {
+        interval_renames(&mut view, &from_frontier, rename_base)?
+    };
     let mut old_of_new: BTreeMap<String, String> = BTreeMap::new();
     for (from_name, to_name) in &interval {
         // Forward comparison: old name on the from side, new on the to side.
@@ -418,9 +431,13 @@ impl TimelineReader {
 // ------------------------------------------------------------------ helpers
 
 /// Tracked content of the live non-ignored worktree.
-fn worktree_entries(root: &Path, ignore: &IgnoreSet) -> Result<BTreeMap<String, Entry>> {
+fn worktree_entries(
+    root: &Path,
+    ignore: &IgnoreSet,
+    scope: &[String],
+) -> Result<BTreeMap<String, Entry>> {
     let mut out = BTreeMap::new();
-    for key in live_files(root, ignore, &[]) {
+    for key in live_files(root, ignore, scope) {
         let path = root.join(&key);
         // Same policy as capture: oversized files are hashed straight from
         // disk instead of being slurped into memory.
