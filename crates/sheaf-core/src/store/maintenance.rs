@@ -457,24 +457,22 @@ fn return_after_setup(
     }
 
     // -- blobs ------------------------------------------------------------------
-    let reachable = reachable_blob_digests(reader);
+    // Every digest surviving history references must have a payload — not
+    // just the live binaries map: a blob named only by an older capture is
+    // still what `restore` to that point materializes from. The
+    // retention-aware set keeps this view identical to what `gc --apply` is
+    // allowed to collect, so a legitimately trimmed store stays healthy.
+    let retention = plan_retention(root, reader.doc(), reader.ledger()).unwrap_or_default();
+    let reachable = retention_aware_reachable_blobs(reader.doc(), reader.ledger(), &retention);
     let (blob_count, blob_bytes, orphan_count, orphan_bytes, superseded) =
         blob_facts(root, Some(&reachable));
-    // Missing blobs: every binary entry at the merged tip must have a payload.
     let mut missing = 0usize;
-    let doc = reader.doc();
-    doc.get_map(super::BINARIES_MAP).for_each(|key, value| {
-        if let Ok(raw) = value.get_deep_value().into_string() {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(hash) = parsed["hash"].as_str() {
-                    if !blobs::blob_path(&sdir, hash).exists() {
-                        missing += 1;
-                        tracing::debug!(key = key, hash = hash, "missing blob");
-                    }
-                }
-            }
+    for digest in &reachable {
+        if !blobs::blob_path(&sdir, digest).exists() {
+            missing += 1;
+            tracing::debug!(digest = %digest, "missing blob");
         }
-    });
+    }
     checks.push(check(
         "blob_coverage",
         missing == 0,
@@ -659,9 +657,8 @@ fn reader_resolves(reader: &TimelineReader, f: &loro::Frontiers) -> bool {
 
 /// Digests any history event or live entry names — the conservative
 /// reachability set. Everything outside it can never be referenced again.
-fn reachable_blob_digests(reader: &TimelineReader) -> BTreeSet<String> {
+fn reachable_blob_digests(doc: &LoroDoc) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let doc = reader.doc();
     // Every binary capture pushed a tree event carrying its digest, so the
     // merged tree_events list is the whole history of "this blob mattered".
     doc.get_list(super::TREE_EVENTS_LIST).for_each(|value| {
@@ -810,7 +807,7 @@ pub fn gc_plan(root: &Path) -> Result<GcPlan> {
     let sdir = store_dir(root);
     let reader = TimelineReader::open(root)?;
     let retention = plan_retention(root, reader.doc(), reader.ledger())?;
-    let reachable = retention_aware_reachable_blobs(&reader, &retention);
+    let reachable = retention_aware_reachable_blobs(reader.doc(), reader.ledger(), &retention);
 
     let manifest = newest_manifest(&sdir);
     let covered = manifest.as_ref().map(|(_, m)| m.covered_upto);
@@ -1351,15 +1348,14 @@ fn short(id: &str) -> String {
 /// surviving capture and which no surviving ledger record or live entry
 /// names.
 fn retention_aware_reachable_blobs(
-    reader: &TimelineReader,
+    doc: &LoroDoc,
+    ledger: &ledger::LedgerState,
     retention: &RetentionFacts,
 ) -> BTreeSet<String> {
-    let mut reachable = reachable_blob_digests(reader);
+    let mut reachable = reachable_blob_digests(doc);
     if retention.prunable.is_empty() {
         return reachable;
     }
-    let doc = reader.doc();
-    let ledger = reader.ledger();
     let mut min_surviving_ms = i64::MAX;
     for capture in
         timeline::captures_from(doc, ledger, &doc.oplog_frontiers(), None, None, usize::MAX)
@@ -1380,7 +1376,11 @@ fn retention_aware_reachable_blobs(
             return;
         };
         if let Some(digest) = parsed["event"]["binary"].as_str() {
-            let ts = parsed["event"]["ts"].as_i64().unwrap_or(i64::MAX);
+            // `push_tree_event` stamps the timestamp at the top level
+            // ({"ts": .., "event": ..}); reading it inside the event payload
+            // always missed, pinning last-mention at i64::MAX so trimmed
+            // captures' superseded blobs were never reclaimed.
+            let ts = parsed["ts"].as_i64().unwrap_or(i64::MAX);
             let slot = last_mention.entry(digest.to_owned()).or_insert(i64::MIN);
             *slot = (*slot).max(ts);
         }
@@ -2021,7 +2021,79 @@ mod tests {
         assert!(!facts.protected.is_empty());
         assert!(facts.prunable.is_empty());
         let reachable = TimelineReader::open(root).unwrap();
-        let blobs = retention_aware_reachable_blobs(&reachable, &facts);
+        let blobs = retention_aware_reachable_blobs(reachable.doc(), reachable.ledger(), &facts);
         assert!(blobs.is_empty());
+    }
+
+    /// Blob reachability under a trim: a digest leaves the reachable set
+    /// only when its every mention predates the earliest surviving capture
+    /// AND no surviving ledger record or live entry names it. Mentions carry
+    /// the TOP-LEVEL tree-event stamp; a misread of that field once pinned
+    /// every mention at i64::MAX and froze reclamation entirely.
+    #[test]
+    fn retention_aware_reachability_follows_mention_stamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut store = fresh(root);
+        store.apply_batch(&touch(root, "keep.txt")).unwrap();
+        let survivor_ms = timeline::captures_from(
+            &store.doc,
+            store.ledger(),
+            &store.doc.oplog_frontiers(),
+            None,
+            None,
+            usize::MAX,
+        )
+        .unwrap()
+        .last()
+        .unwrap()
+        .timestamp_ms;
+        drop(store);
+
+        let reader = TimelineReader::open(root).unwrap();
+        let list = reader.doc().get_list(super::super::TREE_EVENTS_LIST);
+        let mention = |ts: i64, digest: &str| {
+            let stamped = serde_json::json!({ "ts": ts, "event": { "binary": digest } });
+            list.insert(list.len(), stamped.to_string()).unwrap();
+        };
+        let old = "0000000000000000000000000000000000000000000000000000000000000000";
+        let recent = "1111111111111111111111111111111111111111111111111111111111111111";
+        let live = "2222222222222222222222222222222222222222222222222222222222222222";
+        mention(survivor_ms - 10_000, old);
+        mention(survivor_ms - 10_000, live);
+        mention(survivor_ms + 10_000, recent);
+        reader
+            .doc()
+            .get_map(super::super::BINARIES_MAP)
+            .insert(
+                "live.bin",
+                serde_json::json!({ "hash": live, "size": 1 }).to_string(),
+            )
+            .unwrap();
+
+        let retention = RetentionFacts {
+            prunable: vec![PrunableCapture {
+                id: "pruned".to_owned(),
+                at_ms: survivor_ms - 20_000,
+                parent_frontier: String::new(),
+                paths: Vec::new(),
+                events: 0,
+                cause: PruneCause::Expired,
+            }],
+            ..RetentionFacts::default()
+        };
+        let blobs = retention_aware_reachable_blobs(reader.doc(), reader.ledger(), &retention);
+        assert!(
+            !blobs.contains(old),
+            "a pre-boundary mention nothing else names is droppable: {blobs:?}"
+        );
+        assert!(
+            blobs.contains(recent),
+            "a post-boundary mention stays reachable: {blobs:?}"
+        );
+        assert!(
+            blobs.contains(live),
+            "the live binaries map always stays reachable: {blobs:?}"
+        );
     }
 }

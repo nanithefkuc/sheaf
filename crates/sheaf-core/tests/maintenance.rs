@@ -160,20 +160,11 @@ fn doctor_catches_a_missing_blob() {
     let store = seeded_store(root);
     drop(store);
 
-    // Delete one reachable blob out from under history.
-    let blobs_dir = root.join(".sheaf/store/blobs");
-    let victim = std::fs::read_dir(&blobs_dir)
-        .unwrap()
-        .flatten()
-        .next()
-        .unwrap()
-        .path()
-        .read_dir()
-        .unwrap()
-        .flatten()
-        .next()
-        .unwrap()
-        .path();
+    // Delete a blob out from under history: round 0's payload, referenced
+    // only by an older capture (the live binaries map points at round 7's).
+    // Directory order is filesystem-dependent, so pick by digest — this is
+    // the case a live-tip-only coverage check would silently miss.
+    let victim = blob_path(root, &hash_of(&[0xff, 0, 0x00, 0x93, 0x94, 0x01]));
     std::fs::remove_file(&victim).unwrap();
 
     let report = doctor(root).unwrap();
