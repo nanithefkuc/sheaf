@@ -1,0 +1,21 @@
+{
+  "budgets": {
+    "boot_ready_ms": 134,
+    "checkpoint_create_ms": 190,
+    "daemon_rss_kb": 84736,
+    "edit_settle_max_ms": 1054,
+    "initial_capture_ms": 454,
+    "read_diff_ms": 320,
+    "read_grep_ms": 231,
+    "read_log_ms": 191,
+    "restore_apply_ms": 1198,
+    "restore_plan_ms": 370,
+    "store_bytes": 3380526
+  },
+  "comment": "Performance ratchet: tighten with `python3 scripts/perf_gate.py --update` after optimizations; widening requires --allow-widen and a stated reason in the commit that does it.",
+  "slack": {
+    "bytes": 1.15,
+    "rss_kb": 2.0,
+    "time_ms": 2.5
+  }
+}

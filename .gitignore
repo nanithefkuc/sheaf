@@ -3,3 +3,4 @@
 /.sheaf
 /coverage
 *.profraw
+__pycache__/

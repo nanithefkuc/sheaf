@@ -83,6 +83,14 @@ cargo test --workspace
 ./scripts/coverage.sh --summary-only
 ```
 
+Performance is a ratchet, not a snapshot. `python3 scripts/perf_gate.py`
+runs a fixed workload against the release binaries and compares every
+metric against the budgets in `scripts/perf-budgets.json`; CI runs it on
+every push and a breach fails the build. After a change improves a
+metric, rerun the gate with `--update` to tighten the window — it only
+narrows. Widening a budget requires `--allow-widen` and must be justified
+in the commit that does it.
+
 This project targets at least 95% line coverage. Add meaningful tests for new
 behavior and do not lower the threshold to make a change pass.
 

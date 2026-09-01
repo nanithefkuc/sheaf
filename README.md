@@ -300,9 +300,14 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ./scripts/coverage.sh --summary-only
+python3 scripts/perf_gate.py
 ```
 
 The project maintains a minimum 95% line-coverage target.
+
+Performance budgets are a ratchet: after an optimization, rerun the gate
+with `--update` to tighten `scripts/perf-budgets.json` (widening needs
+`--allow-widen`). CI enforces the budgets on every push.
 
 ## License
 
