@@ -4,11 +4,11 @@
     "checkpoint_create_ms": 190,
     "daemon_rss_kb": 84736,
     "edit_settle_max_ms": 1054,
-    "initial_capture_ms": 454,
+    "initial_capture_ms": 2213,
     "read_diff_ms": 320,
     "read_grep_ms": 231,
     "read_log_ms": 191,
-    "restore_apply_ms": 1198,
+    "restore_apply_ms": 3353,
     "restore_plan_ms": 370,
     "store_bytes": 3380526
   },

@@ -337,6 +337,50 @@ def update(results, path: pathlib.Path, allow_widen: bool):
     path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
     print(f"budgets written to {path} — commit the file with your change")
 
+def set_budgets(path: pathlib.Path, pairs):
+    """Write budgets from explicit NAME=VALUE pairs — no workload run.
+
+    The sanctioned path for CI-derived numbers: budgets are enforced on
+    the slowest hardware that runs the gate (CI runners), so tightening
+    from a fast dev laptop via --update would re-break CI. Take the
+    measured values a CI run prints, apply the class slack yourself, and
+    set them here.
+    """
+    doc = {}
+    if path.exists():
+        doc = json.loads(path.read_text())
+    doc.setdefault(
+        "comment",
+        "Performance ratchet: tighten with `python3 scripts/perf_gate.py --update` "
+        "after optimizations; widening requires --allow-widen and a stated reason "
+        "in the commit that does it.",
+    )
+    doc.setdefault("slack", SLACK)
+    budgets = doc.setdefault("budgets", {})
+    for pair in pairs:
+        name, sep, raw = pair.partition("=")
+        if not sep:
+            raise SystemExit(f"--set expects NAME=VALUE, got {pair!r}")
+        try:
+            value = float(raw)
+        except ValueError:
+            raise SystemExit(f"--set value must be numeric, got {raw!r}")
+        if value <= 0:
+            raise SystemExit(f"--set value must be positive, got {raw!r}")
+        cls = metric_class(name)  # rejects unknown metrics
+        old = budgets.get(name)
+        budgets[name] = int(round(value))
+        if old is None:
+            print(f"  {name}: new budget {budgets[name]} ({cls})")
+        elif budgets[name] < float(old):
+            print(f"  {name}: tightened {old} -> {budgets[name]} ({cls})")
+        else:
+            print(f"  {name}: set {old} -> {budgets[name]} ({cls})")
+    doc["budgets"] = budgets
+    path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    print(f"budgets written to {path} — commit the file with your change")
+
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -348,6 +392,9 @@ def main():
                         help="with --update: permit widening budgets")
     parser.add_argument("--keep", action="store_true",
                         help="keep the sandbox directory for debugging")
+    parser.add_argument("--set", action="append", metavar="NAME=VALUE",
+                        help="write budgets directly (e.g. from a CI run's "
+                             "measured table); no workload is run")
     args = parser.parse_args()
 
     cpu = ""
@@ -359,6 +406,9 @@ def main():
     except OSError:
         pass
     print(f"# host: {cpu or 'unknown'} x{os.cpu_count()}")
+    if args.set:
+        set_budgets(args.budgets, args.set)
+        return
 
     results = measure(args.bin, args.keep)
     budgets = {}

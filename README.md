@@ -305,8 +305,9 @@ python3 scripts/perf_gate.py
 
 The project maintains a minimum 95% line-coverage target.
 
-Performance budgets are a ratchet: after an optimization, rerun the gate
-with `--update` to tighten `scripts/perf-budgets.json` (widening needs
+Performance budgets are a ratchet that binds on CI hardware: after an
+optimization, take the measured table a CI run prints and tighten
+`scripts/perf-budgets.json` with `--set name=value` (widening needs
 `--allow-widen`). CI enforces the budgets on every push.
 
 ## License

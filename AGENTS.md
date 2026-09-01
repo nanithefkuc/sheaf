@@ -91,6 +91,11 @@ metric, rerun the gate with `--update` to tighten the window — it only
 narrows. Widening a budget requires `--allow-widen` and must be justified
 in the commit that does it.
 
+Budgets bind on the slowest hardware that runs the gate — the CI runner,
+not a dev laptop. Tighten from the measured table a CI run prints, via
+`--set name=value` (measured × slack); a local `--update` can tighten
+below what CI can hold and re-break it.
+
 This project targets at least 95% line coverage. Add meaningful tests for new
 behavior and do not lower the threshold to make a change pass.
 
