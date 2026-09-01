@@ -2227,6 +2227,14 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         .get("before")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+    // A walk that only needs identity/time/provenance (the squash span
+    // stats) sets this so per-capture `paths` — unbounded for bulk-change
+    // captures — never bloats the envelope past its 1 MiB cap.
+    let omit_paths = req
+        .params
+        .get("omit_paths")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let control = match project_control(shared, &root, &rid) {
         Ok(control) => control,
         Err(response) => return response,
@@ -2293,6 +2301,11 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         entries.drain(..=pos);
     }
     entries.truncate(limit);
+    if omit_paths {
+        for entry in &mut entries {
+            entry.paths.clear();
+        }
+    }
     Response::ok(
         rid,
         json!({"entries": entries, "tips": tips, "degraded": false}),
@@ -5591,6 +5604,52 @@ mod tests {
         );
         assert_eq!(error_code_of(&resp), "state.bad_reference");
         assert!(resp.error.unwrap().message.contains("unknown cursor"));
+    }
+
+    #[test]
+    fn timeline_log_omit_paths_strips_per_capture_path_lists() {
+        // The squash span walk sets `omit_paths` so a full page of captures
+        // stays under the envelope cap even when bulk-change captures carry
+        // long path lists. The daemon must clear `paths` while leaving the
+        // rest of each entry intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let live = skeleton_project(tmp.path(), "omit-paths-log");
+        std::fs::write(live.join("tracked.txt"), "content").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        let mut shutting_down = false;
+
+        let log_req = |omit: bool| {
+            test_request(
+                "timeline.log",
+                Some(live.clone()),
+                json!({"limit": 50, "omit_paths": omit}),
+            )
+        };
+
+        // Default: paths are present (the capture recorded the tracked file).
+        let (resp, _) = dispatch(&shared, &log_req(false), &mut shutting_down);
+        assert!(resp.ok, "timeline.log over a warming project must wait");
+        let entries = resp.result.unwrap()["entries"].as_array().unwrap().clone();
+        assert!(!entries.is_empty());
+        assert!(
+            entries.iter().any(|e| !e["paths"].as_array().unwrap().is_empty()),
+            "the baseline reply carries real path lists"
+        );
+
+        // omit_paths: identity/time survive; paths are emptied.
+        let (resp, _) = dispatch(&shared, &log_req(true), &mut shutting_down);
+        assert!(resp.ok);
+        let slim = resp.result.unwrap()["entries"].as_array().unwrap().clone();
+        assert_eq!(slim.len(), entries.len());
+        for (full, thin) in entries.iter().zip(&slim) {
+            assert_eq!(thin["id"], full["id"]);
+            assert_eq!(thin["timestamp_ms"], full["timestamp_ms"]);
+            assert!(
+                thin["paths"].as_array().unwrap().is_empty(),
+                "omit_paths must clear every path list"
+            );
+        }
     }
 
     // --------------------------------------------------- connection layer

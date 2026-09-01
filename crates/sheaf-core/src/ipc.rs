@@ -49,7 +49,12 @@ use crate::error::{Result, SheafError};
 
 pub const PROTO_MAJOR: u32 = 1;
 /// Minor 1.10: named branches, lifecycle operations, and branch metadata.
-pub const PROTO_MINOR: u32 = 10;
+///
+/// Minor 11: `timeline.log` accepts an optional `omit_paths` flag that
+/// drops per-capture path lists from the reply. The squash span walk sets
+/// it so a full page stays under the envelope cap even across bulk-change
+/// captures; an older daemon ignores it and returns full entries. Additive.
+pub const PROTO_MINOR: u32 = 11;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;
@@ -214,6 +219,13 @@ impl Client {
 
     /// Send one request and fully read its response, buffering any body
     /// (streamed or counted) into the returned [`Reply`].
+    ///
+    /// A response whose id does not match the request is an orphan left by
+    /// an earlier call that timed out client-side after its request reached
+    /// the daemon: the daemon answered late, and that answer now sits ahead
+    /// of ours in the stream. Such stale (older-id) responses are drained —
+    /// body and all — so this call still returns its own answer instead of
+    /// silently handing back the wrong one.
     pub fn call(
         &mut self,
         method: &str,
@@ -221,7 +233,7 @@ impl Client {
         params: Value,
         body: Option<&[u8]>,
     ) -> Result<Reply> {
-        self.send_request(method, project, params)?;
+        let id = self.send_request(method, project, params)?;
         if let Some(bytes) = body {
             // Chunked upload mirrors download framing (reserved; unused v1).
             let mut w = &self.stream;
@@ -230,30 +242,32 @@ impl Client {
             }
         }
 
-        let env_bytes = read_frame(&mut self.stream, MAX_ENVELOPE)
-            .map_err(|e| SheafError::Ipc(format!("read response: {e}")))?;
-        let resp: Response = serde_json::from_slice(&env_bytes)
-            .map_err(|e| SheafError::Ipc(format!("parse response: {e}")))?;
-
-        let mut body_out = Vec::new();
-        if let Some(info) = &resp.body {
-            if info.chunks == STREAMED_BODY_SENTINEL {
-                // Streamed body: buffer it whole for this buffered caller.
-                while let Some(chunk) = self.read_stream_chunk()? {
-                    body_out.extend_from_slice(&chunk);
+        loop {
+            let resp = self.read_envelope()?;
+            if resp.id == id {
+                let mut body_out = Vec::new();
+                if let Some(info) = &resp.body {
+                    if info.chunks == STREAMED_BODY_SENTINEL {
+                        // Streamed body: buffer it whole for this buffered caller.
+                        while let Some(chunk) = self.read_stream_chunk()? {
+                            body_out.extend_from_slice(&chunk);
+                        }
+                    } else {
+                        for _ in 0..info.chunks {
+                            let chunk = read_frame(&mut self.stream, MAX_CHUNK).map_err(|e| {
+                                SheafError::Ipc(format!("read body chunk: {e}"))
+                            })?;
+                            body_out.extend_from_slice(&chunk);
+                        }
+                    }
                 }
-            } else {
-                for _ in 0..info.chunks {
-                    let chunk = read_frame(&mut self.stream, MAX_CHUNK)
-                        .map_err(|e| SheafError::Ipc(format!("read body chunk: {e}")))?;
-                    body_out.extend_from_slice(&chunk);
-                }
+                return Ok(Reply {
+                    response: resp,
+                    body: body_out,
+                });
             }
+            self.drain_orphan(&resp, &id)?;
         }
-        Ok(Reply {
-            response: resp,
-            body: body_out,
-        })
     }
 
     /// Like [`Client::call`], but for a streamed-body method: `on_chunk`
@@ -267,40 +281,89 @@ impl Client {
         params: Value,
         on_chunk: &mut dyn FnMut(&[u8]),
     ) -> Result<Reply> {
-        self.send_request(method, project, params)?;
+        let id = self.send_request(method, project, params)?;
+
+        loop {
+            let resp = self.read_envelope()?;
+            if resp.id == id {
+                let mut body_out = Vec::new();
+                if let Some(info) = &resp.body {
+                    if info.chunks == STREAMED_BODY_SENTINEL {
+                        while let Some(chunk) = self.read_stream_chunk()? {
+                            on_chunk(&chunk);
+                            body_out.extend_from_slice(&chunk);
+                        }
+                    } else {
+                        for _ in 0..info.chunks {
+                            let chunk = read_frame(&mut self.stream, MAX_CHUNK).map_err(|e| {
+                                SheafError::Ipc(format!("read body chunk: {e}"))
+                            })?;
+                            on_chunk(&chunk);
+                            body_out.extend_from_slice(&chunk);
+                        }
+                    }
+                }
+                return Ok(Reply {
+                    response: resp,
+                    body: body_out,
+                });
+            }
+            // A stale response is not the caller's data: drain it without
+            // firing `on_chunk`.
+            self.drain_orphan(&resp, &id)?;
+        }
+    }
+
+    /// Read and parse one response envelope frame.
+    fn read_envelope(&mut self) -> Result<Response> {
         let env_bytes = read_frame(&mut self.stream, MAX_ENVELOPE)
             .map_err(|e| SheafError::Ipc(format!("read response: {e}")))?;
-        let resp: Response = serde_json::from_slice(&env_bytes)
-            .map_err(|e| SheafError::Ipc(format!("parse response: {e}")))?;
+        serde_json::from_slice(&env_bytes)
+            .map_err(|e| SheafError::Ipc(format!("parse response: {e}")))
+    }
 
-        let mut body_out = Vec::new();
+    /// Discard an orphaned response's body so the stream realigns on the
+    /// next envelope. Only stale (older-id) orphans are expected; a response
+    /// carrying an id at or beyond the one we are waiting on is a genuine
+    /// desync we cannot recover from, so it is a hard error.
+    fn drain_orphan(&mut self, resp: &Response, expected: &str) -> Result<()> {
+        let stale = match (resp.id.parse::<u64>(), expected.parse::<u64>()) {
+            (Ok(got), Ok(want)) => got < want,
+            // Non-numeric ids never appear from the daemon; treat any
+            // mismatch as unrecoverable.
+            _ => false,
+        };
+        if !stale {
+            return Err(SheafError::Ipc(format!(
+                "response id {} does not match request id {expected}",
+                resp.id
+            )));
+        }
         if let Some(info) = &resp.body {
             if info.chunks == STREAMED_BODY_SENTINEL {
-                while let Some(chunk) = self.read_stream_chunk()? {
-                    on_chunk(&chunk);
-                    body_out.extend_from_slice(&chunk);
-                }
+                while self.read_stream_chunk()?.is_some() {}
             } else {
                 for _ in 0..info.chunks {
-                    let chunk = read_frame(&mut self.stream, MAX_CHUNK)
-                        .map_err(|e| SheafError::Ipc(format!("read body chunk: {e}")))?;
-                    on_chunk(&chunk);
-                    body_out.extend_from_slice(&chunk);
+                    read_frame(&mut self.stream, MAX_CHUNK)
+                        .map_err(|e| SheafError::Ipc(format!("drain body chunk: {e}")))?;
                 }
             }
         }
-        Ok(Reply {
-            response: resp,
-            body: body_out,
-        })
+        Ok(())
     }
 
-    /// Serialize and frame one request onto the socket.
-    fn send_request(&mut self, method: &str, project: Option<&Path>, params: Value) -> Result<()> {
+    /// Serialize and frame one request onto the socket, returning its
+    /// correlation id so the caller can match the response to it.
+    fn send_request(
+        &mut self,
+        method: &str,
+        project: Option<&Path>,
+        params: Value,
+    ) -> Result<String> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed).to_string();
         let req = Request {
             v: PROTO_MAJOR,
-            id,
+            id: id.clone(),
             method: method.to_string(),
             project: project.map(|p| p.to_path_buf()),
             params,
@@ -309,7 +372,7 @@ impl Client {
             .map_err(|e| SheafError::Ipc(format!("serialize request: {e}")))?;
         let mut w = &self.stream;
         write_frame(&mut w, &payload, MAX_ENVELOPE)?;
-        Ok(())
+        Ok(id)
     }
 
     /// Read one streamed-body frame; `None` is the empty terminator.
@@ -457,15 +520,23 @@ mod tests {
         write_frame(stream, &env, MAX_ENVELOPE).unwrap();
     }
 
+    /// The correlation id the client put on a request. A real daemon always
+    /// echoes it on the response; the mock servers must too, now that the
+    /// client enforces request→response id matching.
+    fn req_id(req: &[u8]) -> String {
+        let parsed: Request = serde_json::from_slice(req).expect("parse request");
+        parsed.id
+    }
+
     #[test]
     fn ping_roundtrip_returns_protocol_and_version() {
         let tmp = tempfile::tempdir().unwrap();
         let (path, listener) = bind_socket(tmp.path());
-        let server = serve_one(listener, |_req, stream| {
+        let server = serve_one(listener, |req, stream| {
             write_env(
                 stream,
                 &Response::ok(
-                    "1",
+                    req_id(req),
                     serde_json::json!({
                         "proto": {"major": PROTO_MAJOR, "minor": PROTO_MINOR},
                         "daemon_version": "9.9.9-test",
@@ -488,10 +559,10 @@ mod tests {
 
         // A structured error renders "code: message".
         let (path, listener) = bind_socket(tmp.path());
-        let server = serve_one(listener, |_req, stream| {
+        let server = serve_one(listener, |req, stream| {
             write_env(
                 stream,
-                &Response::err("1", IpcError::new("bad.method", "nope")),
+                &Response::err(req_id(req), IpcError::new("bad.method", "nope")),
             );
         });
         let mut client = Client::connect(&path, Duration::from_secs(5)).unwrap();
@@ -501,12 +572,12 @@ mod tests {
 
         // A !ok reply with NO error object falls back to "unknown error".
         let (path, listener) = bind_socket(tmp.path());
-        let server = serve_one(listener, |_req, stream| {
+        let server = serve_one(listener, |req, stream| {
             write_env(
                 stream,
                 &Response {
                     v: PROTO_MAJOR,
-                    id: "1".into(),
+                    id: req_id(req),
                     ok: false,
                     result: None,
                     error: None,
@@ -527,14 +598,14 @@ mod tests {
         let upload: Vec<u8> = vec![7u8; MAX_CHUNK + 7]; // forces 2 upload frames
         let up = upload.clone();
         let server = serve_one(listener, move |req, stream| {
-            let _req: Request = serde_json::from_slice(req).unwrap();
+            let req = req_id(req);
             // The request body arrived as MAX_CHUNK-sized continuation frames.
             let a = read_frame(stream, MAX_CHUNK).unwrap();
             let b = read_frame(stream, MAX_CHUNK).unwrap();
             assert_eq!(a.len(), MAX_CHUNK);
             assert_eq!(b, &up[MAX_CHUNK..]);
             // Reply with a counted 2-chunk body.
-            let mut resp = Response::ok("7", serde_json::json!({"accepted": true}));
+            let mut resp = Response::ok(req, serde_json::json!({"accepted": true}));
             resp.body = Some(BodyInfo { chunks: 2 });
             write_env(stream, &resp);
             write_frame(stream, b"alpha-", MAX_CHUNK).unwrap();
@@ -559,8 +630,8 @@ mod tests {
     fn call_streaming_fires_per_chunk_until_the_sentinel_terminator() {
         let tmp = tempfile::tempdir().unwrap();
         let (path, listener) = bind_socket(tmp.path());
-        let server = serve_one(listener, |_req, stream| {
-            let mut resp = Response::ok("8", Value::Null);
+        let server = serve_one(listener, |req, stream| {
+            let mut resp = Response::ok(req_id(req), Value::Null);
             resp.body = Some(BodyInfo {
                 chunks: STREAMED_BODY_SENTINEL,
             });
@@ -589,8 +660,8 @@ mod tests {
     fn call_streaming_also_reads_counted_bodies() {
         let tmp = tempfile::tempdir().unwrap();
         let (path, listener) = bind_socket(tmp.path());
-        let server = serve_one(listener, |_req, stream| {
-            let mut resp = Response::ok("9", Value::Null);
+        let server = serve_one(listener, |req, stream| {
+            let mut resp = Response::ok(req_id(req), Value::Null);
             resp.body = Some(BodyInfo { chunks: 2 });
             write_env(stream, &resp);
             write_frame(stream, b"alpha", MAX_CHUNK).unwrap();
@@ -622,5 +693,64 @@ mod tests {
         let back = read_frame(&mut raw, MAX_ENVELOPE).unwrap();
         assert_eq!(back, b"echo-me");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn call_drains_a_stale_orphan_before_returning_its_own_response() {
+        // The desync a client-side timeout leaves behind: an earlier call
+        // gave up after its request reached the daemon, so the daemon's
+        // late answer (an older id, here even carrying a body) now sits
+        // ahead of this call's real answer. The client must discard the
+        // orphan — body and all — and return the response that matches.
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, listener) = bind_socket(tmp.path());
+        let server = serve_one(listener, |req, stream| {
+            let want: u64 = req_id(req).parse().unwrap();
+            let mut orphan =
+                Response::ok((want - 1).to_string(), serde_json::json!({"stale": true}));
+            orphan.body = Some(BodyInfo { chunks: 1 });
+            write_env(stream, &orphan);
+            write_frame(stream, b"orphan-body", MAX_CHUNK).unwrap();
+            write_env(
+                stream,
+                &Response::ok(want.to_string(), serde_json::json!({"fresh": true})),
+            );
+        });
+        let mut client = Client::connect(&path, Duration::from_secs(5)).unwrap();
+        let reply = client
+            .call("diff", None, serde_json::json!({}), None)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(reply.response.result.unwrap()["fresh"], true);
+        assert!(
+            reply.body.is_empty(),
+            "the orphan's body must not leak into the matched reply"
+        );
+    }
+
+    #[test]
+    fn call_rejects_a_response_id_that_is_not_stale() {
+        // Only an older id is a forgivable orphan. An id at or beyond the
+        // one we are waiting on is a genuine desync we cannot recover from,
+        // so it is a hard error rather than a silently-accepted mismatch.
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, listener) = bind_socket(tmp.path());
+        let server = serve_one(listener, |req, stream| {
+            let want: u64 = req_id(req).parse().unwrap();
+            write_env(
+                stream,
+                &Response::ok((want + 1).to_string(), serde_json::json!({"future": true})),
+            );
+        });
+        let mut client = Client::connect(&path, Duration::from_secs(5)).unwrap();
+        let err = match client.call("diff", None, serde_json::json!({}), None) {
+            Ok(_) => panic!("a non-stale id mismatch must be rejected"),
+            Err(err) => err,
+        };
+        server.join().unwrap();
+        assert!(
+            err.to_string().contains("does not match request id"),
+            "{err}"
+        );
     }
 }

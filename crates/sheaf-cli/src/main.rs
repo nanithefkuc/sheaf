@@ -3770,6 +3770,11 @@ const SQUASH_PAGE: usize = 1000;
 /// before committing anyway (default debounce is 300ms; this absorbs a
 /// burst plus slow fsync).
 const SQUASH_CATCHUP: Duration = Duration::from_secs(10);
+/// Read budget for squash's store-read IPC calls. The 2s connect budget only
+/// covers reaching a live daemon; once connected, every call is genuine store
+/// work (a `timeline.info` that diffs against a parent, a span diff, a lineage
+/// page) that legitimately runs longer on a large store.
+const SQUASH_READ_BUDGET: Duration = Duration::from_secs(35);
 
 /// The resolved start of a squash span.
 struct SquashAnchor {
@@ -3830,14 +3835,29 @@ impl<'a> SquashCtx<'a> {
         let Some(client) = self.client.as_mut() else {
             anyhow::bail!("daemon unavailable");
         };
-        if method == "diff" || method == "checkpoint.create" {
-            client.set_timeout(Duration::from_secs(35))?;
-        }
-        let reply = client.call(method, Some(self.root), params, None)?;
-        if !reply.response.ok {
+        client.set_timeout(SQUASH_READ_BUDGET)?;
+        // A lazily-parked project answers the first request with a
+        // retryable `project.warming` while its store opens (a large store
+        // outlasts the daemon's cold-open budget). Honor the daemon's
+        // "retry shortly" contract so a squash right after `sheafd` starts
+        // resolves fully instead of silently degrading to partial stats.
+        let deadline = std::time::Instant::now() + SQUASH_READ_BUDGET;
+        loop {
+            let reply = client.call(method, Some(self.root), params.clone(), None)?;
+            if reply.response.ok {
+                return Ok(reply.response.result.unwrap_or_default());
+            }
+            let warming = reply
+                .response
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == "project.warming");
+            if warming && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
             anyhow::bail!(ipc_error_text(&reply.response));
         }
-        Ok(reply.response.result.unwrap_or_default())
     }
 
     fn checkpoints(&mut self) -> Result<Vec<sheaf_core::store::Checkpoint>> {
@@ -3900,14 +3920,22 @@ impl<'a> SquashCtx<'a> {
     }
 
     /// Captures strictly older than `cursor` (tip when None), newest first,
-    /// at most [`SQUASH_PAGE`] per call.
-    fn lineage_page(&mut self, cursor: Option<&str>) -> Result<Vec<sheaf_core::store::Capture>> {
+    /// at most [`SQUASH_PAGE`] per call. `omit_paths` drops the per-capture
+    /// path lists — set it for walks that never read `paths` (ordinary span
+    /// stats) so a full page fits the envelope; leave it clear for the smart
+    /// attribution walk, which filters captures by their touched paths.
+    fn lineage_page(
+        &mut self,
+        cursor: Option<&str>,
+        omit_paths: bool,
+    ) -> Result<Vec<sheaf_core::store::Capture>> {
         if self.client.is_some() {
             let value = self.call(
                 "timeline.log",
                 serde_json::json!({
                     "path": null, "follow": false, "all": false,
                     "before": cursor, "limit": SQUASH_PAGE,
+                    "omit_paths": omit_paths,
                 }),
             )?;
             return serde_json::from_value(value.get("entries").cloned().unwrap_or_default())
@@ -4095,7 +4123,7 @@ fn squash_stats(
     };
     let mut last_error = None;
     let result = sheaf_core::store::collect_span(Some(anchor_id), until_inclusive, |cursor| {
-        ctx.lineage_page(cursor).map_err(|e| {
+        ctx.lineage_page(cursor, true).map_err(|e| {
             last_error = Some(format!("{e:#}"));
         })
     });
@@ -4753,7 +4781,7 @@ fn smart_attribution_for(
     let mut last_error = None;
     if let Some(anchor_id) = anchor_id {
         let result = sheaf_core::store::collect_span(Some(&anchor_id), None, |cursor| {
-            ctx.lineage_page(cursor).map_err(|e| {
+            ctx.lineage_page(cursor, false).map_err(|e| {
                 last_error = Some(format!("{e:#}"));
             })
         });
@@ -4768,7 +4796,7 @@ fn smart_attribution_for(
     let mut window = Vec::new();
     let mut cursor: Option<String> = None;
     while window.len() < 200 {
-        let Ok(page) = ctx.lineage_page(cursor.as_deref()) else {
+        let Ok(page) = ctx.lineage_page(cursor.as_deref(), false) else {
             break;
         };
         if page.is_empty() {
