@@ -54,7 +54,13 @@ pub const PROTO_MAJOR: u32 = 1;
 /// drops per-capture path lists from the reply. The squash span walk sets
 /// it so a full page stays under the envelope cap even across bulk-change
 /// captures; an older daemon ignores it and returns full entries. Additive.
-pub const PROTO_MINOR: u32 = 11;
+///
+/// Minor 12: `branch.graph` returns the full branch topology (every
+/// divergent lineage's captures with fork edges, named-branch labels, and
+/// logical squash-merge edges) that `sheaf branch list` renders. Additive;
+/// an older daemon lacks the capability and the client falls back to a
+/// read-only store view.
+pub const PROTO_MINOR: u32 = 12;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;

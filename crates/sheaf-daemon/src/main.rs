@@ -171,6 +171,9 @@ enum StoreCommand {
     ListBranches {
         reply: Sender<std::result::Result<Vec<sheaf_core::store::Branch>, sheaf_core::SheafError>>,
     },
+    BranchGraph {
+        reply: Sender<std::result::Result<sheaf_core::store::BranchGraph, sheaf_core::SheafError>>,
+    },
     CreateBranch {
         name: String,
         reference: Option<String>,
@@ -1494,6 +1497,9 @@ impl StoreCommand {
             StoreCommand::ListBranches { reply } => {
                 let _ = reply.send(Err(error));
             }
+            StoreCommand::BranchGraph { reply } => {
+                let _ = reply.send(Err(error));
+            }
             StoreCommand::CreateBranch { reply, .. }
             | StoreCommand::RenameBranch { reply, .. }
             | StoreCommand::DeleteBranch { reply, .. } => {
@@ -1644,6 +1650,9 @@ fn handle_store_command(
         }
         StoreCommand::ListBranches { reply } => {
             let _ = reply.send(Ok(store.branches()));
+        }
+        StoreCommand::BranchGraph { reply } => {
+            let _ = reply.send(store.branch_graph());
         }
         StoreCommand::CreateBranch {
             name,
@@ -2048,6 +2057,7 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                     "checkpoint.list",
                     "checkpoint.create",
                     "branch.list",
+                    "branch.graph",
                     "branch.create",
                     "branch.rename",
                     "branch.delete",
@@ -2079,6 +2089,7 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
         "checkpoint.list" => plain(checkpoint_list(shared, req, rid)),
         "checkpoint.create" => plain(checkpoint_create(shared, req, rid)),
         "branch.list" => plain(branch_list(shared, req, rid)),
+        "branch.graph" => plain(branch_graph(shared, req, rid)),
         "branch.create" => plain(branch_create(shared, req, rid)),
         "branch.rename" => plain(branch_rename(shared, req, rid)),
         "branch.delete" => plain(branch_delete(shared, req, rid)),
@@ -2507,6 +2518,29 @@ fn branch_list(shared: &Shared, req: &Request, rid: String) -> Response {
         Ok(Ok(branches)) => Response::ok(rid, json!({"branches": branches, "degraded": false})),
         Ok(Err(error)) => core_error(rid, error),
         Err(_) => Response::err(rid, IpcError::new("internal", "branch list timed out")),
+    }
+}
+
+fn branch_graph(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(project) => normalize(project),
+        Err(response) => return response,
+    };
+    let control = match project_control(shared, &root, &rid) {
+        Ok(control) => control,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::BranchGraph { reply: reply_tx })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(graph)) => Response::ok(rid, json!({"graph": graph, "degraded": false})),
+        Ok(Err(error)) => core_error(rid, error),
+        Err(_) => Response::err(rid, IpcError::new("internal", "branch graph timed out")),
     }
 }
 

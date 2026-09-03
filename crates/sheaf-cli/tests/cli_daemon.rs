@@ -296,8 +296,16 @@ fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
     let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
     assert!(ok, "{err}");
     let initial = json_out(&out);
-    assert_eq!(initial["branches"].as_array().unwrap().len(), 1);
-    assert_eq!(initial["branches"][0]["name"], "main");
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        value["graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|node| node["branches"].as_array().cloned().unwrap_or_default())
+            .map(|branch| branch["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(names(&initial), vec!["main".to_owned()]);
 
     let (ok, out, err) = sheaf(
         &fx,
@@ -332,16 +340,21 @@ fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
     assert!(ok, "{err}");
     let value = json_out(&out);
     assert_eq!(value["degraded"], serde_json::json!(false));
-    let branches = value["branches"].as_array().unwrap();
-    assert_eq!(branches.len(), 3, "{value:#}");
-    assert!(branches.iter().any(|branch| branch["name"] == "main"));
-    let primary = branches
+    let all_branches: Vec<serde_json::Value> = value["graph"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|node| node["branches"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert_eq!(all_branches.len(), 3, "{value:#}");
+    assert!(all_branches.iter().any(|branch| branch["name"] == "main"));
+    let primary = all_branches
         .iter()
         .find(|branch| branch["name"] == "primary")
         .expect("renamed branch");
     assert_eq!(primary["metadata"]["description"], "parser work");
     assert_eq!(primary["metadata"]["tests"], "pass");
-    let automatic = branches
+    let automatic = all_branches
         .iter()
         .find(|branch| {
             branch["name"]
@@ -349,9 +362,9 @@ fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
                 .is_some_and(|name| name.starts_with("branch-"))
         })
         .expect("automatic branch name");
-    let automatic_name = automatic["name"].as_str().unwrap();
+    let automatic_name = automatic["name"].as_str().unwrap().to_owned();
 
-    let (ok, out, err) = sheaf(&fx, &["branch", "delete", automatic_name]);
+    let (ok, out, err) = sheaf(&fx, &["branch", "delete", &automatic_name]);
     assert!(ok, "{err}");
     assert!(
         out.contains(&format!("deleted branch {automatic_name}")),
@@ -360,10 +373,10 @@ fn branch_commands_preserve_metadata_and_name_automatic_divergence() {
     let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
     assert!(ok, "{err}");
     let value = json_out(&out);
-    let remaining = value["branches"].as_array().unwrap();
+    let remaining = names(&value);
     assert_eq!(remaining.len(), 2);
-    assert!(remaining.iter().any(|branch| branch["name"] == "main"));
-    assert!(remaining.iter().any(|branch| branch["name"] == "primary"));
+    assert!(remaining.iter().any(|name| name == "main"));
+    assert!(remaining.iter().any(|name| name == "primary"));
 }
 
 // ------------------------------------------------------------- status/log

@@ -530,7 +530,9 @@ enum CheckpointCmd {
 
 #[derive(Subcommand)]
 enum BranchCmd {
-    /// List named branches.
+    /// Draw every branch as a Unicode timeline graph: where each lineage
+    /// forked, the named-branch and checkpoint labels, and where squash
+    /// merges folded a source lineage back in.
     List {
         #[arg(long, short = 'C')]
         project: Option<PathBuf>,
@@ -2374,64 +2376,321 @@ fn cmd_checkpoint_create(project: Option<&Path>, name: &str, at: Option<&str>) -
     Ok(())
 }
 
+/// Connector-row edge directions, composed as a bitmask so crossings and
+/// simultaneous corners fold into one box-drawing glyph.
+const G_UP: u8 = 1;
+const G_DOWN: u8 = 2;
+const G_LEFT: u8 = 4;
+const G_RIGHT: u8 = 8;
+
+fn graph_cell(bits: u8, dashed: bool) -> char {
+    match bits {
+        b if b == G_UP | G_DOWN => {
+            if dashed {
+                '╎'
+            } else {
+                '│'
+            }
+        }
+        b if b == G_LEFT | G_RIGHT => {
+            if dashed {
+                '╌'
+            } else {
+                '─'
+            }
+        }
+        b if b == G_UP | G_DOWN | G_LEFT | G_RIGHT => '┼',
+        b if b == G_UP | G_DOWN | G_RIGHT => '├',
+        b if b == G_UP | G_DOWN | G_LEFT => '┤',
+        b if b == G_LEFT | G_RIGHT | G_DOWN => '┬',
+        b if b == G_LEFT | G_RIGHT | G_UP => '┴',
+        b if b == G_DOWN | G_RIGHT => '╭',
+        b if b == G_DOWN | G_LEFT => '╮',
+        b if b == G_UP | G_RIGHT => '╰',
+        b if b == G_UP | G_LEFT => '╯',
+        _ => ' ',
+    }
+}
+
+#[derive(Clone)]
+struct GraphLane {
+    /// Frontier this lane's downward edge is heading toward (a parent we have
+    /// promised to connect to when its capture is reached).
+    expect: String,
+    /// True for the abandoned source lineage a squash merge folded in; drawn
+    /// with dashed segments to mark it as a logical, not structural, edge.
+    dashed: bool,
+}
+
+/// Render the branch topology as a git-style Unicode lane graph, newest first.
+/// Lanes hold a stable column for their lifetime (freed slots are reused), so
+/// every edge routes orthogonally: forks converge with `├─╯`, squash merges
+/// branch out with dashed `├╌╮`, and the source lineage descends as `╎` until
+/// it rejoins its fork point. `color_on` paints only the right-hand text.
+fn render_branch_graph(graph: &sheaf_core::store::BranchGraph, color_on: bool) -> Vec<String> {
+    let mut lanes: Vec<Option<GraphLane>> = Vec::new();
+    // (plain graph gutter, colored right-hand text) collected before padding.
+    let mut rows: Vec<(String, String)> = Vec::new();
+
+    let vertical = |lane: &Option<GraphLane>| -> char {
+        match lane {
+            Some(l) => graph_cell(G_UP | G_DOWN, l.dashed),
+            None => ' ',
+        }
+    };
+    let free_slot = |lanes: &mut Vec<Option<GraphLane>>| -> usize {
+        if let Some(i) = lanes.iter().position(Option::is_none) {
+            i
+        } else {
+            lanes.push(None);
+            lanes.len() - 1
+        }
+    };
+
+    for node in &graph.nodes {
+        let frontier = &node.capture.frontier;
+        let matches: Vec<usize> = lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| lane.as_ref().is_some_and(|l| &l.expect == frontier))
+            .map(|(i, _)| i)
+            .collect();
+
+        let (col, node_dashed) = if matches.is_empty() {
+            let col = free_slot(&mut lanes);
+            lanes[col] = Some(GraphLane {
+                expect: String::new(),
+                dashed: false,
+            });
+            (col, false)
+        } else {
+            let all_dashed = matches
+                .iter()
+                .all(|&i| lanes[i].as_ref().is_some_and(|l| l.dashed));
+            (matches[0], all_dashed)
+        };
+        let extras: Vec<usize> = matches.iter().copied().filter(|&i| i != col).collect();
+
+        // --- node row: markers over the lane layout as it stands now --------
+        let top_present: Vec<bool> = lanes.iter().map(Option::is_some).collect();
+        let marker = if node.merge_source.is_some() {
+            '◆'
+        } else if node.capture.on_current {
+            '●'
+        } else {
+            '○'
+        };
+        let mut gutter = String::new();
+        for (i, lane) in lanes.iter().enumerate() {
+            if i == col {
+                gutter.push(marker);
+            } else {
+                gutter.push(vertical(lane));
+            }
+            gutter.push(' ');
+        }
+        rows.push((gutter, node_text(node, color_on)));
+
+        // --- mutate lanes for the downstream edges --------------------------
+        let parent = &node.capture.parent_frontier;
+        if parent.is_empty() {
+            lanes[col] = None;
+        } else {
+            lanes[col] = Some(GraphLane {
+                expect: parent.clone(),
+                dashed: node_dashed,
+            });
+        }
+        for &e in &extras {
+            lanes[e] = None;
+        }
+        let merge_col = node.merge_source.as_ref().and_then(|source| {
+            let target = source.frontier.clone()?;
+            let mc = free_slot(&mut lanes);
+            lanes[mc] = Some(GraphLane {
+                expect: target,
+                dashed: true,
+            });
+            Some(mc)
+        });
+
+        // --- connector row: corners for convergence and merge branch-out ----
+        if extras.is_empty() && merge_col.is_none() {
+            continue;
+        }
+        let width = lanes.len().max(top_present.len());
+        let mut bits = vec![0u8; width];
+        let mut dash = vec![false; width];
+        // Straight-through lanes: present above and below, untouched here.
+        for i in 0..width {
+            let above = top_present.get(i).copied().unwrap_or(false);
+            let below = lanes.get(i).map(Option::is_some).unwrap_or(false);
+            let is_col = i == col;
+            let is_extra = extras.contains(&i);
+            let is_merge = merge_col == Some(i);
+            if above && below && !is_col && !is_merge {
+                bits[i] |= G_UP | G_DOWN;
+                dash[i] = lanes[i].as_ref().is_some_and(|l| l.dashed);
+            }
+            if is_extra {
+                bits[i] |= G_UP; // terminates upward, routes toward col
+            }
+        }
+        // The col lane: continues up, and down when its parent survives.
+        bits[col] |= G_UP;
+        if lanes.get(col).map(Option::is_some).unwrap_or(false) {
+            bits[col] |= G_DOWN;
+        }
+        // Route each corner as a horizontal run between col and the endpoint.
+        let route = |bits: &mut [u8], dash: &mut [bool], endpoint: usize, dashed: bool| {
+            let (lo, hi) = (col.min(endpoint), col.max(endpoint));
+            bits[col] |= if endpoint > col { G_RIGHT } else { G_LEFT };
+            bits[endpoint] |= if endpoint > col { G_LEFT } else { G_RIGHT };
+            for cell in bits.iter_mut().take(hi).skip(lo + 1) {
+                *cell |= G_LEFT | G_RIGHT;
+            }
+            if dashed {
+                for d in dash.iter_mut().take(hi + 1).skip(lo) {
+                    *d = true;
+                }
+            }
+        };
+        for &e in &extras {
+            route(&mut bits, &mut dash, e, false);
+        }
+        if let Some(m) = merge_col {
+            bits[m] |= G_DOWN;
+            route(&mut bits, &mut dash, m, true);
+        }
+        let mut gutter = String::new();
+        for i in 0..width {
+            gutter.push(graph_cell(bits[i], dash[i]));
+            let link = bits.get(i).copied().unwrap_or(0);
+            // Horizontal continues across the gap when both this cell and the
+            // next carry a rightward run.
+            let gap = if link & G_RIGHT != 0 {
+                graph_cell(G_LEFT | G_RIGHT, dash[i])
+            } else {
+                ' '
+            };
+            gutter.push(gap);
+        }
+        rows.push((gutter, String::new()));
+    }
+
+    let gutter_width = rows
+        .iter()
+        .map(|(gutter, _)| gutter.chars().count())
+        .max()
+        .unwrap_or(0);
+    rows.into_iter()
+        .map(|(gutter, text)| {
+            let pad = gutter_width - gutter.chars().count();
+            if text.is_empty() {
+                gutter.trim_end().to_owned()
+            } else {
+                format!("{gutter}{:pad$} {text}", "", pad = pad)
+            }
+        })
+        .collect()
+}
+
+/// The right-hand description of one graph node: short id, ref labels, squash
+/// source, checkpoints, restore provenance, and local capture time.
+fn node_text(node: &sheaf_core::store::GraphNode, color_on: bool) -> String {
+    use sheaf_core::store::OriginKind;
+
+    let mut parts = vec![paint(color_on, "36", short(&node.capture.id))];
+    for branch in &node.branches {
+        parts.push(paint(color_on, "1;32", &format!("[{}]", branch.name)));
+        for (key, value) in &branch.metadata {
+            parts.push(paint(color_on, "2", &format!("{key}={value}")));
+        }
+    }
+    if let Some(source) = &node.merge_source {
+        parts.push(paint(
+            color_on,
+            "35",
+            &format!("merge←{}", short(&source.capture_id)),
+        ));
+    }
+    for checkpoint in &node.capture.checkpoints {
+        parts.push(paint(color_on, "33", &format!("⚑{checkpoint}")));
+    }
+    if let Some(origin) = &node.capture.origin {
+        let label = match origin.kind {
+            OriginKind::Restore => Some("restore"),
+            OriginKind::PreRestore => Some("pre-restore"),
+            OriginKind::FragmentRestore => Some("fragment-restore"),
+            OriginKind::Merge => None,
+        };
+        if let Some(label) = label {
+            parts.push(paint(color_on, "2", label));
+        }
+    }
+    let when = DateTime::<Utc>::from_timestamp_millis(node.capture.timestamp_ms)
+        .map(|utc| {
+            let local: DateTime<Local> = utc.into();
+            local.format("%Y-%m-%d %H:%M:%S").to_string()
+        })
+        .unwrap_or_else(|| "unknown time".to_owned());
+    parts.push(paint(color_on, "2", &when));
+    parts.join("  ")
+}
+
 fn cmd_branch_list(project: Option<&Path>, as_json: bool, color: ColorWhen) -> CliResult {
     let root = timeline_root(project)?;
     let socket = sheaf_core::paths::control_socket_path();
-    let (branches, degraded) = match Client::connect(&socket, Duration::from_secs(2)) {
-        Ok(mut client) => {
-            let reply = client.call("branch.list", Some(&root), serde_json::json!({}), None)?;
-            if !reply.response.ok {
-                return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    let (graph, degraded): (sheaf_core::store::BranchGraph, bool) =
+        match Client::connect(&socket, Duration::from_secs(2)) {
+            Ok(mut client) => {
+                let ping = client.call("ping", Some(&root), serde_json::json!({}), None)?;
+                let has_graph = ping
+                    .response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("capabilities"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("branch.graph")));
+                if !has_graph {
+                    return Err(anyhow::anyhow!(
+                        "running sheafd lacks the branch topology graph; rebuild/reinstall and restart sheafd"
+                    )
+                    .into());
+                }
+                let reply = client.call("branch.graph", Some(&root), serde_json::json!({}), None)?;
+                if !reply.response.ok {
+                    return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+                }
+                let value = reply.response.result.unwrap_or_default();
+                let graph = serde_json::from_value(value.get("graph").cloned().unwrap_or_default())
+                    .context("daemon returned an invalid branch graph")?;
+                (graph, false)
             }
-            let value = reply.response.result.unwrap_or_default();
-            let branches =
-                serde_json::from_value(value.get("branches").cloned().unwrap_or_default())
-                    .context("daemon returned invalid branches")?;
-            (branches, false)
-        }
-        Err(_) => {
-            let _guard = shared_read_guard(&root)?;
-            let reader = sheaf_core::store::TimelineReader::open(&root)?;
-            (reader.branches(), true)
-        }
-    };
+            Err(_) => {
+                let _guard = shared_read_guard(&root)?;
+                let reader = sheaf_core::store::TimelineReader::open(&root)?;
+                (reader.branch_graph()?, true)
+            }
+        };
     if as_json {
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"branches": branches, "degraded": degraded})
-            )
-            .context("serialize branches")?
+            serde_json::to_string_pretty(&serde_json::json!({"graph": graph, "degraded": degraded}))
+                .context("serialize branch graph")?
         );
         return Ok(());
     }
     if degraded {
         eprintln!("note: daemon unavailable; showing a read-only store snapshot");
     }
+    if graph.nodes.is_empty() {
+        println!("no captures yet");
+        return Ok(());
+    }
     let color_on = color.enabled(std::io::stdout().is_terminal());
-    for branch in branches {
-        let id = branch
-            .capture_id
-            .as_deref()
-            .map(|value| &value[..12.min(value.len())])
-            .unwrap_or("------------");
-        let marker = if branch.on_current { "*" } else { " " };
-        let metadata = branch
-            .metadata
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join("  ");
-        println!(
-            "{marker} {:<24}  {}{}",
-            branch.name,
-            paint(color_on, "36", id),
-            if metadata.is_empty() {
-                String::new()
-            } else {
-                format!("  {metadata}")
-            }
-        );
+    for line in render_branch_graph(&graph, color_on) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -7007,5 +7266,149 @@ mod private_branch_tests {
             color: ColorWhen::Never,
         })
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod branch_graph_tests {
+    use super::*;
+    use sheaf_core::store::{
+        Branch, BranchGraph, Capture, CaptureOrigin, GraphNode, MergeSource, OriginKind,
+    };
+
+    fn cap(id: &str, frontier: &str, parent: &str, on_current: bool) -> Capture {
+        Capture {
+            id: id.to_owned(),
+            frontier: frontier.to_owned(),
+            parent_frontier: parent.to_owned(),
+            timestamp_ms: 0,
+            paths: vec![],
+            events: 0,
+            checkpoints: vec![],
+            origin: None,
+            on_current,
+        }
+    }
+
+    fn node(capture: Capture, branches: &[&str], merge_source: Option<MergeSource>) -> GraphNode {
+        let labels = branches
+            .iter()
+            .map(|name| Branch {
+                name: (*name).to_owned(),
+                frontier: capture.frontier.clone(),
+                capture_id: Some(capture.id.clone()),
+                timestamp_ms: Some(capture.timestamp_ms),
+                on_current: capture.on_current,
+                metadata: Default::default(),
+            })
+            .collect();
+        GraphNode {
+            capture,
+            branches: labels,
+            merge_source,
+        }
+    }
+
+    #[test]
+    fn cell_glyphs_cover_verticals_corners_and_crossings() {
+        assert_eq!(graph_cell(G_UP | G_DOWN, false), '│');
+        assert_eq!(graph_cell(G_UP | G_DOWN, true), '╎');
+        assert_eq!(graph_cell(G_LEFT | G_RIGHT, false), '─');
+        assert_eq!(graph_cell(G_LEFT | G_RIGHT, true), '╌');
+        assert_eq!(graph_cell(G_UP | G_DOWN | G_LEFT | G_RIGHT, false), '┼');
+        assert_eq!(graph_cell(G_UP | G_DOWN | G_RIGHT, false), '├');
+        assert_eq!(graph_cell(G_DOWN | G_LEFT, false), '╮');
+        assert_eq!(graph_cell(G_UP | G_LEFT, false), '╯');
+        assert_eq!(graph_cell(G_UP | G_RIGHT, false), '╰');
+        assert_eq!(graph_cell(0, false), ' ');
+    }
+
+    #[test]
+    fn linear_graph_lists_nodes_newest_first_with_the_tip_label() {
+        let graph = BranchGraph {
+            nodes: vec![
+                node(cap("bbbbbbbbbbbb", "f2", "f1", true), &["main"], None),
+                node(cap("aaaaaaaaaaaa", "f1", "", true), &[], None),
+            ],
+        };
+        let lines = render_branch_graph(&graph, false);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains('●'), "{:?}", lines[0]);
+        assert!(lines[0].contains("bbbbbbbbbbbb"));
+        assert!(lines[0].contains("[main]"));
+        assert!(lines[1].contains("aaaaaaaaaaaa"));
+    }
+
+    /// A feature lineage that forks at `f1` and is squash-merged back at the
+    /// tip: the merge node is `◆`, its source rides a dashed lane, the merge
+    /// branch-out and the fork convergence both draw corners.
+    #[test]
+    fn squash_merge_draws_a_dashed_source_lane_between_fork_and_merge() {
+        let merge = node(
+            {
+                let mut capture = cap("mmmmmmmmmmmm", "fM", "f2", true);
+                capture.origin = Some(CaptureOrigin {
+                    kind: OriginKind::Merge,
+                    target: Some("s2s2s2s2s2s2".to_owned()),
+                    scope: vec![],
+                    selections: vec![],
+                });
+                capture
+            },
+            &["main"],
+            Some(MergeSource {
+                capture_id: "s2s2s2s2s2s2".to_owned(),
+                frontier: Some("fS2".to_owned()),
+            }),
+        );
+        let graph = BranchGraph {
+            nodes: vec![
+                merge,
+                node(cap("s2s2s2s2s2s2", "fS2", "fS1", false), &["feature"], None),
+                node(cap("t2t2t2t2t2t2", "f2", "f1", true), &[], None),
+                node(cap("s1s1s1s1s1s1", "fS1", "f1", false), &[], None),
+                node(cap("t1t1t1t1t1t1", "f1", "", true), &[], None),
+            ],
+        };
+        let rendered = render_branch_graph(&graph, false);
+        let all = rendered.join("\n");
+        assert!(all.contains('◆'), "merge node marker\n{all}");
+        assert!(all.contains("merge←s2s2s2s2s2"), "merge annotation\n{all}");
+        assert!(all.contains("[feature]"), "source label\n{all}");
+        assert!(all.contains('╎'), "dashed source lane\n{all}");
+        assert!(all.contains('╌'), "dashed merge branch-out\n{all}");
+        // Merge branch-out corner near the top; fork convergence corner near
+        // the bottom.
+        assert!(all.contains('╮'), "branch-out corner\n{all}");
+        assert!(all.contains('╯') || all.contains('╰'), "convergence corner\n{all}");
+    }
+
+    #[test]
+    fn checkpoints_and_restore_origin_annotate_the_node() {
+        let mut capture = cap("cccccccccccc", "f1", "", true);
+        capture.checkpoints = vec!["release".to_owned()];
+        capture.origin = Some(CaptureOrigin {
+            kind: OriginKind::Restore,
+            target: None,
+            scope: vec![],
+            selections: vec![],
+        });
+        let graph = BranchGraph {
+            nodes: vec![node(capture, &[], None)],
+        };
+        let text = render_branch_graph(&graph, false).join("\n");
+        assert!(text.contains("⚑release"), "{text}");
+        assert!(text.contains("restore"), "{text}");
+    }
+
+    #[test]
+    fn color_wraps_ids_in_sgr_codes() {
+        let graph = BranchGraph {
+            nodes: vec![node(cap("dddddddddddd", "f1", "", true), &["main"], None)],
+        };
+        let plain = render_branch_graph(&graph, false).join("\n");
+        let colored = render_branch_graph(&graph, true).join("\n");
+        assert!(!plain.contains('\x1b'));
+        assert!(colored.contains('\x1b'));
     }
 }

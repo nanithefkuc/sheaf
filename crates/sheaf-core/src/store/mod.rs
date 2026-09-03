@@ -94,8 +94,8 @@ pub use squash::{
     span_stats, split_range, SpanStats,
 };
 pub use timeline::{
-    decode_frontier, encode_frontier, Branch, BranchTip, Capture, CaptureInfo, CaptureOrigin,
-    Checkpoint, OriginKind, ResolvedPoint, TimelineReader,
+    decode_frontier, encode_frontier, Branch, BranchGraph, BranchTip, Capture, CaptureInfo,
+    CaptureOrigin, Checkpoint, GraphNode, MergeSource, OriginKind, ResolvedPoint, TimelineReader,
 };
 pub use worktree::{linked_worktrees, WorktreeInfo};
 

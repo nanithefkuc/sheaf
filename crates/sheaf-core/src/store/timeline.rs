@@ -141,6 +141,98 @@ pub struct Branch {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// The source lineage an `OriginKind::Merge` capture folded in. Sheaf merges
+/// are squash merges: the source is not a structural second parent in the
+/// Change DAG, only a logical relationship a layout renderer draws as a
+/// distinct (dashed) edge. `frontier` is the resolved source tip when it is
+/// still present in the graph; a pruned source leaves only its id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeSource {
+    pub capture_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier: Option<String>,
+}
+
+/// One capture placed in the branch topology, with the labels and logical
+/// merge edge a layout renderer needs beyond the structural parent edge each
+/// [`Capture`] already carries in `parent_frontier`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphNode {
+    pub capture: Capture,
+    /// Named branch labels pinned to this capture's frontier (ref style),
+    /// carrying their metadata so the layout can surface it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<Branch>,
+    /// Present iff this capture is a squash merge; names the folded source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_source: Option<MergeSource>,
+}
+
+/// Every divergent lineage in one topologically ordered (newest first) view.
+/// Structural fork/parent edges live on each node's `capture.parent_frontier`;
+/// logical squash-merge edges live on `merge_source`. Named branches appear
+/// as labels on their nodes; unnamed abandoned futures are present too, so the
+/// layout shows where each split from and merged back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BranchGraph {
+    pub nodes: Vec<GraphNode>,
+}
+
+/// Assemble the full branch topology: every divergent lineage's captures in
+/// newest-first causal order, each annotated with its named-branch labels,
+/// checkpoint pins, current-lineage membership, and — for squash merges — the
+/// logical source it folded in. `current`, when known, marks which nodes sit
+/// on the worktree's live lineage.
+fn branch_graph_from(
+    doc: &LoroDoc,
+    ledger: &super::ledger::LedgerState,
+    current: Option<&Frontiers>,
+) -> Result<BranchGraph> {
+    let mut captures = captures_from(
+        doc,
+        ledger,
+        &doc.oplog_frontiers(),
+        None,
+        None,
+        usize::MAX,
+    )?;
+    if let Some(current) = current {
+        mark_current_lineage(doc, ledger, current, &mut captures);
+    }
+    annotate_checkpoints(doc, ledger, &mut captures);
+
+    let mut labels: BTreeMap<String, Vec<Branch>> = BTreeMap::new();
+    for branch in branches_from(doc, ledger, current) {
+        labels.entry(branch.frontier.clone()).or_default().push(branch);
+    }
+    let frontier_of: BTreeMap<String, String> = captures
+        .iter()
+        .map(|capture| (capture.id.clone(), capture.frontier.clone()))
+        .collect();
+
+    let nodes = captures
+        .into_iter()
+        .map(|capture| {
+            let branches = labels.get(&capture.frontier).cloned().unwrap_or_default();
+            let merge_source = capture
+                .origin
+                .as_ref()
+                .filter(|origin| origin.kind == OriginKind::Merge)
+                .and_then(|origin| origin.target.clone())
+                .map(|capture_id| MergeSource {
+                    frontier: frontier_of.get(&capture_id).cloned(),
+                    capture_id,
+                });
+            GraphNode {
+                capture,
+                branches,
+                merge_source,
+            }
+        })
+        .collect();
+    Ok(BranchGraph { nodes })
+}
+
 /// A capture plus the file-level difference from its exact parent frontier.
 /// This preserves the distinction between one debounced multi-file capture
 /// and an arbitrary range diff.
@@ -333,6 +425,14 @@ impl TimelineReader {
         )
     }
 
+    pub fn branch_graph(&self) -> Result<BranchGraph> {
+        branch_graph_from(
+            &self.doc,
+            &self.ledger,
+            Some(&decode_frontier(&self.current_frontier()).unwrap_or_default()),
+        )
+    }
+
     pub fn resolve(&self, reference: &str) -> Result<ResolvedPoint> {
         resolve_in_doc(
             &self.doc,
@@ -488,6 +588,10 @@ impl ProjectStore {
             &self.ledger,
             Some(&self.materialized_frontiers()),
         )
+    }
+
+    pub fn branch_graph(&self) -> Result<BranchGraph> {
+        branch_graph_from(&self.doc, &self.ledger, Some(&self.materialized_frontiers()))
     }
 
     /// Append a checkpoint label without creating a user-visible capture.
@@ -1991,6 +2095,25 @@ mod tests {
             store.capture_info("not-a-real-ref"),
             Err(SheafError::TimelineReference(_))
         ));
+    }
+
+    #[test]
+    fn branch_graph_labels_the_tip_and_orders_newest_first() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let mut store = opened(root);
+        store.apply_batch(&touch(root, "a.rs")).unwrap();
+        store.apply_batch(&touch(root, "b.rs")).unwrap();
+
+        let graph = store.branch_graph().unwrap();
+        assert_eq!(graph.nodes.len(), 2);
+        // Newest first, matching the capture log.
+        assert!(graph.nodes[0].capture.timestamp_ms >= graph.nodes[1].capture.timestamp_ms);
+        // A linear store: the conventional `main` label sits on the tip, every
+        // node is on the live lineage, and nothing is a squash merge.
+        assert!(graph.nodes[0].branches.iter().any(|b| b.name == "main"));
+        assert!(graph.nodes.iter().all(|node| node.capture.on_current));
+        assert!(graph.nodes.iter().all(|node| node.merge_source.is_none()));
     }
     #[test]
     fn capture_walk_empty_and_limited_frontiers_are_safe() {
