@@ -60,7 +60,11 @@ pub const PROTO_MAJOR: u32 = 1;
 /// logical squash-merge edges) that `sheaf branch list` renders. Additive;
 /// an older daemon lacks the capability and the client falls back to a
 /// read-only store view.
-pub const PROTO_MINOR: u32 = 12;
+///
+/// Minor 13: `timeline.log` accepts a named `branch`, and its opt-in
+/// `details`/`patch` view streams exact parent deltas in the response body.
+/// The ordinary JSON capture page remains unchanged. Additive.
+pub const PROTO_MINOR: u32 = 13;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;

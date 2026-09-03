@@ -138,12 +138,24 @@ sleep 2.5
 # plus this one.
 settle 2
 sheaf log 2>&1 | has "divergent branch tips exist" || fail "log must hint at hidden branches"
-sheaf log --all > "$E/all.txt" || fail "log --all"
-grep -q "^+ " "$E/all.txt" || fail "log --all must mark off-lineage captures"
-grep -q "^\* " "$E/all.txt" || fail "log --all must mark the current lineage"
+sheaf branch list --json > "$E/branches.json" || fail "branch list"
+python3 - "$E/branches.json" <<'PY' || fail "branch graph lineage markers"
+import json,sys
+nodes=json.load(open(sys.argv[1]))["graph"]["nodes"]
+assert any(n["capture"]["on_current"] for n in nodes)
+assert any(not n["capture"]["on_current"] for n in nodes)
+PY
+ABANDONED=$(python3 - "$E/branches.json" <<'PY'
+import json,sys
+nodes=json.load(open(sys.argv[1]))["graph"]["nodes"]
+print(next(b["name"] for n in nodes for b in n["branches"] if not b["on_current"]))
+PY
+)
+sheaf log --branch "$ABANDONED" --json | has '"on_current": false' \
+  || fail "named branch log omits abandoned lineage"
 sheaf checkpoint list | has "afternoon.*off current lineage" || fail "off-lineage checkpoint not marked"
 sheaf checkpoint list | grep morning | grep -v "off current lineage" >/dev/null || fail "morning wrongly marked"
-ok "branch hints, --all markers, checkpoint lineage"
+ok "branch hints, named branch log, checkpoint lineage"
 
 echo "== scoped restore across a rename speaks both names =="
 mv "$P/src/util/strings.rs" "$P/src/strs.rs"

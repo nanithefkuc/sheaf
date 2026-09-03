@@ -46,15 +46,18 @@ enum Cmd {
         /// Project directory (default: nearest ancestor with a store).
         path: Option<PathBuf>,
     },
-    /// Browse capture history.
+    /// Browse one branch's capture history.
     ///
-    /// The human view prints oldest → newest, so the latest change lands at
-    /// the bottom of terminal scrollback where the eye already is. `--json`
-    /// keeps the wire order (newest first) for scripts.
+    /// Human output selects the newest page but prints it oldest → newest,
+    /// leaving the latest edit at the bottom of the terminal. `--json` keeps
+    /// wire order (newest first) for scripts.
     Log {
         /// Project directory (default: nearest ancestor with a store).
         #[arg(long, short = 'C')]
         project: Option<PathBuf>,
+        /// Read a named branch without switching the active worktree.
+        #[arg(long)]
+        branch: Option<String>,
         /// Only captures touching this root-relative path.
         #[arg(long)]
         path: Option<PathBuf>,
@@ -62,14 +65,20 @@ enum Cmd {
         /// names (first-class rename history, not content guessing).
         #[arg(long, requires = "path")]
         follow: bool,
-        /// Include every divergent branch, not only the current lineage.
-        #[arg(long)]
-        all: bool,
         /// Continue after this full or unique capture-ID prefix.
         #[arg(long)]
         before: Option<String>,
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: u16,
+        /// Timestamp presentation for human output.
+        #[arg(long, value_enum, default_value_t = LogTime::Relative, conflicts_with = "json")]
+        time: LogTime,
+        /// List every changed path and its line counts.
+        #[arg(long, short = 'v', conflicts_with = "json")]
+        verbose: bool,
+        /// Include the exact patch for every capture; implies --verbose.
+        #[arg(long, short = 'p', conflicts_with = "json")]
+        patch: bool,
         /// Emit the IPC-compatible JSON result.
         #[arg(long)]
         json: bool,
@@ -585,6 +594,14 @@ enum ColorWhen {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum LogTime {
+    Relative,
+    Local,
+    Utc,
+    Unix,
+}
+
 /// Restorable extent a grep hit resolves to: the matched span alone, or the
 /// whole line containing it.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -649,64 +666,6 @@ fn paint(on: bool, code: &str, text: &str) -> String {
     }
 }
 
-/// Terminal width in columns: `$COLUMNS`, then the TIOCGWINSZ ioctl, then
-/// the classic 80. Piped output has no geometry — 80 keeps lines copyable.
-fn terminal_width() -> usize {
-    if let Some(w) =
-        std::env::var_os("COLUMNS").and_then(|v| v.to_str().and_then(|s| s.parse::<usize>().ok()))
-    {
-        if w > 0 {
-            return w;
-        }
-    }
-    #[cfg(unix)]
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            return ws.ws_col as usize;
-        }
-    }
-    80
-}
-
-/// Fit as many paths as `budget` cells allow, folding the overflow into the
-/// existing `… +N more` marker. At least one path always shows (an
-/// over-long single path is left for the terminal to wrap).
-fn fit_paths(paths: &[String], budget: usize) -> String {
-    if paths.is_empty() {
-        return "(metadata)".to_owned();
-    }
-    if budget < 16 {
-        // Degenerate width: keep the marker, don't fight the terminal.
-        return format!("{}, … +{} more", paths[0], paths.len() - 1);
-    }
-    // Cell-accurate lengths (`…` is one cell, three bytes).
-    let cells = |s: &str| s.chars().count();
-    let suffix = |hidden: usize| cells(&format!(", … +{hidden} more"));
-    let mut shown = 1usize;
-    let mut acc = cells(&paths[0]);
-    for k in 1..paths.len() {
-        let next = acc + 2 + cells(&paths[k]);
-        let hidden_after = paths.len() - (k + 1);
-        let suffix_len = if hidden_after > 0 {
-            suffix(hidden_after)
-        } else {
-            0
-        };
-        if next + suffix_len > budget {
-            break;
-        }
-        acc = next;
-        shown = k + 1;
-    }
-    let hidden = paths.len() - shown;
-    if hidden == 0 {
-        paths.join(", ")
-    } else {
-        format!("{}, … +{} more", paths[..shown].join(", "), hidden)
-    }
-}
-
 fn main() -> ExitCode {
     // Piped into `head`, a paginated viewer, or an editor, stdout closes
     // early; Rust ignores SIGPIPE by default, which turns that into an
@@ -738,22 +697,28 @@ fn main() -> ExitCode {
         Cmd::Status { path } => cmd_status(path.as_deref()),
         Cmd::Log {
             project,
+            branch,
             path,
             follow,
-            all,
             before,
             limit,
+            time,
+            verbose,
+            patch,
             json,
-        } => cmd_log(
-            project.as_deref(),
-            path.as_deref(),
+        } => cmd_log(LogArgs {
+            project: project.as_deref(),
+            branch: branch.as_deref(),
+            path: path.as_deref(),
             follow,
-            all,
-            before.as_deref(),
-            limit as usize,
-            json,
+            before: before.as_deref(),
+            limit: limit as usize,
+            time,
+            verbose,
+            patch,
+            as_json: json,
             color,
-        ),
+        }),
         Cmd::Info {
             reference,
             project,
@@ -1312,53 +1277,120 @@ fn timeline_root(path: Option<&Path>) -> Result<PathBuf, ExitErr> {
     }
 }
 
-// Flat view options mirror the flat CLI flags; eight is the honest shape.
-#[allow(clippy::too_many_arguments)]
-fn cmd_log(
-    project: Option<&Path>,
-    path: Option<&Path>,
+struct LogArgs<'a> {
+    project: Option<&'a Path>,
+    branch: Option<&'a str>,
+    path: Option<&'a Path>,
     follow: bool,
-    all: bool,
-    before: Option<&str>,
+    before: Option<&'a str>,
     limit: usize,
+    time: LogTime,
+    verbose: bool,
+    patch: bool,
     as_json: bool,
     color: ColorWhen,
-) -> CliResult {
-    let root = timeline_root(project)?;
+}
+
+fn cmd_log(args: LogArgs<'_>) -> CliResult {
+    let root = timeline_root(args.project)?;
     let params = serde_json::json!({
-        "path": path.map(|p| p.to_string_lossy().to_string()),
-        "follow": follow,
-        "all": all,
-        "before": before,
-        "limit": limit,
+        "branch": args.branch,
+        "path": args.path.map(|p| p.to_string_lossy().to_string()),
+        "follow": args.follow,
+        "all": false,
+        "before": args.before,
+        "limit": args.limit,
+        "details": !args.as_json,
+        "patch": args.patch,
+        "omit_paths": !args.as_json,
     });
     let socket = sheaf_core::paths::control_socket_path();
-    let (entries, tips, degraded) = match Client::connect(&socket, Duration::from_secs(2)) {
+    let (entries, details, patches, tips, degraded) = match Client::connect(
+        &socket,
+        Duration::from_secs(2),
+    ) {
         Ok(mut client) => {
+            if args.branch.is_some() || !args.as_json {
+                let ping = client.call("ping", Some(&root), serde_json::json!({}), None)?;
+                let capabilities = ping
+                    .response
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("capabilities"))
+                    .and_then(serde_json::Value::as_array);
+                let has = |name: &str| {
+                    capabilities.is_some_and(|caps| {
+                        caps.iter()
+                            .any(|capability| capability.as_str() == Some(name))
+                    })
+                };
+                let required = if args.branch.is_some() {
+                    "timeline.log.branch"
+                } else {
+                    "timeline.log.details"
+                };
+                if !has(required) || (!args.as_json && !has("timeline.log.details")) {
+                    return Err(anyhow::anyhow!(
+                            "running sheafd lacks the detailed branch log; rebuild/reinstall and restart sheafd"
+                        )
+                        .into());
+                }
+            }
+            client.set_timeout(Duration::from_secs(35))?;
             let reply = client.call("timeline.log", Some(&root), params, None)?;
             if !reply.response.ok {
                 return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
             }
             let value = reply.response.result.unwrap_or_default();
-            let entries = serde_json::from_value(value.get("entries").cloned().unwrap_or_default())
-                .context("daemon returned invalid timeline entries")?;
+            let entries: Vec<sheaf_core::store::Capture> =
+                serde_json::from_value(value.get("entries").cloned().unwrap_or_default())
+                    .context("daemon returned invalid timeline entries")?;
             let tips = value
                 .get("tips")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1) as usize;
-            (entries, tips, false)
+            let (details, patches) = if args.as_json {
+                (Vec::new(), Vec::new())
+            } else {
+                let body: serde_json::Value = serde_json::from_slice(&reply.body)
+                    .context("daemon returned invalid timeline details")?;
+                let details =
+                    serde_json::from_value(body.get("details").cloned().unwrap_or_default())
+                        .context("daemon returned invalid capture details")?;
+                let patches =
+                    serde_json::from_value(body.get("patches").cloned().unwrap_or_default())
+                        .context("daemon returned invalid capture patches")?;
+                (details, patches)
+            };
+            (entries, details, patches, tips, false)
         }
         Err(_) => {
             let _guard = shared_read_guard(&root)?;
             let reader = sheaf_core::store::TimelineReader::open(&root)?;
-            let mut entries = reader.captures(
-                all,
-                path,
-                follow,
-                if before.is_some() { usize::MAX } else { limit },
-            )?;
+            let mut entries = match args.branch {
+                Some(branch) => reader.captures_for_branch(
+                    branch,
+                    args.path,
+                    args.follow,
+                    if args.before.is_some() {
+                        usize::MAX
+                    } else {
+                        args.limit
+                    },
+                )?,
+                None => reader.captures(
+                    false,
+                    args.path,
+                    args.follow,
+                    if args.before.is_some() {
+                        usize::MAX
+                    } else {
+                        args.limit
+                    },
+                )?,
+            };
             let tips = reader.branch_tips().map(|t| t.len()).unwrap_or(1);
-            if let Some(cursor) = before {
+            if let Some(cursor) = args.before {
                 if cursor.len() < 6 || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                     return Err(anyhow::anyhow!(
                         "timeline cursors require at least 6 hexadecimal capture-ID characters"
@@ -1376,12 +1408,34 @@ fn cmd_log(
                         anyhow::anyhow!("timeline cursor `{cursor}` is outside this view")
                     })?;
                 entries.drain(..=pos);
-                entries.truncate(limit);
+                entries.truncate(args.limit);
             }
-            (entries, tips, true)
+            let details = if args.as_json {
+                Vec::new()
+            } else {
+                entries
+                    .iter()
+                    .map(|entry| reader.capture_log_detail(&entry.id))
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let patches = if args.patch {
+                details
+                    .iter()
+                    .map(|detail| {
+                        detail
+                            .diff
+                            .as_ref()
+                            .map(|diff| String::from_utf8_lossy(&diff.render_patch()).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (entries, details, patches, tips, true)
         }
     };
-    if as_json {
+    if args.as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(
@@ -1389,61 +1443,193 @@ fn cmd_log(
             )
             .context("serialize timeline")?
         );
-    } else {
-        if degraded {
-            eprintln!("note: daemon unavailable; showing a read-only store snapshot");
-        }
-        // Oldest → newest: the latest change lands at the bottom of the
-        // terminal where scrollback already put the user's eyes.
-        let is_tty = std::io::stdout().is_terminal();
-        let color_on = color.enabled(is_tty);
-        let width = terminal_width();
-        // Fixed columns before the path list: marker, space, 12-char id,
-        // two spaces, 19-char timestamp, two spaces.
-        const LINE_OVERHEAD: usize = 37;
-        for entry in entries.iter().rev() {
-            let utc = DateTime::<Utc>::from_timestamp_millis(entry.timestamp_ms)
-                .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-            let local: DateTime<Local> = utc.into();
-            let time = local.format("%Y-%m-%d %H:%M:%S").to_string();
-            let origin = origin_suffix(entry.origin.as_ref());
-            // Width-fitting exists to protect a terminal; piped output has
-            // no width to overflow, and greppers need whole path lists.
-            let budget = if is_tty {
-                width
-                    .saturating_sub(LINE_OVERHEAD + origin.chars().count())
-                    .max(16)
+        return Ok(());
+    }
+    if degraded {
+        eprintln!("note: daemon unavailable; showing a read-only store snapshot");
+    }
+    if details.len() != entries.len() || (args.patch && patches.len() != entries.len()) {
+        return Err(anyhow::anyhow!("daemon returned an incomplete timeline detail page").into());
+    }
+
+    let color_on = args.color.enabled(std::io::stdout().is_terminal());
+    let now_ms = Utc::now().timestamp_millis();
+    let show_relative_refs = args.branch.is_none() && args.path.is_none() && args.before.is_none();
+    for index in (0..details.len()).rev() {
+        let info = &details[index];
+        let capture = &entries[index];
+        let position = if show_relative_refs {
+            if index == 0 {
+                "@".to_owned()
             } else {
-                usize::MAX
-            };
-            let paths = fit_paths(&entry.paths, budget);
-            // The marker column is the branch-aware part of the view: `*` is
-            // the live lineage the worktree sits on, `+` a divergent branch
-            // (an abandoned future, usually) that only --all surfaces.
-            let marker = if all && !entry.on_current { '+' } else { '*' };
-            println!(
-                "{} {}  {}  {}{}",
-                marker,
-                paint(color_on, "36", entry.short_id()),
-                paint(color_on, "2", &time),
-                paths,
-                origin
-            );
-            if !entry.checkpoints.is_empty() {
-                println!(
-                    "  {} {}",
-                    paint(color_on, "35", "checkpoint:"),
-                    entry.checkpoints.join(", ")
-                );
+                format!("@~{index}")
+            }
+        } else if args.before.is_none() && index == 0 {
+            args.branch.unwrap_or_default().to_owned()
+        } else {
+            String::new()
+        };
+        let when = format_log_time(capture.timestamp_ms, now_ms, args.time);
+        println!(
+            "{} {:<8} {:>12}  {}",
+            paint(color_on, "36", capture.short_id()),
+            paint(color_on, "1;32", &position),
+            paint(color_on, "2", &when),
+            capture_summary(info),
+        );
+        if args.verbose || args.patch {
+            match &info.diff {
+                Some(diff) => {
+                    for change in &diff.entries {
+                        print_log_change(change, color_on);
+                    }
+                }
+                None => {
+                    for path in &info.capture.paths {
+                        println!("  ? {path}");
+                    }
+                }
             }
         }
-        if !all && tips > 1 {
-            eprintln!(
-                "note: {tips} divergent branch tips exist; `sheaf log --all` lists every capture"
-            );
+        if args.patch {
+            for line in patches[index].lines() {
+                println!("  {line}");
+            }
+        }
+        let origin = origin_suffix(capture.origin.as_ref());
+        if !origin.is_empty() {
+            println!("{}", paint(color_on, "35", origin.trim()));
+        }
+        if !capture.checkpoints.is_empty() {
+            let label = if capture.checkpoints.len() == 1 {
+                format!("[Checkpoint: {}]", capture.checkpoints[0])
+            } else {
+                format!("[Checkpoints: {}]", capture.checkpoints.join(", "))
+            };
+            println!("{}", paint(color_on, "35", &label));
         }
     }
+    if args.branch.is_none() && tips > 1 {
+        eprintln!(
+            "note: {tips} divergent branch tips exist; `sheaf branch list` shows every branch"
+        );
+    }
     Ok(())
+}
+
+fn capture_summary(detail: &sheaf_core::store::CaptureLogDetail) -> String {
+    use sheaf_core::store::SideContent;
+    let Some(diff) = &detail.diff else {
+        let paths = detail.capture.paths.len();
+        return format!(
+            "details pruned ({paths} recorded {})",
+            if paths == 1 { "path" } else { "paths" }
+        );
+    };
+    let files = diff.entries.len();
+    if files == 0 {
+        return "metadata only".to_owned();
+    }
+    let added: usize = diff.entries.iter().map(|entry| entry.added_lines).sum();
+    let removed: usize = diff.entries.iter().map(|entry| entry.removed_lines).sum();
+    let binaries = diff
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry.old, SideContent::Binary { .. })
+                || matches!(entry.new, SideContent::Binary { .. })
+        })
+        .count();
+    let mut summary = format!("{files} {}", if files == 1 { "file" } else { "files" });
+    if binaries > 0 {
+        summary.push_str(&format!(
+            ", {binaries} {}",
+            if binaries == 1 { "binary" } else { "binaries" }
+        ));
+    }
+    if added > 0 || removed > 0 {
+        summary.push_str(&format!(" +{added} -{removed}"));
+    }
+    summary
+}
+
+fn print_log_change(change: &sheaf_core::store::FileDiff, color_on: bool) {
+    use sheaf_core::store::DiffKind;
+    let (mark, ansi) = match change.kind {
+        DiffKind::Added => ('A', "32"),
+        DiffKind::Deleted => ('D', "31"),
+        DiffKind::Renamed => ('R', "33"),
+        DiffKind::Modified => ('M', "33"),
+        DiffKind::TypeChanged => ('T', "33"),
+    };
+    let name = match &change.old_path {
+        Some(old) => format!("{old} => {}", change.path),
+        None => change.path.clone(),
+    };
+    let suffix = if change.added_lines > 0 || change.removed_lines > 0 {
+        format!(" +{} -{}", change.added_lines, change.removed_lines)
+    } else {
+        String::new()
+    };
+    println!(
+        "  {} {}{}",
+        paint(color_on, ansi, &mark.to_string()),
+        name,
+        suffix,
+    );
+}
+
+fn format_log_time(timestamp_ms: i64, now_ms: i64, format: LogTime) -> String {
+    match format {
+        LogTime::Relative => relative_log_time(timestamp_ms, now_ms),
+        LogTime::Local => DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+            .map(|utc| {
+                let local: DateTime<Local> = utc.into();
+                local.format("%Y-%m-%d %H:%M:%S%.3f %:z").to_string()
+            })
+            .unwrap_or_else(|| "unknown time".to_owned()),
+        LogTime::Utc => DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+            .map(|utc| utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            .unwrap_or_else(|| "unknown time".to_owned()),
+        LogTime::Unix => {
+            let magnitude = timestamp_ms.unsigned_abs();
+            let sign = if timestamp_ms < 0 { "-" } else { "" };
+            format!("{sign}{}.{:03}", magnitude / 1000, magnitude % 1000)
+        }
+    }
+}
+
+fn relative_log_time(timestamp_ms: i64, now_ms: i64) -> String {
+    let delta = now_ms.saturating_sub(timestamp_ms);
+    if delta.unsigned_abs() < 1000 {
+        return "now".to_owned();
+    }
+    let mut seconds = delta.unsigned_abs() / 1000;
+    let days = seconds / 86_400;
+    seconds %= 86_400;
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+    let mut parts = Vec::with_capacity(4);
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 {
+        parts.push(format!("{seconds}s"));
+    }
+    let duration = parts.join(" ");
+    if delta >= 0 {
+        format!("{duration} ago")
+    } else {
+        format!("in {duration}")
+    }
 }
 
 // -------------------------------------------------------------------- info
@@ -1492,14 +1678,21 @@ fn cmd_info(project: Option<&Path>, reference: &str, as_json: bool, color: Color
     let local: DateTime<Local> = utc.into();
     let color_on = color.enabled(std::io::stdout().is_terminal());
     println!(
-        "* {}  {}",
+        "capture: {}  {}",
         paint(color_on, "36", info.capture.short_id()),
         paint(
             color_on,
             "2",
-            &local.format("%Y-%m-%d %H:%M:%S").to_string()
+            &local.format("%Y-%m-%d %H:%M:%S%.3f %:z").to_string()
         ),
     );
+    match info.diff.from.capture_id.as_deref() {
+        Some(parent) => {
+            println!("parent:  {}", paint(color_on, "36", short(parent)));
+            println!("undo:    sheaf restore {} --dry-run", short(parent));
+        }
+        None => println!("parent:  (timeline root)"),
+    }
     for change in info.diff.entries {
         use sheaf_core::store::DiffKind;
         let (mark, name, ansi) = match change.kind {
@@ -2641,43 +2834,47 @@ fn node_text(node: &sheaf_core::store::GraphNode, color_on: bool) -> String {
 fn cmd_branch_list(project: Option<&Path>, as_json: bool, color: ColorWhen) -> CliResult {
     let root = timeline_root(project)?;
     let socket = sheaf_core::paths::control_socket_path();
-    let (graph, degraded): (sheaf_core::store::BranchGraph, bool) =
-        match Client::connect(&socket, Duration::from_secs(2)) {
-            Ok(mut client) => {
-                let ping = client.call("ping", Some(&root), serde_json::json!({}), None)?;
-                let has_graph = ping
-                    .response
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("capabilities"))
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("branch.graph")));
-                if !has_graph {
-                    return Err(anyhow::anyhow!(
+    let (graph, degraded): (sheaf_core::store::BranchGraph, bool) = match Client::connect(
+        &socket,
+        Duration::from_secs(2),
+    ) {
+        Ok(mut client) => {
+            let ping = client.call("ping", Some(&root), serde_json::json!({}), None)?;
+            let has_graph = ping
+                .response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("capabilities"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("branch.graph")));
+            if !has_graph {
+                return Err(anyhow::anyhow!(
                         "running sheafd lacks the branch topology graph; rebuild/reinstall and restart sheafd"
                     )
                     .into());
-                }
-                let reply = client.call("branch.graph", Some(&root), serde_json::json!({}), None)?;
-                if !reply.response.ok {
-                    return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
-                }
-                let value = reply.response.result.unwrap_or_default();
-                let graph = serde_json::from_value(value.get("graph").cloned().unwrap_or_default())
-                    .context("daemon returned an invalid branch graph")?;
-                (graph, false)
             }
-            Err(_) => {
-                let _guard = shared_read_guard(&root)?;
-                let reader = sheaf_core::store::TimelineReader::open(&root)?;
-                (reader.branch_graph()?, true)
+            let reply = client.call("branch.graph", Some(&root), serde_json::json!({}), None)?;
+            if !reply.response.ok {
+                return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
             }
-        };
+            let value = reply.response.result.unwrap_or_default();
+            let graph = serde_json::from_value(value.get("graph").cloned().unwrap_or_default())
+                .context("daemon returned an invalid branch graph")?;
+            (graph, false)
+        }
+        Err(_) => {
+            let _guard = shared_read_guard(&root)?;
+            let reader = sheaf_core::store::TimelineReader::open(&root)?;
+            (reader.branch_graph()?, true)
+        }
+    };
     if as_json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"graph": graph, "degraded": degraded}))
-                .context("serialize branch graph")?
+            serde_json::to_string_pretty(
+                &serde_json::json!({"graph": graph, "degraded": degraded})
+            )
+            .context("serialize branch graph")?
         );
         return Ok(());
     }
@@ -5909,42 +6106,22 @@ const _: (u32, u32) = (PROTO_MAJOR, PROTO_MINOR);
 mod log_view_tests {
     use super::*;
 
-    fn s(items: &[&str]) -> Vec<String> {
-        items.iter().map(|x| x.to_string()).collect()
+    #[test]
+    fn relative_time_is_exact_compact_and_directional() {
+        let elapsed_ms = (86_400 + 2 * 3_600 + 23) * 1000;
+        assert_eq!(relative_log_time(0, elapsed_ms), "1d 2h 23s ago");
+        assert_eq!(relative_log_time(9_500, 10_000), "now");
+        assert_eq!(relative_log_time(14_000, 10_000), "in 4s");
     }
 
     #[test]
-    fn short_lists_are_joined_whole() {
-        assert_eq!(fit_paths(&s(&["a.rs", "b.rs"]), 80), "a.rs, b.rs");
-    }
-
-    #[test]
-    fn empty_paths_show_the_metadata_marker() {
-        assert_eq!(fit_paths(&[], 80), "(metadata)");
-    }
-
-    #[test]
-    fn overflow_folds_into_the_more_marker() {
-        let paths = s(&["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"]);
-        // Wide enough for two paths plus the marker, not three.
-        let out = fit_paths(&paths, 50);
-        assert_eq!(out, "aaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbb, … +1 more");
-        assert!(out.chars().count() <= 50);
-    }
-
-    #[test]
-    fn a_single_oversized_path_is_left_for_the_terminal_to_wrap() {
-        let long = "x".repeat(200);
-        let paths = vec![long.clone(), "b.rs".to_string()];
-        let out = fit_paths(&paths, 30);
-        assert!(out.starts_with(&long), "first path must survive: {out}");
-        assert!(out.contains("+1 more"));
-    }
-
-    #[test]
-    fn tiny_budgets_keep_the_marker_readable() {
-        let out = fit_paths(&s(&["a.rs", "b.rs", "c.rs"]), 8);
-        assert_eq!(out, "a.rs, … +2 more");
+    fn absolute_time_formats_preserve_milliseconds() {
+        assert_eq!(
+            format_log_time(1_234, 0, LogTime::Utc),
+            "1970-01-01T00:00:01.234Z"
+        );
+        assert_eq!(format_log_time(1_234, 0, LogTime::Unix), "1.234");
+        assert_eq!(format_log_time(-1, 0, LogTime::Unix), "-0.001");
     }
 
     #[test]
@@ -6079,11 +6256,14 @@ mod grep_cli_layer_tests {
     fn outputs_json_follows_the_json_flag_per_command() {
         let log = Cmd::Log {
             project: None,
+            branch: None,
             path: None,
             follow: false,
-            all: false,
             before: None,
             limit: 50,
+            time: LogTime::Relative,
+            verbose: false,
+            patch: false,
             json: true,
         };
         assert!(log.outputs_json());
@@ -6143,30 +6323,6 @@ mod grep_cli_layer_tests {
     fn paint_wraps_only_when_enabled() {
         assert_eq!(paint(false, "32", "present"), "present");
         assert_eq!(paint(true, "32", "present"), "\x1b[32mpresent\x1b[0m");
-    }
-
-    #[test]
-    fn terminal_width_prefers_a_positive_columns_env() {
-        // One sequential test: COLUMNS is process-global, so both branches
-        // live here to stay parallel-safe with every other test.
-        std::env::remove_var("COLUMNS");
-        let width = terminal_width();
-        assert!(width >= 1, "a width always resolves, got {width}");
-
-        std::env::set_var("COLUMNS", "113");
-        assert_eq!(terminal_width(), 113);
-
-        // A zero COLUMNS is ignored as "no geometry".
-        std::env::set_var("COLUMNS", "0");
-        let width = terminal_width();
-        assert!(width >= 1, "a width always resolves, got {width}");
-
-        // A non-numeric COLUMNS parses as absent.
-        std::env::set_var("COLUMNS", "wide");
-        let width = terminal_width();
-        assert!(width >= 1, "a width always resolves, got {width}");
-
-        std::env::remove_var("COLUMNS");
     }
 
     #[test]
@@ -6879,11 +7035,14 @@ mod private_branch_tests {
         let commands = [
             Cmd::Log {
                 project: None,
+                branch: None,
                 path: None,
                 follow: false,
-                all: false,
                 before: None,
                 limit: 1,
+                time: LogTime::Relative,
+                verbose: false,
+                patch: false,
                 json: true,
             },
             Cmd::Info {
@@ -7380,7 +7539,10 @@ mod branch_graph_tests {
         // Merge branch-out corner near the top; fork convergence corner near
         // the bottom.
         assert!(all.contains('╮'), "branch-out corner\n{all}");
-        assert!(all.contains('╯') || all.contains('╰'), "convergence corner\n{all}");
+        assert!(
+            all.contains('╯') || all.contains('╰'),
+            "convergence corner\n{all}"
+        );
     }
 
     #[test]

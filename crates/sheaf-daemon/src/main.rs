@@ -147,6 +147,7 @@ enum StoreCommand {
 
     TimelineLog {
         all: bool,
+        branch: Option<String>,
         path: Option<PathBuf>,
         follow: bool,
         limit: usize,
@@ -154,14 +155,19 @@ enum StoreCommand {
             std::result::Result<(Vec<sheaf_core::store::Capture>, usize), sheaf_core::SheafError>,
         >,
     },
-    ListCheckpoints {
-        reply:
-            Sender<std::result::Result<Vec<sheaf_core::store::Checkpoint>, sheaf_core::SheafError>>,
+    CaptureLogDetails {
+        references: Vec<String>,
+        reply: Sender<
+            std::result::Result<Vec<sheaf_core::store::CaptureLogDetail>, sheaf_core::SheafError>,
+        >,
     },
-
     CaptureInfo {
         reference: String,
         reply: Sender<std::result::Result<sheaf_core::store::CaptureInfo, sheaf_core::SheafError>>,
+    },
+    ListCheckpoints {
+        reply:
+            Sender<std::result::Result<Vec<sheaf_core::store::Checkpoint>, sheaf_core::SheafError>>,
     },
     CreateCheckpoint {
         name: String,
@@ -1470,6 +1476,7 @@ impl StoreCommand {
             StoreCommand::InWorktree { command, .. } => command.is_memory_heavy(),
             StoreCommand::Doctor { .. }
             | StoreCommand::Gc { .. }
+            | StoreCommand::CaptureLogDetails { .. }
             | StoreCommand::Diff { .. }
             | StoreCommand::Grep { .. }
             | StoreCommand::CacheBackfill { .. }
@@ -1483,6 +1490,9 @@ impl StoreCommand {
         match self {
             StoreCommand::InWorktree { command, .. } => command.send_error(error),
             StoreCommand::TimelineLog { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            StoreCommand::CaptureLogDetails { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             StoreCommand::ListCheckpoints { reply } => {
@@ -1619,23 +1629,31 @@ fn handle_store_command(
     match command {
         StoreCommand::TimelineLog {
             all,
+            branch,
             path,
             follow,
             limit,
             reply,
         } => {
             let tips = store.branch_tips().map(|t| t.len()).unwrap_or(1);
-            let _ = reply.send(
-                store
-                    .captures(all, path.as_deref(), follow, limit)
-                    .map(|c| (c, tips)),
-            );
+            let captures = match branch {
+                Some(branch) => store.captures_for_branch(&branch, path.as_deref(), follow, limit),
+                None => store.captures(all, path.as_deref(), follow, limit),
+            };
+            let _ = reply.send(captures.map(|captures| (captures, tips)));
         }
-        StoreCommand::ListCheckpoints { reply } => {
-            let _ = reply.send(Ok(store.checkpoints()));
+        StoreCommand::CaptureLogDetails { references, reply } => {
+            let details = references
+                .iter()
+                .map(|reference| store.capture_log_detail(reference))
+                .collect();
+            let _ = reply.send(details);
         }
         StoreCommand::CaptureInfo { reference, reply } => {
             let _ = reply.send(store.capture_info(&reference));
+        }
+        StoreCommand::ListCheckpoints { reply } => {
+            let _ = reply.send(Ok(store.checkpoints()));
         }
         StoreCommand::CreateCheckpoint {
             name,
@@ -2053,6 +2071,8 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "capabilities": [
                     "timeline.log",
+                    "timeline.log.branch",
+                    "timeline.log.details",
                     "timeline.info",
                     "checkpoint.list",
                     "checkpoint.create",
@@ -2084,7 +2104,7 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
             }),
         )),
         "project.status" => plain(project_status(shared, req, rid)),
-        "timeline.log" => plain(timeline_log(shared, req, rid)),
+        "timeline.log" => bytes(timeline_log(shared, req, rid)),
         "timeline.info" => plain(timeline_info(shared, req, rid)),
         "checkpoint.list" => plain(checkpoint_list(shared, req, rid)),
         "checkpoint.create" => plain(checkpoint_create(shared, req, rid)),
@@ -2288,10 +2308,10 @@ fn project_control(
     })
 }
 
-fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
+fn timeline_log(shared: &Shared, req: &Request, rid: String) -> (Response, Vec<u8>) {
     let root = match require_project(req, &rid) {
         Ok(p) => normalize(p),
-        Err(resp) => return resp,
+        Err(resp) => return (resp, Vec::new()),
     };
     let limit = req
         .params
@@ -2304,6 +2324,20 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         .get("all")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let branch = req
+        .params
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if all && branch.is_some() {
+        return (
+            Response::err(
+                rid,
+                IpcError::new("bad.params", "`all` and `branch` cannot be combined"),
+            ),
+            Vec::new(),
+        );
+    }
     let follow = req
         .params
         .get("follow")
@@ -2319,6 +2353,16 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         .get("before")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+    let details = req
+        .params
+        .get("details")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let patch = req
+        .params
+        .get("patch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // A walk that only needs identity/time/provenance (the squash span
     // stats) sets this so per-capture `paths` — unbounded for bulk-change
     // captures — never bloats the envelope past its 1 MiB cap.
@@ -2329,12 +2373,13 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         .unwrap_or(false);
     let control = match project_control(shared, &root, &rid) {
         Ok(control) => control,
-        Err(response) => return response,
+        Err(response) => return (response, Vec::new()),
     };
     let (reply_tx, reply_rx) = channel();
     if control
         .send(StoreCommand::TimelineLog {
             all,
+            branch,
             path,
             follow,
             limit: if before.is_some() { usize::MAX } else { limit },
@@ -2342,23 +2387,32 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         })
         .is_err()
     {
-        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+        return (
+            Response::err(rid, IpcError::new("internal", "project writer stopped")),
+            Vec::new(),
+        );
     }
     let (mut entries, tips) = match reply_rx.recv_timeout(REQUEST_SOFT) {
         Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return core_error(rid, e),
+        Ok(Err(e)) => return (core_error(rid, e), Vec::new()),
         Err(_) => {
-            return Response::err(rid, IpcError::new("internal", "timeline request timed out"))
+            return (
+                Response::err(rid, IpcError::new("internal", "timeline request timed out")),
+                Vec::new(),
+            )
         }
     };
     if let Some(before) = before.as_deref() {
         if before.len() < 6 {
-            return Response::err(
-                rid,
-                IpcError::new(
-                    "state.bad_reference",
-                    "capture cursor prefixes require at least 6 hex characters",
+            return (
+                Response::err(
+                    rid,
+                    IpcError::new(
+                        "state.bad_reference",
+                        "capture cursor prefixes require at least 6 hex characters",
+                    ),
                 ),
+                Vec::new(),
             );
         }
         let exact = entries.iter().position(|entry| entry.id == before);
@@ -2374,18 +2428,27 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
             match matches.as_slice() {
                 [index] => *index,
                 [] => {
-                    return Response::err(
-                        rid,
-                        IpcError::new("state.bad_reference", format!("unknown cursor `{before}`")),
+                    return (
+                        Response::err(
+                            rid,
+                            IpcError::new(
+                                "state.bad_reference",
+                                format!("unknown cursor `{before}`"),
+                            ),
+                        ),
+                        Vec::new(),
                     )
                 }
                 _ => {
-                    return Response::err(
-                        rid,
-                        IpcError::new(
-                            "state.bad_reference",
-                            format!("ambiguous cursor `{before}`"),
+                    return (
+                        Response::err(
+                            rid,
+                            IpcError::new(
+                                "state.bad_reference",
+                                format!("ambiguous cursor `{before}`"),
+                            ),
                         ),
+                        Vec::new(),
                     )
                 }
             }
@@ -2393,15 +2456,76 @@ fn timeline_log(shared: &Shared, req: &Request, rid: String) -> Response {
         entries.drain(..=pos);
     }
     entries.truncate(limit);
+
+    let detail_rows = if details || patch {
+        let (detail_tx, detail_rx) = channel();
+        let references = entries.iter().map(|entry| entry.id.clone()).collect();
+        if control
+            .send(StoreCommand::CaptureLogDetails {
+                references,
+                reply: detail_tx,
+            })
+            .is_err()
+        {
+            return (
+                Response::err(rid, IpcError::new("internal", "project writer stopped")),
+                Vec::new(),
+            );
+        }
+        match detail_rx.recv_timeout(REQUEST_SOFT) {
+            Ok(Ok(rows)) => Some(rows),
+            Ok(Err(error)) => return (core_error(rid, error), Vec::new()),
+            Err(_) => {
+                return (
+                    Response::err(
+                        rid,
+                        IpcError::new("internal", "timeline detail request timed out"),
+                    ),
+                    Vec::new(),
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    let body = match detail_rows {
+        Some(rows) => {
+            let patches: Vec<String> = if patch {
+                rows.iter()
+                    .map(|detail| {
+                        detail
+                            .diff
+                            .as_ref()
+                            .map(|diff| String::from_utf8_lossy(&diff.render_patch()).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            match serde_json::to_vec(&json!({"details": rows, "patches": patches})) {
+                Ok(body) => body,
+                Err(error) => {
+                    return (
+                        Response::err(
+                            rid,
+                            IpcError::new("internal", format!("serialize log details: {error}")),
+                        ),
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        None => Vec::new(),
+    };
     if omit_paths {
         for entry in &mut entries {
             entry.paths.clear();
         }
     }
-    Response::ok(
-        rid,
-        json!({"entries": entries, "tips": tips, "degraded": false}),
-    )
+    let result = json!({"entries": entries, "tips": tips, "degraded": false});
+    (Response::ok(rid, result), body)
 }
 
 fn timeline_info(shared: &Shared, req: &Request, rid: String) -> Response {
@@ -3786,6 +3910,7 @@ mod tests {
         control
             .send(StoreCommand::TimelineLog {
                 all: false,
+                branch: None,
                 path: None,
                 follow: false,
                 limit: 10,
@@ -3925,6 +4050,7 @@ mod tests {
             vec![
                 StoreCommand::TimelineLog {
                     all: false,
+                    branch: None,
                     path: None,
                     follow: false,
                     limit: 1,
@@ -4307,6 +4433,7 @@ mod tests {
             &mut frags,
             StoreCommand::TimelineLog {
                 all: false,
+                branch: None,
                 path: None,
                 follow: false,
                 limit: 10,
@@ -4830,6 +4957,7 @@ mod tests {
         control_tx
             .send(StoreCommand::TimelineLog {
                 all: false,
+                branch: None,
                 path: None,
                 follow: false,
                 limit: 10,
@@ -4947,6 +5075,7 @@ mod tests {
         control_tx
             .send(StoreCommand::TimelineLog {
                 all: false,
+                branch: None,
                 path: None,
                 follow: false,
                 limit: 50,
@@ -5929,6 +6058,66 @@ mod tests {
                 "omit_paths must clear every path list"
             );
         }
+    }
+
+    #[test]
+    fn timeline_log_streams_details_and_reads_a_named_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = skeleton_project(tmp.path(), "detailed-branch-log");
+        std::fs::write(live.join("tracked.txt"), "content\n").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        let mut shutting_down = false;
+
+        let (created, _) = dispatch(
+            &shared,
+            &test_request(
+                "branch.create",
+                Some(live.clone()),
+                json!({"name": "feature", "at": "@"}),
+            ),
+            &mut shutting_down,
+        );
+        assert!(created.ok, "branch creation failed: {:?}", created.error);
+
+        let (response, IpcBody::Bytes(body)) = dispatch(
+            &shared,
+            &test_request(
+                "timeline.log",
+                Some(live.clone()),
+                json!({
+                    "branch": "feature",
+                    "details": true,
+                    "patch": true,
+                    "limit": 10,
+                }),
+            ),
+            &mut shutting_down,
+        ) else {
+            panic!("timeline.log details must use a byte body");
+        };
+        assert!(response.ok, "branch log failed: {:?}", response.error);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let details = payload["details"].as_array().unwrap();
+        let patches = payload["patches"].as_array().unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            details[0]["capture"]["id"],
+            response.result.unwrap()["entries"][0]["id"]
+        );
+        assert!(patches[0]
+            .as_str()
+            .unwrap()
+            .contains("diff --sheaf a/tracked.txt b/tracked.txt"));
+
+        let (missing, _) = dispatch(
+            &shared,
+            &test_request("timeline.log", Some(live), json!({"branch": "missing"})),
+            &mut shutting_down,
+        );
+        assert!(!missing.ok);
+        assert!(missing.error.unwrap().message.contains("missing"));
     }
 
     // --------------------------------------------------- connection layer

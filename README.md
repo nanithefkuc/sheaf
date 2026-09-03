@@ -137,29 +137,44 @@ environment.
 
 ## Checking Changes
 
-Browse your edit history:
-```sh
-# Browse the edit history
-sheaf log
+`log` selects the newest page of the active branch and prints it oldest to
+newest, so the latest edit stays beside the prompt. Each capture is a compact
+summary by default:
 
-# Browse with colors in your terminal
-sheaf log --color=always # force color (auto detects a tty)
+```sh
+sheaf log
+# 3a16bfb3445f @  3s ago  1 file +3 -1
 ```
 
-Browse edits to a specific file:
-```sh
-# Browse edits on this file/directory
-sheaf log --path src/lib.rs
+Use a named branch without switching the worktree, or scope history to a path
+and its former names:
 
-# Browse edits to this file including file renaming
+```sh
+sheaf log --branch parser-experiment
+sheaf log --path src/lib.rs
 sheaf log --path src/lib.rs --follow
 ```
 
-Get more information on what was exactly edited:
+Human timestamps are relative by default. Absolute formats preserve
+milliseconds:
+
 ```sh
-# Find out what actually happened at this recorded time
+sheaf log --time local
+sheaf log --time utc
+sheaf log --time unix
+```
+
+Ask for file-level details or exact patches only when needed:
+
+```sh
+sheaf log --verbose
+sheaf log --patch
 sheaf info 1a2b3c4d
 ```
+
+Checkpoint and restore annotations appear between the captures they separate.
+Use `sheaf branch list` for cross-branch topology; `log` always walks one
+lineage. Machine-readable `--json` output remains newest first.
 
 ## Restore Anything
 

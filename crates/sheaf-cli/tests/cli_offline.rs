@@ -298,25 +298,35 @@ fn timeline_commands_refuse_to_run_outside_a_project() {
 // -------------------------------------------------------------------- log
 
 #[test]
-fn log_orders_oldest_to_newest_and_json_keeps_wire_order() {
+fn log_is_compact_chronological_and_json_keeps_wire_order() {
     let iso = Iso::new("log");
     let root = iso.enrolled_project();
     let (oldest, middle, newest) = three_capture_store(&root);
     fn short(id: &str) -> &str {
         &id[..12]
     }
+    {
+        let mut store = open(&root);
+        store
+            .create_checkpoint("middle-point", Some(&middle))
+            .unwrap();
+    }
 
     let out = iso.run(&root, &["log"]);
     ok(&out);
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines.len(), 4, "{text}");
     assert!(
-        lines[0].contains(short(&oldest)) && lines[0].contains("a.txt"),
-        "oldest first: {text}"
+        lines[0].contains(short(&oldest))
+            && lines[0].contains("@~2")
+            && lines[0].contains("1 file")
+            && !lines[0].contains("a.txt"),
+        "oldest compact capture first: {text}"
     );
-    assert!(lines[1].contains(short(&middle)) && lines[1].contains("b.txt"));
-    assert!(lines[2].contains(short(&newest)) && lines[2].contains("a.txt"));
+    assert!(lines[1].contains(short(&middle)) && lines[1].contains("@~1"));
+    assert_eq!(lines[2], "[Checkpoint: middle-point]");
+    assert!(lines[3].contains(short(&newest)) && lines[3].contains('@'));
     assert!(
         stderr(&out).contains("note: daemon unavailable; showing a read-only store snapshot"),
         "{}",
@@ -334,11 +344,16 @@ fn log_orders_oldest_to_newest_and_json_keeps_wire_order() {
     assert_eq!(entries[0]["id"], serde_json::json!(newest));
     assert_eq!(entries[2]["id"], serde_json::json!(oldest));
 
-    // Path filter and limit narrow the view.
-    let out = iso.run(&root, &["log", "--path", "b.txt"]);
+    // Path filters and verbose output expose the exact file-level delta.
+    let out = iso.run(
+        &root,
+        &["log", "--path", "b.txt", "--verbose", "--time", "utc"],
+    );
     ok(&out);
     let text = stdout(&out);
     assert!(text.contains("b.txt") && !text.contains("a.txt"), "{text}");
+    assert!(text.contains(" A b.txt"), "{text}");
+    assert!(text.contains('Z'), "{text}");
 
     let out = iso.run(&root, &["log", "--limit", "1"]);
     ok(&out);
@@ -347,6 +362,44 @@ fn log_orders_oldest_to_newest_and_json_keeps_wire_order() {
         text.contains(short(&newest)) && !text.contains(short(&oldest)),
         "{text}"
     );
+}
+
+#[test]
+fn log_reads_a_named_branch_without_switching_the_worktree() {
+    let iso = Iso::new("log-branch");
+    let root = iso.enrolled_project();
+    let (oldest, middle, newest) = three_capture_store(&root);
+    {
+        let mut store = open(&root);
+        store
+            .create_branch("feature", Some(&middle), std::collections::BTreeMap::new())
+            .unwrap();
+    }
+
+    let out = iso.run(&root, &["log", "--branch", "feature"]);
+    ok(&out);
+    let text = stdout(&out);
+    assert!(text.contains(&oldest[..12]), "{text}");
+    assert!(text.contains(&middle[..12]), "{text}");
+    assert!(!text.contains(&newest[..12]), "{text}");
+    assert!(text.lines().last().unwrap().contains("feature"), "{text}");
+
+    let out = iso.run(&root, &["log", "--branch", "missing"]);
+    fail(&out, 1, "branch `missing`");
+}
+
+#[test]
+fn log_patch_includes_the_exact_parent_delta() {
+    let iso = Iso::new("log-patch");
+    let root = iso.enrolled_project();
+    three_capture_store(&root);
+    let out = iso.run(&root, &["log", "--limit", "1", "--patch"]);
+    ok(&out);
+    let text = stdout(&out);
+    assert!(text.contains(" M a.txt"), "{text}");
+    assert!(text.contains("diff --sheaf a/a.txt b/a.txt"), "{text}");
+    assert!(text.contains("-v1"), "{text}");
+    assert!(text.contains("+v2"), "{text}");
 }
 
 #[test]
@@ -383,12 +436,14 @@ fn log_before_cursor_validates_and_paginates() {
 fn info_renders_entries_json_and_unknown_references() {
     let iso = Iso::new("info");
     let root = iso.enrolled_project();
-    let (_, middle, _) = three_capture_store(&root);
+    let (oldest, middle, _) = three_capture_store(&root);
 
     let out = iso.run(&root, &["info", &middle]);
     ok(&out);
     let text = stdout(&out);
-    assert!(text.contains(&format!("* {}", &middle[..12])), "{text}");
+    assert!(text.contains(&format!("capture: {}", &middle[..12])), "{text}");
+    assert!(text.contains(&format!("parent:  {}", &oldest[..12])), "{text}");
+    assert!(text.contains(&format!("undo:    sheaf restore {}", &oldest[..12])), "{text}");
     assert!(text.contains("  + b.txt"), "{text}");
     assert!(
         stderr(&out).contains("note: daemon unavailable; showing a read-only store snapshot"),
@@ -875,9 +930,10 @@ fn gc_offline_reports_plans_expiry_marks_and_applies() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "the marked capture is gone: {text}");
     assert!(
-        lines[0].contains(&middle[..12]) && lines[1].contains(&newest[..12]),
+        lines[0].contains(&middle[..12]) && lines[0].contains("details pruned"),
         "{text}"
     );
+    assert!(lines[1].contains(&newest[..12]), "{text}");
 }
 
 // ------------------------------------------------------------------ cache

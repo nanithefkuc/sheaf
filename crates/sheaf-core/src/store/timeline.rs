@@ -188,14 +188,7 @@ fn branch_graph_from(
     ledger: &super::ledger::LedgerState,
     current: Option<&Frontiers>,
 ) -> Result<BranchGraph> {
-    let mut captures = captures_from(
-        doc,
-        ledger,
-        &doc.oplog_frontiers(),
-        None,
-        None,
-        usize::MAX,
-    )?;
+    let mut captures = captures_from(doc, ledger, &doc.oplog_frontiers(), None, None, usize::MAX)?;
     if let Some(current) = current {
         mark_current_lineage(doc, ledger, current, &mut captures);
     }
@@ -203,7 +196,10 @@ fn branch_graph_from(
 
     let mut labels: BTreeMap<String, Vec<Branch>> = BTreeMap::new();
     for branch in branches_from(doc, ledger, current) {
-        labels.entry(branch.frontier.clone()).or_default().push(branch);
+        labels
+            .entry(branch.frontier.clone())
+            .or_default()
+            .push(branch);
     }
     let frontier_of: BTreeMap<String, String> = captures
         .iter()
@@ -240,6 +236,16 @@ fn branch_graph_from(
 pub struct CaptureInfo {
     pub capture: Capture,
     pub diff: super::DiffOutcome,
+}
+
+/// Log-safe capture detail. Retention can preserve a capture while pruning
+/// its exact parent, in which case the capture remains navigable but its
+/// parent delta is no longer reconstructable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureLogDetail {
+    pub capture: Capture,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<super::DiffOutcome>,
 }
 
 /// Read-only snapshot+journal view. Opening it never creates, truncates, or appends files.
@@ -372,6 +378,16 @@ impl TimelineReader {
         )
     }
 
+    pub fn capture_log_detail(&self, reference: &str) -> Result<CaptureLogDetail> {
+        capture_log_detail_from(
+            &self.root,
+            &self.doc,
+            &self.ledger,
+            &decode_frontier(&self.current_frontier())?,
+            reference,
+        )
+    }
+
     pub fn captures(
         &self,
         all_branches: bool,
@@ -399,6 +415,26 @@ impl TimelineReader {
         }
         annotate_checkpoints(&self.doc, &self.ledger, &mut entries);
         Ok(entries)
+    }
+
+    /// Captures on one named branch, newest first. Reading another branch
+    /// never changes the worktree's active frontier.
+    pub fn captures_for_branch(
+        &self,
+        branch: &str,
+        path: Option<&Path>,
+        follow: bool,
+        limit: usize,
+    ) -> Result<Vec<Capture>> {
+        captures_for_named_branch(
+            &self.doc,
+            &self.ledger,
+            &decode_frontier(&self.current_frontier())?,
+            branch,
+            path,
+            follow,
+            limit,
+        )
     }
 
     /// Tombstones of captures whose content was reclaimed (ghosts).
@@ -480,6 +516,9 @@ fn capture_info_from(
     };
     let ignore = crate::ignore::IgnoreSet::for_project(root, &config::load(root)?.ignore.patterns)
         .map_err(|e| SheafError::Config(e.to_string()))?;
+    // A capture can only change paths named by its watcher batch. Restricting
+    // the exact parent diff to that superset avoids materializing unrelated
+    // files when log renders a page of capture summaries.
     let diff = super::diff::compute_diff_points(
         root,
         doc,
@@ -489,10 +528,45 @@ fn capture_info_from(
             frontier: capture.frontier.clone(),
             capture_id: Some(capture.id.clone()),
         }),
-        &[],
+        &capture.paths,
         &ignore,
     )?;
     Ok(CaptureInfo { capture, diff })
+}
+
+fn capture_log_detail_from(
+    root: &Path,
+    doc: &LoroDoc,
+    ledger: &super::ledger::LedgerState,
+    current: &Frontiers,
+    reference: &str,
+) -> Result<CaptureLogDetail> {
+    let point = resolve_in_doc(doc, ledger, current, reference)?;
+    let frontier = decode_frontier(&point.frontier)?;
+    let capture = capture_at_frontier(doc, &frontier).ok_or_else(|| {
+        SheafError::TimelineReference(format!("`{reference}` does not name a capture"))
+    })?;
+    let parent = decode_frontier(&capture.parent_frontier)?;
+    let parent_pruned = ledger.tombstones.keys().any(|capture_id| {
+        ledger
+            .captures
+            .get(capture_id)
+            .is_some_and(|record| record.frontier == capture.parent_frontier)
+    });
+    let starts_shallow_epoch = ledger
+        .epochs
+        .iter()
+        .any(|epoch| epoch.boundary == capture.frontier);
+    if parent_pruned || starts_shallow_epoch || doc.frontiers_to_vv(&parent).is_none() {
+        return Ok(CaptureLogDetail {
+            capture,
+            diff: None,
+        });
+    }
+    capture_info_from(root, doc, ledger, current, reference).map(|info| CaptureLogDetail {
+        capture: info.capture,
+        diff: Some(info.diff),
+    })
 }
 
 impl ProjectStore {
@@ -518,6 +592,15 @@ impl ProjectStore {
         )
     }
 
+    pub fn capture_log_detail(&self, reference: &str) -> Result<CaptureLogDetail> {
+        capture_log_detail_from(
+            &self.root,
+            &self.doc,
+            &self.ledger,
+            &self.materialized_frontiers(),
+            reference,
+        )
+    }
     pub fn captures(
         &self,
         all_branches: bool,
@@ -545,6 +628,26 @@ impl ProjectStore {
         }
         annotate_checkpoints(&self.doc, &self.ledger, &mut entries);
         Ok(entries)
+    }
+
+    /// Captures on one named branch, newest first. This is a read-only walk
+    /// and does not activate that branch's worktree state.
+    pub fn captures_for_branch(
+        &self,
+        branch: &str,
+        path: Option<&Path>,
+        follow: bool,
+        limit: usize,
+    ) -> Result<Vec<Capture>> {
+        captures_for_named_branch(
+            &self.doc,
+            &self.ledger,
+            &self.materialized_frontiers(),
+            branch,
+            path,
+            follow,
+            limit,
+        )
     }
 
     /// Tombstones of captures whose content was reclaimed (ghosts).
@@ -591,7 +694,11 @@ impl ProjectStore {
     }
 
     pub fn branch_graph(&self) -> Result<BranchGraph> {
-        branch_graph_from(&self.doc, &self.ledger, Some(&self.materialized_frontiers()))
+        branch_graph_from(
+            &self.doc,
+            &self.ledger,
+            Some(&self.materialized_frontiers()),
+        )
     }
 
     /// Append a checkpoint label without creating a user-visible capture.
@@ -828,6 +935,28 @@ pub(super) fn captures_from(
     })
     .map_err(|e| SheafError::StoreCorrupt(format!("timeline traversal: {e}")))?;
     Ok(out)
+}
+
+fn captures_for_named_branch(
+    doc: &LoroDoc,
+    ledger: &super::ledger::LedgerState,
+    current: &Frontiers,
+    branch: &str,
+    path: Option<&Path>,
+    follow: bool,
+    limit: usize,
+) -> Result<Vec<Capture>> {
+    let record = ledger
+        .branches
+        .get(branch)
+        .ok_or_else(|| SheafError::BranchNotFound(branch.to_owned()))?;
+    let point = resolved_branch(ledger, branch, record)?;
+    let start = decode_frontier(&point.frontier)?;
+    let names = path.map(|p| path_names(doc, p)).filter(|_| follow);
+    let mut entries = captures_from(doc, ledger, &start, path, names.as_deref(), limit)?;
+    mark_current_lineage(doc, ledger, current, &mut entries);
+    annotate_checkpoints(doc, ledger, &mut entries);
+    Ok(entries)
 }
 
 /// Whether one frontier lies on the worktree's live causal lineage. Point
@@ -2010,6 +2139,52 @@ mod tests {
         assert!(
             store.branches().is_empty(),
             "a persisted explicit deletion must not recreate the default"
+        );
+    }
+
+    #[test]
+    fn named_branch_capture_walk_stops_at_its_tip() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let mut store = opened(root);
+        let first = store
+            .apply_batch(&touch(root, "src/a.rs"))
+            .unwrap()
+            .capture
+            .unwrap();
+        let second = store
+            .apply_batch(&touch(root, "src/b.rs"))
+            .unwrap()
+            .capture
+            .unwrap();
+        store
+            .create_branch("feature", Some(&first.id), BTreeMap::new())
+            .unwrap();
+
+        let selected = store
+            .captures_for_branch("feature", None, false, 50)
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|capture| &capture.id)
+                .collect::<Vec<_>>(),
+            vec![&first.id]
+        );
+        assert!(!selected.iter().any(|capture| capture.id == second.id));
+        assert!(matches!(
+            store.captures_for_branch("missing", None, false, 50),
+            Err(SheafError::BranchNotFound(_))
+        ));
+
+        drop(store);
+        let reader = TimelineReader::open(root).unwrap();
+        assert_eq!(
+            reader
+                .captures_for_branch("feature", None, false, 50)
+                .unwrap()[0]
+                .id,
+            first.id
         );
     }
 

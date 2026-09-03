@@ -279,7 +279,7 @@ fn checkpoint_create_writes_names_and_the_log_annotates_them() {
     wait_caught_up(&fx);
     let (ok, out, err) = sheaf(&fx, &["log"]);
     assert!(ok, "{err}");
-    assert!(out.contains("checkpoint: before-work"), "{out}");
+    assert!(out.contains("[Checkpoints: before-work, earlier]"), "{out}");
 
     // The name resolves as a restore point through the daemon planner.
     let (ok, out, err) = sheaf(&fx, &["restore", "--dry-run", "checkpoint:before-work"]);
@@ -464,18 +464,28 @@ fn restore_applies_scoped_then_full_and_reports_both_modes() {
         "full restore put the old content back"
     );
 
-    // The abandoned future (V3) is still reachable with --all.
-    let (ok, out, err) = sheaf(&fx, &["log", "--all", "--json"]);
+    // The abandoned future (V3) remains named and can be inspected one
+    // lineage at a time.
+    let (ok, out, err) = sheaf(&fx, &["branch", "list", "--json"]);
     assert!(ok, "{err}");
-    let value = json_out(&out);
-    let paths: Vec<String> = value["entries"]
+    let graph = json_out(&out);
+    let abandoned = graph["graph"]["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .flat_map(|e| e["paths"].as_array().unwrap().clone())
-        .filter_map(|p| p.as_str().map(str::to_owned))
-        .collect();
-    assert!(paths.iter().any(|p| p.ends_with("lib.rs")));
+        .flat_map(|node| node["branches"].as_array().unwrap())
+        .find(|branch| !branch["on_current"].as_bool().unwrap())
+        .and_then(|branch| branch["name"].as_str())
+        .expect("full restore names the abandoned branch");
+    let (ok, out, err) = sheaf(&fx, &["log", "--branch", abandoned, "--json"]);
+    assert!(ok, "{err}");
+    let branch_log = json_out(&out);
+    assert!(!branch_log["entries"].as_array().unwrap().is_empty());
+    assert!(branch_log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| !entry["on_current"].as_bool().unwrap()));
 }
 
 // ------------------------------------------------- doctor/cache via daemon

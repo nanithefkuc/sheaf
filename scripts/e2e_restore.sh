@@ -37,7 +37,7 @@ strings "$SHEAF" | has "restore to:" || fail "stale cli binary"
 sheaf() { "$SHEAF" "$@" -C "$P"; }
 tree_hash() { (cd "$P" && find . -path ./.sheaf -prune -o -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum); }
 log_count() { sheaf log --limit 1000 --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["entries"]))'; }
-all_count() { sheaf log --all --limit 1000 --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["entries"]))'; }
+all_count() { sheaf branch list --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["graph"]["nodes"]))'; }
 settle() {
   local want=$1 tries=0
   while :; do
@@ -119,10 +119,10 @@ LINEAGE_AFTER=$(log_count)
 ok "no spurious captures ($AFTER total, $LINEAGE_AFTER on the restored lineage)"
 
 echo "== the log was never trimmed =="
-sheaf log --all --limit 1000 --json > "$E/log.json"
+sheaf branch list --json > "$E/log.json"
 python3 - "$E/log.json" "$BEFORE_RESTORE_CAPTURES" <<'PY' || fail "log lost entries"
 import json,sys
-entries=json.load(open(sys.argv[1]))["entries"]
+entries=[node["capture"] for node in json.load(open(sys.argv[1]))["graph"]["nodes"]]
 assert len(entries) >= int(sys.argv[2]), (len(entries), sys.argv[2])
 PY
 ok "every pre-restore capture is still reachable"
@@ -183,14 +183,14 @@ sheaf restore "$BULK" bulk > "$E/race.txt" || fail "bulk restore"
 wait "$WRITER"
 sleep 3
 # Whichever side won the race, the typed bytes must exist somewhere in history.
-sheaf log --all --limit 1000 --json > "$E/race-log.json"
+sheaf branch list --json > "$E/race-log.json"
 python3 - "$P" "$E/race-log.json" <<'PY2' || fail "a save during the restore was lost"
 import json,pathlib,subprocess,sys
 proj=pathlib.Path(sys.argv[1])
 live=(proj/"bulk/f400.txt").read_text()
 if live.strip()=="typed during the restore":
     print("    (the write landed after the restore finished)"); raise SystemExit(0)
-entries=json.load(open(sys.argv[2]))["entries"]
+entries=[node["capture"] for node in json.load(open(sys.argv[2]))["graph"]["nodes"]]
 assert any("bulk/f400.txt" in e["paths"] for e in entries), "no capture mentions the raced path"
 PY2
 ok "the concurrent save is accounted for"
@@ -224,10 +224,10 @@ ok "interrupted restore completed on startup, worktree converged"
 echo "== nothing was lost to the crash =="
 # The edits made while the daemon was dead were captured before the resume
 # overwrote them, so they are still addressable.
-sheaf log --all --limit 1000 --json > "$E/log2.json"
+sheaf branch list --json > "$E/log2.json"
 python3 - "$E/log2.json" <<'PY' || fail "gap edits were not preserved"
 import json,sys
-entries=json.load(open(sys.argv[1]))["entries"]
+entries=[node["capture"] for node in json.load(open(sys.argv[1]))["graph"]["nodes"]]
 assert any("src/util/mod.rs" in e["paths"] for e in entries), "gap edit missing from history"
 PY
 ok "edits from the dead gap are in history"
