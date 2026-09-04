@@ -441,9 +441,18 @@ fn info_renders_entries_json_and_unknown_references() {
     let out = iso.run(&root, &["info", &middle]);
     ok(&out);
     let text = stdout(&out);
-    assert!(text.contains(&format!("capture: {}", &middle[..12])), "{text}");
-    assert!(text.contains(&format!("parent:  {}", &oldest[..12])), "{text}");
-    assert!(text.contains(&format!("undo:    sheaf restore {}", &oldest[..12])), "{text}");
+    assert!(
+        text.contains(&format!("capture: {}", &middle[..12])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("parent:  {}", &oldest[..12])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("undo:    sheaf restore {}", &oldest[..12])),
+        "{text}"
+    );
     assert!(text.contains("  + b.txt"), "{text}");
     assert!(
         stderr(&out).contains("note: daemon unavailable; showing a read-only store snapshot"),
