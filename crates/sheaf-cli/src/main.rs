@@ -1727,15 +1727,18 @@ fn cmd_diff(
     let root = timeline_root(project)?;
     // `A..B` packs two points into one argument.
     let (from, to) = match (from, to) {
-        (Some(range), None) if let Some((a, b)) = range.split_once("..") => {
-            let (a, b) = (a.trim(), b.trim());
-            if a.is_empty() || b.is_empty() {
-                return Err(
-                    anyhow::anyhow!("`{range}` needs a point on both sides of `..`").into(),
-                );
+        (Some(range), None) => match range.split_once("..") {
+            Some((a, b)) => {
+                let (a, b) = (a.trim(), b.trim());
+                if a.is_empty() || b.is_empty() {
+                    return Err(
+                        anyhow::anyhow!("`{range}` needs a point on both sides of `..`").into(),
+                    );
+                }
+                (a.to_string(), Some(b.to_string()))
             }
-            (a.to_string(), Some(b.to_string()))
-        }
+            None => (range.to_string(), None),
+        },
         _ => (from.unwrap_or("@").to_string(), to.map(str::to_string)),
     };
 
