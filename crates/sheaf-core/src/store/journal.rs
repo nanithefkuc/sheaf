@@ -273,6 +273,7 @@ pub fn visit_records(
     paths: &[(u64, PathBuf)],
     mut visit: impl FnMut(Result<SegmentRecord, (u64, String)>) -> bool,
 ) {
+    let mut dropped = 0usize;
     'segments: for &(seg, ref path) in paths {
         let mut f = match File::open(path) {
             Ok(f) => f,
@@ -298,7 +299,8 @@ pub fn visit_records(
                     break; // clean end or torn tail — both stop this segment
                 }
                 Err(e @ (FrameErr::BadCrc | FrameErr::BadLength)) => {
-                    tracing::warn!(segment = seg, ordinal, error = ?e, "torn tail dropped");
+                    tracing::trace!(segment = seg, ordinal, error = ?e, "torn tail dropped");
+                    dropped += 1;
                     break;
                 }
                 Err(FrameErr::Torn(e)) => {
@@ -309,6 +311,9 @@ pub fn visit_records(
                 }
             }
         }
+    }
+    if dropped > 0 {
+        tracing::warn!(dropped, "journal replay dropped torn frames; store integrity unaffected");
     }
 }
 

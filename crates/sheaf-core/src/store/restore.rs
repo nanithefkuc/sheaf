@@ -1069,9 +1069,7 @@ impl ProjectStore {
                 token = %intent.token,
                 age_ms = intent.age_ms(),
                 max_resume_age_ms,
-                "pending restore is past the staleness bound; NOT replaying \
-                 automatically — `sheaf restore --resume` forces it, \
-                 `sheaf restore --abandon` discards it"
+                "stale restore intent refused; leaving worktree untouched"
             );
             return Ok(None);
         }
@@ -1079,7 +1077,7 @@ impl ProjectStore {
             root = %self.root.display(),
             token = %intent.token,
             forced = force,
-            "resuming restore interrupted before completion"
+            "interrupted restore resuming; replay converges on the same worktree"
         );
         // Fragment intents replay from their durable plan payload, not from
         // (target, scope): a crash mid-apply leaves files at a mix of pre
@@ -1103,11 +1101,12 @@ impl ProjectStore {
             root = %self.root.display(),
             token = had.as_ref().map(|i| i.token.clone()).unwrap_or_default(),
             abandoned = had.is_some(),
-            "restore intent abandoned by operator; reconciling worktree as-is"
+            "restore intent abandoned; reconciling worktree as-is"
         );
         self.reconcile_worktree(ignore)
     }
 
+    #[tracing::instrument(skip_all, fields(root = %self.root.display()))]
     fn run_restore(
         &mut self,
         plan: &RestorePlan,
@@ -1273,10 +1272,7 @@ impl ProjectStore {
             root = %self.root.display(),
             mode = ?fresh.mode,
             written = written_paths.len(),
-            deleted = deleted_paths.len(),
-            unchanged = fresh.unchanged,
-            resumed,
-            "restore applied"
+            "restore completed"
         );
 
         Ok(RestoreOutcome {
@@ -1642,8 +1638,7 @@ pub fn pending_restore_at(root: &Path) -> Option<RestoreIntent> {
             tracing::error!(
                 intent = %path.display(),
                 %error,
-                "restore intent is unreadable; quarantining it as .bad — \
-                 the worktree may be half-restored, compare it against `sheaf log`"
+                "restore intent unreadable; quarantined as .bad"
             );
             let _ = std::fs::rename(&path, path.with_extension("intent.bad"));
             None

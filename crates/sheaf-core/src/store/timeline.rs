@@ -302,7 +302,10 @@ impl TimelineReader {
                         match super::ledger::LedgerState::from_json(state) {
                             Ok(parsed) => ledger = parsed,
                             Err(error) => {
-                                tracing::warn!(%error, "manifest ledger state unparseable")
+                                tracing::warn!(
+                                    error = %error,
+                                    "manifest ledger state unparseable; older tombstones/marks lost"
+                                )
                             }
                         }
                     }
@@ -310,8 +313,8 @@ impl TimelineReader {
                 }
                 Err(error) => tracing::warn!(
                     snapshot = %snapshot.display(),
-                    %error,
-                    "timeline snapshot unreadable; attempting full journal replay"
+                    error = %error,
+                    "snapshot unreadable; replaying full journal"
                 ),
             }
         }
@@ -1041,7 +1044,11 @@ pub(super) fn path_names(doc: &LoroDoc, path: &Path) -> Vec<String> {
         match doc.fork_at(&tip) {
             Ok(merged) => read_renames(&merged),
             Err(error) => {
-                tracing::warn!(%error, "cannot fork at tip for rename following");
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "tip fork failed; rename scan limited to materialized state"
+                );
                 read_renames(doc)
             }
         }

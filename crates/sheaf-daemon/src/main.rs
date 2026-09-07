@@ -427,6 +427,7 @@ fn same_root(a: &Path, b: &Path) -> bool {
 // ------------------------------------------------------------------ daemon
 
 fn run_daemon(socket_override: Option<PathBuf>) -> Result<()> {
+    let started = Instant::now();
     init_tracing();
     disable_thp_for_this_process();
 
@@ -446,7 +447,7 @@ fn run_daemon(socket_override: Option<PathBuf>) -> Result<()> {
         match probe_incumbent(&socket_path) {
             Ok(_) => bail!("daemon already running on {}", socket_path.display()),
             Err(_) => {
-                tracing::info!("removing dead socket");
+                tracing::info!(socket = %socket_path.display(), "stale socket removed; predecessor daemon is dead");
                 let _ = std::fs::remove_file(&socket_path);
             }
         }
@@ -504,7 +505,7 @@ fn run_daemon(socket_override: Option<PathBuf>) -> Result<()> {
         socket = %socket_path.display(),
         projects_resumed = resumed,
         projects_pruned = pruned,
-        "sheafd listening"
+        "daemon listening"
     );
 
     // Accept loop: poll(2) on {listener, shutdown pipe}. Blocks indefinitely
@@ -513,7 +514,7 @@ fn run_daemon(socket_override: Option<PathBuf>) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     loop {
         if shared.stopping.load(Ordering::SeqCst) {
-            return graceful_shutdown(shared, listener);
+            return graceful_shutdown(shared, listener, started);
         }
         let mut fds = [
             libc::pollfd {
@@ -540,7 +541,7 @@ fn run_daemon(socket_override: Option<PathBuf>) -> Result<()> {
             let mut buf = [0u8; 64];
             unsafe { libc::read(pipe_read, buf.as_mut_ptr().cast(), buf.len()) };
             tracing::info!("shutdown signal received");
-            return graceful_shutdown(shared, listener);
+            return graceful_shutdown(shared, listener, started);
         }
         if fds[0].revents & libc::POLLIN != 0 {
             // Accept everything currently queued; the fd is non-blocking.
@@ -573,7 +574,7 @@ fn run_daemon(socket_override: Option<PathBuf>) -> Result<()> {
     }
 }
 
-fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener) -> Result<()> {
+fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener, started: Instant) -> Result<()> {
     shared.stopping.store(true, Ordering::SeqCst);
 
     // Phase 1: stop the event producers so no new batch can start.
@@ -609,7 +610,7 @@ fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener) -> Result<()> 
     drop(listener);
     // Socket removal last so probes never see live-but-exiting states.
     let _ = std::fs::remove_file(&shared.socket_path);
-    tracing::info!("bye");
+    tracing::info!(uptime_ms = started.elapsed().as_millis() as u64, "daemon stopped");
     std::process::exit(0);
 }
 
@@ -692,6 +693,7 @@ fn acquire_registry_singleton_at(dir: &Path, socket_path: &Path) -> Result<std::
 
 /// Take the writer flock and open recovery state; both travel together so
 /// a second daemon instance can never double-write a project's journal.
+#[tracing::instrument(skip_all, fields(root = %root.display()))]
 fn open_store_locked(
     root: &Path,
     limits: StoreLimits,
@@ -714,6 +716,7 @@ fn open_store_locked(
 /// automatically — a tree the user has worked in for days must never rewind
 /// after a reboot. It stays pending, visible in `project.status`, until the
 /// operator resumes or abandons it explicitly.
+#[tracing::instrument(skip_all, fields(root = %root.display()))]
 fn resume_interrupted_restore(
     root: &Path,
     store: &mut ProjectStore,
@@ -732,7 +735,7 @@ fn resume_interrupted_restore(
             Some(outcome)
         }
         Err(e) => {
-            tracing::error!(root = %root.display(), error = %e, "restore resume FAILED");
+            tracing::error!(root = %root.display(), error = %e, "restore resume failed");
             None
         }
     }
@@ -746,10 +749,13 @@ fn resume_interrupted_restore(
 fn resume_enrollments(shared: &Shared, registry: &Registry) -> (usize, usize) {
     let mut resumed = 0usize;
     let mut pruned = 0usize;
+    let mut prune_failed = 0usize;
+    let mut skipped = 0usize;
     let Ok(entries) = registry.list() else {
         tracing::error!("enrollment registry unreadable; nothing resumed");
         return (0, 0);
     };
+    let total = entries.len();
     for entry in entries {
         if !entry.root.is_dir() {
             match registry.forget(&entry.root) {
@@ -757,23 +763,41 @@ fn resume_enrollments(shared: &Shared, registry: &Registry) -> (usize, usize) {
                     pruned += 1;
                     tracing::info!(
                         root = %entry.root.display(),
-                        "enrollment pruned: root is gone from disk (re-run `sheaf init` if this was a mistake)"
+                        "enrollment pruned; root is gone from disk (re-run `sheaf init` to re-enroll)"
+                    );
+                }
+                Err(e) => {
+                    prune_failed += 1;
+                    tracing::trace!(
+                        root = %entry.root.display(),
+                        error = %e,
+                        "enrollment prune failed"
                     );
                 }
                 Ok(false) => {}
-                Err(e) => tracing::warn!(
-                    root = %entry.root.display(),
-                    error = %e,
-                    "root is gone but the enrollment could not be pruned"
-                ),
             }
             continue;
         }
         if spawn_watch(shared, &entry.root) {
             resumed += 1;
         } else {
-            tracing::warn!(root = %entry.root.display(), "enrolled project skipped");
+            skipped += 1;
+            tracing::trace!(root = %entry.root.display(), "enrollment skipped");
         }
+    }
+    if prune_failed > 0 {
+        tracing::warn!(
+            failed = prune_failed,
+            total = total,
+            "enrollment prune failed; stale entries kept"
+        );
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped = skipped,
+            total = total,
+            "enrollments skipped; projects unwatchable"
+        );
     }
     (resumed, pruned)
 }
@@ -842,7 +866,7 @@ fn classifier_for(root: &Path) -> sheaf_core::classify::Classifier {
         Err(error) => {
             tracing::warn!(
                 root = %root.display(),
-                %error,
+                error = %error,
                 "classification failed; treating every path as durable until the rules parse"
             );
             sheaf_core::classify::Classifier::all_durable()
@@ -899,7 +923,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
         ) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(root = %root_n.display(), error = %e, "bad classify patterns");
+                tracing::error!(root = %root_n.display(), error = %e, "classify patterns rejected");
                 return false;
             }
         };
@@ -942,7 +966,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             Err(error) => {
                 tracing::warn!(
                     root = %linked.path.display(),
-                    %error,
+                    error = %error,
                     "managed worktree classification failed; worktree not watched"
                 );
                 continue;
@@ -954,8 +978,8 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             Err(error) => {
                 tracing::warn!(
                     root = %linked.path.display(),
-                    %error,
-                    "managed worktree backend failed"
+                    error = %error,
+                    "managed worktree backend failed; worktree not watched"
                 );
                 continue;
             }
@@ -969,7 +993,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
         {
             Ok(handle) => watch_handles.push(handle),
             Err(error) => {
-                tracing::warn!(root = %root_log, %error, "managed worktree thread failed")
+                tracing::warn!(root = %root_log, error = %error, "managed worktree thread failed; worktree not watched")
             }
         }
     }
@@ -988,7 +1012,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
         match open_store_locked(&root_n, store_limits.clone(), cfg.watch.max_tracked_bytes) {
             Ok(pair) => Some(pair),
             Err(e) => {
-                tracing::error!(root = %root_n.display(), error = %e, "store unavailable");
+                tracing::error!(root = %root_n.display(), error = %e, "store open failed");
                 return false;
             }
         }
@@ -1086,7 +1110,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             wake: wake_tx,
         },
     );
-    tracing::info!(root = %root_n.display(), cold = matches!(policy, OpenPolicy::Lazy), "watching");
+    tracing::info!(root = %root_n.display(), cold = matches!(policy, OpenPolicy::Lazy), "watch started");
     true
 }
 
@@ -1109,7 +1133,7 @@ fn boot_reconcile_store(
     let mut primary_mute = None;
     for worktree in roots {
         if let Err(error) = store.activate_worktree(&worktree) {
-            tracing::error!(root = %worktree.display(), %error, "worktree activation failed");
+            tracing::error!(root = %worktree.display(), error = %error, "worktree activation failed");
             continue;
         }
         let owned_classifier;
@@ -1131,7 +1155,7 @@ fn boot_reconcile_store(
                 Err(error) => {
                     tracing::error!(
                         root = %worktree.display(),
-                        %error,
+                        error = %error,
                         "merge resume blocked; leaving intent pending and skipping reconciliation"
                     );
                     continue;
@@ -1148,7 +1172,7 @@ fn boot_reconcile_store(
             ),
             Err(error) => tracing::warn!(
                 root = %worktree.display(),
-                %error,
+                error = %error,
                 "boot reconciliation failed"
             ),
         }
@@ -1213,7 +1237,7 @@ fn collect_cold(
                 return Some(pair);
             }
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     root = %root.display(),
                     error = %e,
                     "lazy store open failed; retrying on next activity"
@@ -1420,7 +1444,7 @@ fn collect_loop(
         .filter(|batch| !batch.is_empty())
         .collect();
     for tail in tails {
-        tracing::info!(root = %tail.root.display(), events = tail.len(), "final drain on shutdown");
+        tracing::info!(root = %tail.root.display(), events = tail.len(), "final drain completed");
         persist_batch(&mut store, &tail);
     }
     flush_scratch(&mut scratch, &mut scratch_dirty);
@@ -1462,7 +1486,7 @@ fn route_fs_event(
     let Some(event_root) =
         sheaf_core::init::resolve_project_root(start).map(|path| normalize(&path))
     else {
-        tracing::warn!(path = %ev.path().display(), "event has no project root");
+        tracing::warn!(path = %ev.path().display(), "event dropped; no project root");
         return;
     };
     if !store.is_registered_worktree(&event_root).unwrap_or(false) {
@@ -1713,7 +1737,7 @@ fn disable_thp_for_this_process() {
     if unsafe { libc::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) } != 0 {
         tracing::debug!(
             error = %std::io::Error::last_os_error(),
-            "could not disable THP for this process (non-fatal)"
+            "THP disable failed; non-fatal"
         );
     }
 }
@@ -2251,6 +2275,7 @@ fn persist_batch(store: &mut ProjectStore, batch: &sheaf_core::events::Batch) {
     let _ = persist_batch_checked(store, batch);
 }
 
+#[tracing::instrument(skip_all, fields(root = %batch.root.display()))]
 fn persist_batch_checked(
     store: &mut ProjectStore,
     batch: &sheaf_core::events::Batch,
@@ -2273,7 +2298,7 @@ fn persist_batch_checked(
             Ok(())
         }
         Err(e) => {
-            tracing::error!(root = %batch.root.display(), error = %e, "persist FAILED; window lost");
+            tracing::error!(root = %batch.root.display(), error = %e, "persist failed; window lost");
             Err(e)
         }
     }
@@ -2410,9 +2435,9 @@ fn write_response(stream: &mut UnixStream, resp: &Response, body: &[u8]) -> std:
     if payload.len() > MAX_ENVELOPE {
         tracing::warn!(
             bytes = payload.len(),
-            cap = MAX_ENVELOPE,
-            method_id = %resp.id,
-            "response exceeds the envelope cap; replying with `result.too_large`"
+            cap_bytes = MAX_ENVELOPE,
+            request_id = %resp.id,
+            "envelope cap exceeded; replying with `result.too_large`"
         );
         let replacement = Response::err(
             resp.id.clone(),
@@ -2881,10 +2906,10 @@ fn editor_capture(shared: &Shared, req: &Request, rid: String, body: Option<Vec<
                 .map(|capture| capture.id.clone());
             tracing::debug!(
                 seq = result.outcome.seq,
-                bytes = result.content_sha256.len(),
+                digest = %result.content_sha256,
                 recorded = capture_id.is_some(),
                 rebased = result.rebased,
-                "editor capture"
+                "editor capture applied"
             );
             Response::ok(
                 rid,

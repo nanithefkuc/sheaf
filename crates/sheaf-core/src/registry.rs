@@ -59,16 +59,29 @@ impl Registry {
         }
         let f = std::fs::File::open(&self.file)?;
         let mut out = Vec::new();
+        let mut malformed = 0usize;
+        let mut total = 0usize;
         for line in std::io::BufReader::new(f).lines() {
             let line = line.map_err(|e| SheafError::Registry(format!("read: {e}")))?;
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
+            total += 1;
             match serde_json::from_str::<Enrollment>(line) {
                 Ok(e) => out.push(e),
-                Err(e) => tracing::warn!(%line, error = %e, "skipping malformed enrollment line"),
+                Err(e) => {
+                    malformed += 1;
+                    tracing::trace!(error = %e, "malformed enrollment line skipped");
+                }
             }
+        }
+        if malformed > 0 {
+            tracing::warn!(
+                failed = malformed,
+                total,
+                "malformed enrollment lines skipped; remaining enrollments loaded"
+            );
         }
         Ok(out)
     }

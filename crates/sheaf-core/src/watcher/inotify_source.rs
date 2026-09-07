@@ -86,7 +86,7 @@ struct RunState {
 }
 
 impl RunState {
-    fn add_watch(&mut self, dir: &Path) {
+    fn add_watch(&mut self, dir: &Path) -> bool {
         // Registration descends into DURABLE directories only: volatile
         // subtrees (build trees, vendored deps) stay dark exactly as they
         // were under plain ignore — no watch descriptors spent on them.
@@ -96,24 +96,28 @@ impl RunState {
             if !rel.as_os_str().is_empty()
                 && self.classifier.read().classify_rel(rel) != crate::classify::PathClass::Durable
             {
-                return;
+                return true;
             }
         }
         match self.ino.watches().add(dir, WATCH_MASK) {
             Ok(wd) => {
                 self.dirs.insert(wd, dir.to_path_buf());
+                true
             }
             Err(e)
                 if e.raw_os_error() == Some(17 /*EEXIST*/)
                     || e.kind() == std::io::ErrorKind::AlreadyExists =>
             {
-                tracing::trace!(dir = %dir.display(), "watch already present");
+                tracing::trace!(path = %dir.display(), "watch already present");
+                true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::debug!(dir = %dir.display(), "vanished before watching");
+                tracing::trace!(path = %dir.display(), "vanished before watching");
+                true
             }
             Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "failed to add watch");
+                tracing::trace!(path = %dir.display(), error = %e, "watch add failed");
+                false
             }
         }
     }
@@ -140,8 +144,20 @@ impl RunState {
         };
         // Phase 2: mutate — watches go in top-down so parents already observe
         // stragglers beneath children as those children register.
+        let total = targets.len();
+        let mut failed = 0usize;
         for dir in &targets {
-            self.add_watch(dir);
+            if !self.add_watch(dir) {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            tracing::warn!(
+                root = %self.root.display(),
+                failed = failed,
+                total = total,
+                "directory watch registration incomplete; events under failed directories may be missed"
+            );
         }
     }
 
@@ -287,7 +303,7 @@ impl RunState {
         cookie: u32,
     ) {
         if mask.contains(EventMask::Q_OVERFLOW) {
-            tracing::warn!(root = %self.root.display(), "kernel queue overflow: rescanning");
+            tracing::warn!(root = %self.root.display(), "kernel queue overflow; rescanning");
             self.pending_moves.clear();
             let base = self.root.clone();
             self.register_tree_at(&base);

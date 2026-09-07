@@ -273,8 +273,8 @@ impl ProjectStore {
     }
 
     /// Open with an explicit aggregate char-level text budget. The daemon
-    /// supplies `[watch].max_tracked_bytes`; direct callers receive the
-    /// conservative default through [`ProjectStore::open`].
+    /// supplies `[watch].max_tracked_bytes`; direct callers receive the default.
+    #[tracing::instrument(skip_all, fields(root = %root.display()))]
     pub fn open_with_text_budget(
         root: &Path,
         limits: StoreLimits,
@@ -284,7 +284,7 @@ impl ProjectStore {
         // Writer-owned capability bump: ledger frames need format
         // 2 so older builds fail closed instead of choking on record frames.
         if config::upgrade_store_format(root)? {
-            tracing::info!(root = %root.display(), "store upgraded to format {}", config::STORE_FORMAT_VERSION);
+            tracing::info!(root = %root.display(), format = config::STORE_FORMAT_VERSION, "store upgraded");
         }
         let sdir = store_dir(root);
         std::fs::create_dir_all(journal::journal_dir(&sdir))?;
@@ -362,6 +362,7 @@ impl ProjectStore {
         let mut replayed = 0usize;
         let mut replay_bytes = 0u64;
         let mut unknown_frames = 0usize;
+        let mut replay_skipped = 0usize;
         let mut replay_error: Option<SheafError> = None;
         {
             let mut buffer = ReplayBuffer::new(&doc, &mut ledger);
@@ -369,7 +370,8 @@ impl ProjectStore {
                 let record = match item {
                     Ok(record) => record,
                     Err((seg, msg)) => {
-                        tracing::warn!(segment = seg, %msg, "segment skipped");
+                        tracing::trace!(segment = seg, error = %msg, "segment skipped");
+                        replay_skipped += 1;
                         return false;
                     }
                 };
@@ -385,12 +387,13 @@ impl ProjectStore {
                             true
                         }
                         Err(failure) => {
-                            tracing::warn!(
+                            tracing::trace!(
                                 segment = failure.at.segment,
                                 ordinal = failure.at.ordinal,
                                 error = %failure.error,
                                 "delta import failed; stopping replay at this point"
                             );
+                            replay_skipped += 1;
                             replay_error = Some(failure.error);
                             false
                         }
@@ -401,27 +404,37 @@ impl ProjectStore {
                     }
                     None => {
                         unknown_frames += 1;
-                        tracing::warn!(
+                        tracing::trace!(
                             segment = record.segment,
                             ordinal = record.ordinal,
-                            "unclassifiable journal frame skipped (future or torn frame)"
+                            error = "unclassifiable journal frame (future or torn)",
+                            "journal frame skipped"
                         );
+                        replay_skipped += 1;
                         true
                     }
                 }
             });
             if let Err(failure) = buffer.flush() {
-                tracing::warn!(
+                tracing::trace!(
                     segment = failure.at.segment,
                     ordinal = failure.at.ordinal,
                     error = %failure.error,
                     "delta import failed; stopping replay at this point"
                 );
+                replay_skipped += 1;
                 replay_error = replay_error.or(Some(failure.error));
             }
         }
         if let Some(error) = replay_error {
             return Err(error);
+        }
+        if replay_skipped > 0 {
+            tracing::warn!(
+                skipped = replay_skipped,
+                total = replayed + replay_skipped,
+                "journal replay skipped frames; store integrity unaffected"
+            );
         }
         if unknown_frames > 0 {
             tracing::warn!(
@@ -471,9 +484,8 @@ impl ProjectStore {
                 doc.free_history_cache();
                 doc.free_diff_calculator();
                 tracing::info!(
-                    root = %root.display(),
                     frontier = %timeline::encode_frontier(&head),
-                    "worktree head is behind the oplog tip; editing continues on its lineage"
+                    "worktree checked out behind oplog tip; edits continue on its lineage"
                 );
             }
         }
@@ -494,13 +506,13 @@ impl ProjectStore {
             );
         }
 
-        tracing::debug!(
+        tracing::info!(
             root = %root.display(),
             recovered_records = replayed,
             segments = journal.index,
             tracked_text_bytes,
             max_tracked_bytes,
-            "project store open"
+            "store opened"
         );
 
         let mut store = ProjectStore {
@@ -538,9 +550,8 @@ impl ProjectStore {
         // — the fresh baseline re-anchors every later open to it.
         if store.size_snapshot_due() {
             tracing::info!(
-                root = %root.display(),
                 bytes_since_snapshot = store.bytes_since_snapshot,
-                "journal tail past the newest snapshot exceeds one segment; compacting on open"
+                "compacting on open; journal tail exceeds one segment"
             );
             store.compact()?;
         }
@@ -1483,6 +1494,7 @@ impl ProjectStore {
         Ok(union.into_iter().map(|c| c.frontier).collect())
     }
 
+    #[tracing::instrument(skip_all, fields(root = %self.root.display()))]
     fn compact_inner(
         &mut self,
         trim: Option<(&loro::Frontiers, Vec<ledger::LedgerRecord>)>,

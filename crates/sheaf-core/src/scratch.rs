@@ -255,14 +255,14 @@ impl ScratchWriter {
         let line = match serde_json::to_string(rec) {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!(error = %e, "scratch record encode failed");
+                tracing::warn!(error = %e, "scratch record encode failed; record dropped");
                 return;
             }
         };
         let mut line = line.into_bytes();
         line.push(b'\n');
         if let Err(e) = seg.write_all(&line) {
-            tracing::warn!(error = %e, "scratch append failed");
+            tracing::warn!(error = %e, "scratch append failed; record dropped");
             return;
         }
         self.seg_bytes += line.len() as u64;
@@ -320,7 +320,11 @@ impl ScratchWriter {
             match std::fs::remove_file(&segments[i].1) {
                 Ok(()) => {
                     total = total.saturating_sub(sizes[i]);
-                    tracing::debug!(segment = %segments[i].1.display(), "scratch ring pruned oldest segment");
+                    tracing::debug!(
+                        segment = %segments[i].1.display(),
+                        dropped_bytes = sizes[i],
+                        "scratch segment pruned"
+                    );
                 }
                 Err(_) => break, // unreadable/undeletable: stop rather than loop
             }

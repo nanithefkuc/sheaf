@@ -882,7 +882,7 @@ impl GrepContentCache {
         let Ok(watermark) = serde_json::from_str::<GrepCacheWatermark>(&raw) else {
             // A corrupt watermark is a lagging watermark: ignore it and let
             // the next backfill rewrite it from row-level completeness.
-            tracing::warn!("timeline grep cache watermark unparseable; ignoring");
+            tracing::warn!("watermark ignored; parse failed");
             return;
         };
         if watermark.v != GREP_CACHE_SCHEMA {
@@ -1066,6 +1066,8 @@ impl GrepContentCache {
     ) -> (usize, usize) {
         let mut pending = Vec::new();
         let mut blobs_written = 0usize;
+        let mut publish_total = 0usize;
+        let mut publish_failed = 0usize;
         for (key, value) in rows {
             let mapping = Self::mapping_for(&value);
             let hash = match &mapping {
@@ -1084,17 +1086,23 @@ impl GrepContentCache {
             match self.persist_content(&mapping, &value) {
                 Ok(wrote) => blobs_written += wrote as usize,
                 Err(error) => {
-                    tracing::warn!(%error, path = key.1, "timeline grep content publish skipped");
+                    publish_total += 1;
+                    publish_failed += 1;
+                    tracing::trace!(%error, path = key.1, "grep content publish skipped");
                     continue;
                 }
             }
+            publish_total += 1;
             pending.push((key, mapping));
+        }
+        if publish_failed > 0 {
+            tracing::warn!(failed = publish_failed, total = publish_total, "grep content publish finished with failures");
         }
         if pending.is_empty() {
             return (0, blobs_written);
         }
         if let Err(error) = self.append_mappings(&pending) {
-            tracing::warn!(%error, "timeline grep mappings publish skipped");
+            tracing::warn!(%error, "mappings append failed; rows rederived on demand");
             return (0, blobs_written);
         }
         let written = pending.len();
@@ -1175,10 +1183,7 @@ impl GrepContentCache {
         match std::fs::remove_dir_all(&self.index_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(
-                %error,
-                "could not remove disposable timeline grep cache"
-            ),
+            Err(error) => tracing::warn!(%error, "cache wipe incomplete; directory removal failed"),
         }
         self.entries.clear();
         self.order.clear();
@@ -1242,7 +1247,7 @@ impl GrepContentCache {
             // Rewrite mappings.jsonl as the compacted survivor set (atomic
             // replace, so a crash leaves either the old or the new whole file).
             if let Err(error) = self.rewrite_mappings() {
-                tracing::warn!(%error, "grep cache retention sweep could not rewrite mappings; full wipe");
+                tracing::warn!(%error, phase = "rewrite_mappings", "grep cache retention sweep fell back to full wipe");
                 self.wipe();
                 return;
             }
@@ -1264,7 +1269,7 @@ impl GrepContentCache {
                     let file = match file {
                         Ok(file) => file,
                         Err(error) => {
-                            tracing::warn!(%error, "grep cache retention sweep could not enumerate content; full wipe");
+                            tracing::warn!(%error, phase = "enumerate_content", "grep cache retention sweep fell back to full wipe");
                             self.wipe();
                             return;
                         }
@@ -1273,7 +1278,7 @@ impl GrepContentCache {
                     let hash = name.strip_suffix(".zst").unwrap_or(&name);
                     if !referenced.contains(hash) {
                         if let Err(error) = std::fs::remove_file(file.path()) {
-                            tracing::warn!(%error, "grep cache retention sweep could not remove orphan content; full wipe");
+                            tracing::warn!(%error, phase = "remove_orphan", "grep cache retention sweep fell back to full wipe");
                             self.wipe();
                             return;
                         }
@@ -1282,7 +1287,7 @@ impl GrepContentCache {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(%error, "grep cache retention sweep could not read content directory; full wipe");
+                tracing::warn!(%error, phase = "read_content_dir", "grep cache retention sweep fell back to full wipe");
                 self.wipe();
                 return;
             }
@@ -1296,7 +1301,7 @@ impl GrepContentCache {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(%error, "grep cache retention sweep could not remove watermark; full wipe");
+                tracing::warn!(%error, phase = "remove_watermark", "grep cache retention sweep fell back to full wipe");
                 self.wipe();
                 return;
             }
@@ -1306,7 +1311,7 @@ impl GrepContentCache {
         // publication makes the targeted sweep incomplete, so fall back to a
         // full derived-cache wipe rather than retaining an old coverage set.
         if let Err(error) = self.rebuild_trigram_index() {
-            tracing::warn!(%error, "grep cache retention sweep could not rebuild trigram index; full wipe");
+            tracing::warn!(%error, phase = "rebuild_trigram", "grep cache retention sweep fell back to full wipe");
             self.wipe();
             return;
         }
@@ -1371,24 +1376,33 @@ impl GrepContentCache {
             updated_ms: chrono::Utc::now().timestamp_millis(),
         };
         if let Err(error) = self.store_watermark(&watermark) {
-            tracing::warn!(%error, "timeline grep watermark write failed; backfill repairs it");
+            tracing::warn!(%error, "grep cache watermark write failed; backfill repairs it");
             return;
         }
         self.watermark = Some(watermark);
     }
 
     pub(super) fn index_capture(&mut self, doc: &LoroDoc, capture: &Capture) {
-        let rows = capture
-            .paths
-            .iter()
-            .map(|path| match current_path_content(doc, path) {
-                Ok(content) => Some(((capture.frontier.clone(), path.clone()), content)),
-                Err(error) => {
-                    tracing::warn!(%error, path, "timeline grep capture indexing skipped");
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let rows = {
+            let mut failed = 0usize;
+            let rows = capture
+                .paths
+                .iter()
+                .map(|path| match current_path_content(doc, path) {
+                    Ok(content) => Some(((capture.frontier.clone(), path.clone()), content)),
+                    Err(error) => {
+                        failed += 1;
+                        tracing::trace!(%error, path, "grep capture indexing skipped");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            let total = capture.paths.len();
+            if failed > 0 {
+                tracing::warn!(failed, total, "grep capture indexing finished with failures");
+            }
+            rows
+        };
         let rows: Vec<_> = rows.into_iter().flatten().collect();
         let (written, _) = self.publish_rows(rows);
         if written == 0 && !self.capture_is_indexed(capture) {
@@ -3927,6 +3941,7 @@ impl ProjectStore {
         let mut chain_intact = true;
         let mut indexed_this_run: u32 = 0;
         let mut limit_hit = false;
+        let mut walk1_attempted = 0usize;
 
         for (position, capture) in lineage.iter().enumerate() {
             if budget_tripped(&started, opts.max_elapsed_ms) {
@@ -3948,6 +3963,7 @@ impl ProjectStore {
             match self.backfill_capture(&mut cache, &mut history, capture) {
                 Ok((rows, blobs)) => {
                     report.captures_indexed += 1;
+                    walk1_attempted += 1;
                     report.rows_written += rows;
                     report.content_blobs_written += blobs;
                     indexed_this_run += 1;
@@ -3961,7 +3977,7 @@ impl ProjectStore {
                                 .is_none_or(|w| !same_chain(w, &next))
                         {
                             if let Err(error) = cache.store_watermark(&next) {
-                                tracing::warn!(%error, "grep cache watermark write failed");
+                                tracing::warn!(%error, "grep cache watermark write failed; backfill repairs it");
                             } else {
                                 cache.watermark = Some(next);
                             }
@@ -3969,10 +3985,11 @@ impl ProjectStore {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(
+                    walk1_attempted += 1;
+                    tracing::trace!(
                         %error,
                         capture = capture.id,
-                        "grep cache backfill could not materialize a capture"
+                        "grep cache backfill capture materialization failed"
                     );
                     report.captures_failed += 1;
                     // Later captures can still receive valid rows, but the
@@ -3982,6 +3999,12 @@ impl ProjectStore {
                     covered = None;
                 }
             }
+        }
+        let walk1_failed = report.captures_failed;
+        if walk1_failed > 0 {
+            tracing::warn!(failed = walk1_failed, total = walk1_attempted, "grep cache backfill finished with failures");
+        } else if walk1_attempted > 0 {
+            tracing::debug!(total = walk1_attempted, "grep cache backfill complete");
         }
 
         // Walk 2 (only under `all`): divergent-branch captures the lineage
@@ -3997,6 +4020,7 @@ impl ProjectStore {
                 usize::MAX,
             )?;
             union.reverse();
+            let mut walk2_attempted = 0usize;
             for capture in &union {
                 if lineage_frontiers.contains(&capture.frontier) {
                     continue;
@@ -4017,19 +4041,27 @@ impl ProjectStore {
                 match self.backfill_capture(&mut cache, &mut history, capture) {
                     Ok((rows, blobs)) => {
                         report.captures_indexed += 1;
+                        walk2_attempted += 1;
                         report.rows_written += rows;
                         report.content_blobs_written += blobs;
                         indexed_this_run += 1;
                     }
                     Err(error) => {
-                        tracing::warn!(
+                        walk2_attempted += 1;
+                        tracing::trace!(
                             %error,
                             capture = capture.id,
-                            "grep cache backfill could not materialize a branch capture"
+                            "grep cache backfill branch capture materialization failed"
                         );
                         report.captures_failed += 1;
                     }
                 }
+            }
+            let walk2_failed = report.captures_failed - walk1_failed;
+            if walk2_failed > 0 {
+                tracing::warn!(failed = walk2_failed, total = walk2_attempted, "grep cache backfill finished with failures");
+            } else if walk2_attempted > 0 {
+                tracing::debug!(total = walk2_attempted, "grep cache backfill complete");
             }
         }
 
@@ -4040,7 +4072,7 @@ impl ProjectStore {
         if let Some(wm) = &covered {
             if cache.watermark.as_ref().is_none_or(|w| !same_chain(w, wm)) {
                 if let Err(error) = cache.store_watermark(wm) {
-                    tracing::warn!(%error, "grep cache watermark write failed");
+                    tracing::warn!(%error, "grep cache watermark write failed; backfill repairs it");
                 } else {
                     cache.watermark = Some(wm.clone());
                 }
@@ -4058,7 +4090,7 @@ impl ProjectStore {
             match cache.rebuild_trigram_index() {
                 Ok(size) => size,
                 Err(error) => {
-                    tracing::warn!(%error, "timeline grep trigram index write skipped");
+                    tracing::warn!(%error, "trigram index write failed; filter removed");
                     // A stale index remains sound only while every covered hash
                     // retains identical bytes, but removing it is simpler and
                     // preserves the stronger corruption contract: publication

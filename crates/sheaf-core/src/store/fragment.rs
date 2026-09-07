@@ -956,10 +956,8 @@ impl ProjectStore {
         tracing::info!(
             root = %self.root.display(),
             mode = ?fresh.mode,
-            files = written_paths.len(),
-            unchanged = fresh.unchanged,
-            resumed,
-            "fragment restore applied"
+            written = written_paths.len(),
+            "restore completed"
         );
 
         Ok(RestoreOutcome {

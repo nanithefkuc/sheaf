@@ -243,6 +243,8 @@ pub fn doctor_fix(root: &Path) -> Result<RepairOutcome> {
     let mut applied: Vec<AppliedFix> = Vec::new();
 
     // -- torn journal tails -------------------------------------------------
+    let mut truncate_attempts = 0usize;
+    let mut truncate_failures = 0usize;
     for (idx, path) in journal::list_segments(&sdir) {
         let len = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
@@ -250,6 +252,7 @@ pub fn doctor_fix(root: &Path) -> Result<RepairOutcome> {
         };
         match journal::scan_intact_prefix(&path) {
             Some(valid) if valid < len => {
+                truncate_attempts += 1;
                 match std::fs::OpenOptions::new().write(true).open(&path) {
                     Ok(f) => {
                         let truncated = f.set_len(valid).and_then(|()| f.sync_all());
@@ -261,18 +264,27 @@ pub fn doctor_fix(root: &Path) -> Result<RepairOutcome> {
                                 ),
                             }),
                             Err(e) => {
-                                tracing::warn!(segment = idx, error = %e, "truncate failed")
+                                truncate_failures += 1;
+                                tracing::trace!(segment = idx, error = %e, "journal tail truncate failed")
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(segment = idx, error = %e, "open for truncate failed")
+                        truncate_failures += 1;
+                        tracing::trace!(segment = idx, error = %e, "journal segment open failed")
                     }
                 }
             }
             // Unreadable framing is not a tail we can prove: refuse below.
             _ => {}
         }
+    }
+    if truncate_failures > 0 {
+        tracing::warn!(
+            failed = truncate_failures,
+            total = truncate_attempts,
+            "journal truncate repairs failed; continuing with the remaining repairs"
+        );
     }
 
     // -- superseded snapshots -------------------------------------------------
@@ -470,8 +482,11 @@ fn return_after_setup(
     for digest in &reachable {
         if !blobs::blob_path(&sdir, digest).exists() {
             missing += 1;
-            tracing::debug!(digest = %digest, "missing blob");
+            tracing::trace!(digest = %digest, "missing blob");
         }
+    }
+    if missing > 0 {
+        tracing::debug!(missing, "doctor found missing blobs");
     }
     checks.push(check(
         "blob_coverage",
@@ -898,6 +913,7 @@ fn listing(dir: &Path, suffix: &str) -> Vec<(u64, PathBuf)> {
 /// pre-GC state with a few orphans fewer. Retention trims are NOT executed
 /// here — they need the live writer — see [`gc_run_store`]; the plan's
 /// retention section is informational when reached through this path.
+#[tracing::instrument(skip_all, fields(root = %root.display()))]
 pub fn gc_apply(root: &Path, plan: &GcPlan) -> Result<GcReport> {
     let sdir = store_dir(root);
 
@@ -1109,7 +1125,7 @@ pub(super) fn plan_retention(
             if marked {
                 tracing::warn!(
                     reason = %p.reason,
-                    "explicit mark destroys this point's reachability protection (sanctioned bypass)"
+                    "explicit mark removes reachability protection; sanctioned bypass"
                 );
             }
             !marked
@@ -1182,7 +1198,7 @@ pub(super) fn plan_retention(
             }
             // A failed scan must not masquerade as "nothing prunable": the
             // plan would defer every mark with no hint as to why.
-            Err(e) => tracing::warn!(error = %e, "prunable-prefix scan failed"),
+            Err(e) => tracing::warn!(error = %e, "prunable-prefix scan failed; plan defers every mark"),
         }
     }
 
@@ -1299,11 +1315,13 @@ fn prunable_prefix(
     now: i64,
 ) -> Result<Vec<PrunableCapture>> {
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for capture in
         timeline::captures_from(doc, ledger, &doc.oplog_frontiers(), None, None, usize::MAX)?
     {
         let Ok(f) = timeline::decode_frontier(&capture.frontier) else {
-            tracing::warn!(capture = %capture.id, "undecodable frontier skipped in prune scan");
+            skipped += 1;
+            tracing::trace!(capture = %capture.id, "undecodable frontier skipped in prune scan");
             continue;
         };
         match doc.cmp_frontiers(&f, boundary) {
@@ -1313,7 +1331,8 @@ fn prunable_prefix(
                 // an Err means the comparison itself failed, which silently
                 // shrinks the plan and defers marks that should act — say so.
                 if let Err(e) = other {
-                    tracing::warn!(
+                    skipped += 1;
+                    tracing::trace!(
                         capture = %capture.id,
                         error = %e,
                         "frontier comparison failed in prune scan"
@@ -1340,6 +1359,9 @@ fn prunable_prefix(
             events: capture.events,
             cause,
         });
+    }
+    if skipped > 0 {
+        tracing::warn!(count = skipped, "prune scan skipped captures it could not compare");
     }
     out.sort_by_key(|c| c.at_ms);
     Ok(out)
