@@ -326,6 +326,7 @@ mod tests {
             checkpoints: Vec::new(),
             origin: None,
             on_current: true,
+            stats: None,
         }
     }
 
@@ -408,6 +409,7 @@ mod tests {
         let mut with_restore = capture("d", 4_000, &["src/a"]);
         with_restore.origin = Some(CaptureOrigin {
             kind: OriginKind::Restore,
+            source: None,
             target: None,
             scope: vec![],
             selections: Vec::new(),

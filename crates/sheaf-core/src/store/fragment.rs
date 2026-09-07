@@ -868,6 +868,7 @@ impl ProjectStore {
             ignore,
             Some(CaptureOrigin {
                 kind: OriginKind::PreRestore,
+                source: None,
                 target: None,
                 scope: checked.destination_paths(),
                 selections: Vec::new(),
@@ -1085,6 +1086,7 @@ impl ProjectStore {
             },
             Some(CaptureOrigin {
                 kind: OriginKind::FragmentRestore,
+                source: None,
                 target: None,
                 scope: written.to_vec(),
                 selections: plan.selection_ids(),
@@ -1122,6 +1124,7 @@ impl ProjectStore {
             ignore,
             Some(CaptureOrigin {
                 kind: OriginKind::PreRestore,
+                source: None,
                 target: None,
                 scope: plan.destination_paths(),
                 selections: Vec::new(),

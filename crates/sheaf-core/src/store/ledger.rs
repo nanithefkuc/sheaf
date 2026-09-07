@@ -94,6 +94,10 @@ pub enum LedgerRecord {
         events: usize,
         #[serde(default)]
         blobs: Vec<String>,
+        /// Aggregate churn (files/added/removed/binaries) computed once at
+        /// commit. Absent on captures written before stats recording existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<super::diff::CaptureStats>,
     },
     /// A checkpoint label. Ledger-native (v2); labels found in the legacy
     /// `_sheaf.meta` map of format-1 stores are merged in at read time.
@@ -290,6 +294,9 @@ pub struct CaptureRec {
     pub events: usize,
     #[serde(default)]
     pub blobs: Vec<String>,
+    /// Aggregate churn recorded at commit; `None` for pre-stats captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<super::diff::CaptureStats>,
 }
 
 /// Folded checkpoint label: the frontier it pins and the capture at that point.
@@ -347,6 +354,7 @@ impl LedgerState {
                 paths,
                 events,
                 blobs,
+                stats,
             } => {
                 self.captures.insert(
                     id,
@@ -356,6 +364,7 @@ impl LedgerState {
                         paths,
                         events,
                         blobs,
+                        stats,
                     },
                 );
             }
@@ -489,6 +498,12 @@ mod tests {
                 paths: vec!["src/a.rs".into()],
                 events: 3,
                 blobs: vec!["deadbeef".into()],
+                stats: Some(super::super::diff::CaptureStats {
+                    files: 1,
+                    added_lines: 4,
+                    removed_lines: 2,
+                    binaries: 0,
+                }),
             },
             LedgerRecord::Checkpoint {
                 name: "before refactoring".into(),
@@ -553,6 +568,7 @@ mod tests {
             paths: vec![],
             events: 1,
             blobs: vec!["d1".into()],
+            stats: None,
         });
         state.fold(LedgerRecord::Tombstone {
             capture_id: "c0".into(),
@@ -592,6 +608,7 @@ mod tests {
             paths: vec![],
             events: 0,
             blobs: vec![],
+            stats: None,
         };
         let mut payload = vec![TAG_CHECKPOINT];
         payload.extend_from_slice(&serde_json::to_vec(&capture).unwrap());
@@ -614,6 +631,7 @@ mod tests {
             paths: vec![],
             events: 2,
             blobs: vec!["x".into(), "y".into()],
+            stats: None,
         };
         assert_eq!(capture.summary(), "capture abcdef123456 blobs=2");
 
@@ -624,6 +642,7 @@ mod tests {
             paths: vec![],
             events: 0,
             blobs: vec![],
+            stats: None,
         };
         assert_eq!(
             short_id.summary(),
@@ -685,6 +704,7 @@ mod tests {
             paths: vec![],
             events: 1,
             blobs: vec!["b2".into(), "b1".into()],
+            stats: None,
         });
         state.fold(LedgerRecord::Capture {
             id: "c2".into(),
@@ -693,6 +713,7 @@ mod tests {
             paths: vec![],
             events: 1,
             blobs: vec!["b3".into()],
+            stats: None,
         });
         state.fold(LedgerRecord::Tombstone {
             capture_id: "c2".into(),

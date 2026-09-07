@@ -1140,6 +1140,7 @@ impl ProjectStore {
             ignore,
             Some(CaptureOrigin {
                 kind: OriginKind::PreRestore,
+                source: None,
                 target: plan.target.capture_id.clone(),
                 scope: plan.scope.clone(),
                 selections: Vec::new(),
@@ -1452,6 +1453,7 @@ impl ProjectStore {
             },
             Some(CaptureOrigin {
                 kind: OriginKind::Restore,
+                source: None,
                 target: plan.target.capture_id.clone(),
                 scope: plan.scope.clone(),
                 selections: Vec::new(),
@@ -1486,6 +1488,7 @@ impl ProjectStore {
             },
             Some(CaptureOrigin {
                 kind: OriginKind::PreRestore,
+                source: None,
                 target: None,
                 scope: vec![key.to_owned()],
                 selections: Vec::new(),

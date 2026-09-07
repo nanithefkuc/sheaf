@@ -1360,7 +1360,13 @@ fn retention_aware_reachable_blobs(
     retention: &RetentionFacts,
 ) -> BTreeSet<String> {
     let mut reachable = reachable_blob_digests(doc);
-    if retention.prunable.is_empty() {
+    // The relaxation matters whenever a trim has ever run: tombstoned
+    // captures no longer bound survivability, so mentions that predate the
+    // earliest surviving capture are droppable. Gating on a non-empty
+    // prunable list alone strands every digest the trimmed captures named:
+    // tree_events (preserved whole by the shallow boundary snapshot) keeps
+    // mentioning them forever, and post-trim prunable is always empty.
+    if retention.prunable.is_empty() && ledger.tombstones.is_empty() {
         return reachable;
     }
     let mut min_surviving_ms = i64::MAX;

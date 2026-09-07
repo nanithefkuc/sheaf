@@ -63,6 +63,12 @@ pub enum SheafError {
     #[error("timeline merge conflict: {0}")]
     TimelineMergeConflict(String),
 
+    #[error("editor integration does not support this buffer: {0}")]
+    EditorUnsupported(String),
+
+    #[error("editor history is stale: {0}")]
+    EditorStale(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -93,6 +99,8 @@ impl SheafError {
             SheafError::RestoreObstructed(_) => "restore.obstructed",
             SheafError::MergePlanStale(_) => "merge.plan_stale",
             SheafError::TimelineMergeConflict(_) => "merge.conflict",
+            SheafError::EditorUnsupported(_) => "editor.unsupported",
+            SheafError::EditorStale(_) => "editor.stale",
 
             SheafError::Other(_) => "internal",
         }
@@ -157,6 +165,11 @@ mod tests {
                 SheafError::TimelineMergeConflict("both changed".into()),
                 "merge.conflict",
             ),
+            (
+                SheafError::EditorUnsupported("binary".into()),
+                "editor.unsupported",
+            ),
+            (SheafError::EditorStale("changed".into()), "editor.stale"),
             (SheafError::Other("misc".into()), "internal"),
         ];
         for (err, code) in cases {

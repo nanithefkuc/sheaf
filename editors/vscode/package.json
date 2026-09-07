@@ -1,0 +1,81 @@
+{
+  "name": "sheaf",
+  "displayName": "Sheaf",
+  "description": "Persistent editor-buffer capture and native-first Ctrl+Z fall-through into Sheaf text history.",
+  "publisher": "nanithefkuc",
+  "version": "0.1.0",
+  "type": "commonjs",
+  "license": "MIT",
+  "main": "./out/extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "sheaf.undo",
+        "title": "Sheaf: Undo"
+      },
+      {
+        "command": "sheaf.redo",
+        "title": "Sheaf: Redo"
+      },
+      {
+        "command": "sheaf.reconnect",
+        "title": "Sheaf: Reconnect"
+      },
+      {
+        "command": "sheaf.showOutput",
+        "title": "Sheaf: Show Output"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "sheaf.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "editorTextFocus && !editorReadonly && sheaf.editorActive"
+      },
+      {
+        "command": "sheaf.redo",
+        "key": "ctrl+shift+z",
+        "mac": "cmd+shift+z",
+        "when": "editorTextFocus && !editorReadonly && sheaf.editorActive"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "test:unit": "npm run compile && node --test out/test/unit/*.test.js",
+    "test:integration": "npm run compile && vscode-test --label integration",
+    "package": "npm run compile && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-cli": "^0.0.6",
+    "@vscode/test-electron": "^2.3.9",
+    "@vscode/vsce": "^2.24.0",
+    "mocha": "^10.3.0",
+    "typescript": "^5.4.0"
+  }
+}

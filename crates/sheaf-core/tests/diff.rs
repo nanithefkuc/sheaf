@@ -330,3 +330,62 @@ fn diff_bad_references_fail_closed() {
         .unwrap_err();
     assert_eq!(err.code(), "state.bad_reference");
 }
+
+#[test]
+fn recorded_capture_stats_match_the_authoritative_diff() {
+    // The summary `log` renders comes from churn recorded once at commit. It
+    // must agree, capture for capture, with the on-demand parent diff `info`
+    // computes — otherwise the two views of the same history disagree.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    skeleton(root);
+    let mut store = ProjectStore::open(root, limits()).unwrap();
+
+    // Add two text files and a binary.
+    write(
+        root,
+        "src/lib.rs",
+        b"fn one() {}\nfn two() {}\nfn three() {}\n",
+    );
+    write(root, "README.md", b"a\nb\n");
+    write(root, "img.bin", &[0xff, 0xfe, 0x00]);
+    capture_now(&mut store);
+    // Modify one, delete one, rewrite the binary.
+    write(
+        root,
+        "src/lib.rs",
+        b"fn one() {}\nfn TWO() {}\nfn three() {}\n",
+    );
+    std::fs::remove_file(root.join("README.md")).unwrap();
+    write(root, "img.bin", &[0x94, 0x94, 0x94, 0x94]);
+    capture_now(&mut store);
+
+    let captures = store.captures(false, None, false, 50).unwrap();
+    assert!(captures.len() >= 2, "expected two captures");
+    for capture in &captures {
+        let recorded = capture
+            .stats
+            .unwrap_or_else(|| panic!("capture {} recorded no stats", capture.short_id()));
+        let authoritative = store.capture_info(&capture.id).unwrap().diff.stats();
+        assert_eq!(
+            recorded,
+            authoritative,
+            "recorded stats disagree with the parent diff for {}",
+            capture.short_id()
+        );
+    }
+    // Spot-check the newest capture's numbers: three files (one modified text,
+    // one deleted text, one modified binary), one binary. The differ scores
+    // line churn only when both sides are text, so the delete and the binary
+    // add no line counts — leaving the modified text file's +1 -1.
+    let newest = captures.first().unwrap().stats.unwrap();
+    assert_eq!(newest.files, 3);
+    assert_eq!(newest.binaries, 1);
+    assert_eq!((newest.added_lines, newest.removed_lines), (1, 1));
+
+    // Degraded reader reads the same recorded stats without a daemon.
+    drop(store);
+    let reader = TimelineReader::open(root).unwrap();
+    let via_reader = reader.captures(false, None, false, 50).unwrap();
+    assert_eq!(via_reader.first().unwrap().stats, Some(newest));
+}

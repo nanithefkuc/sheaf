@@ -1293,6 +1293,10 @@ struct LogArgs<'a> {
 
 fn cmd_log(args: LogArgs<'_>) -> CliResult {
     let root = timeline_root(args.project)?;
+    // The default summary reads churn recorded on each capture; only the
+    // per-file breakdown (-v) and the full patch (-p) need the daemon to
+    // re-materialize deltas, so they are the only opt-ins that fetch details.
+    let want_details = args.verbose || args.patch;
     let params = serde_json::json!({
         "branch": args.branch,
         "path": args.path.map(|p| p.to_string_lossy().to_string()),
@@ -1300,9 +1304,8 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
         "all": false,
         "before": args.before,
         "limit": args.limit,
-        "details": !args.as_json,
+        "details": want_details,
         "patch": args.patch,
-        "omit_paths": !args.as_json,
     });
     let socket = sheaf_core::paths::control_socket_path();
     let (entries, details, patches, tips, degraded) = match Client::connect(
@@ -1310,7 +1313,7 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
         Duration::from_secs(2),
     ) {
         Ok(mut client) => {
-            if args.branch.is_some() || !args.as_json {
+            if args.branch.is_some() || want_details {
                 let ping = client.call("ping", Some(&root), serde_json::json!({}), None)?;
                 let capabilities = ping
                     .response
@@ -1324,19 +1327,22 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
                             .any(|capability| capability.as_str() == Some(name))
                     })
                 };
-                let required = if args.branch.is_some() {
-                    "timeline.log.branch"
-                } else {
-                    "timeline.log.details"
-                };
-                if !has(required) || (!args.as_json && !has("timeline.log.details")) {
+                if args.branch.is_some() && !has("timeline.log.branch") {
                     return Err(anyhow::anyhow!(
-                            "running sheafd lacks the detailed branch log; rebuild/reinstall and restart sheafd"
-                        )
-                        .into());
+                        "running sheafd lacks branch-scoped log; rebuild/reinstall and restart sheafd"
+                    )
+                    .into());
                 }
+                if want_details && !has("timeline.log.details") {
+                    return Err(anyhow::anyhow!(
+                        "running sheafd lacks the detailed log; rebuild/reinstall and restart sheafd"
+                    )
+                    .into());
+                }
+                // A page of exact per-file deltas can outlast the handshake
+                // deadline on a long history; the summary path never does.
+                client.set_timeout(Duration::from_secs(35))?;
             }
-            client.set_timeout(Duration::from_secs(35))?;
             let reply = client.call("timeline.log", Some(&root), params, None)?;
             if !reply.response.ok {
                 return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
@@ -1349,9 +1355,7 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
                 .get("tips")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1) as usize;
-            let (details, patches) = if args.as_json {
-                (Vec::new(), Vec::new())
-            } else {
+            let (details, patches) = if want_details {
                 let body: serde_json::Value = serde_json::from_slice(&reply.body)
                     .context("daemon returned invalid timeline details")?;
                 let details =
@@ -1361,6 +1365,8 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
                     serde_json::from_value(body.get("patches").cloned().unwrap_or_default())
                         .context("daemon returned invalid capture patches")?;
                 (details, patches)
+            } else {
+                (Vec::new(), Vec::new())
             };
             (entries, details, patches, tips, false)
         }
@@ -1410,13 +1416,13 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
                 entries.drain(..=pos);
                 entries.truncate(args.limit);
             }
-            let details = if args.as_json {
-                Vec::new()
-            } else {
+            let details = if want_details {
                 entries
                     .iter()
                     .map(|entry| reader.capture_log_detail(&entry.id))
                     .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
             };
             let patches = if args.patch {
                 details
@@ -1448,15 +1454,16 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
     if degraded {
         eprintln!("note: daemon unavailable; showing a read-only store snapshot");
     }
-    if details.len() != entries.len() || (args.patch && patches.len() != entries.len()) {
+    if want_details
+        && (details.len() != entries.len() || (args.patch && patches.len() != entries.len()))
+    {
         return Err(anyhow::anyhow!("daemon returned an incomplete timeline detail page").into());
     }
 
     let color_on = args.color.enabled(std::io::stdout().is_terminal());
     let now_ms = Utc::now().timestamp_millis();
     let show_relative_refs = args.branch.is_none() && args.path.is_none() && args.before.is_none();
-    for index in (0..details.len()).rev() {
-        let info = &details[index];
+    for index in (0..entries.len()).rev() {
         let capture = &entries[index];
         let position = if show_relative_refs {
             if index == 0 {
@@ -1475,17 +1482,17 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
             paint(color_on, "36", capture.short_id()),
             paint(color_on, "1;32", &position),
             paint(color_on, "2", &when),
-            capture_summary(info),
+            capture_summary(capture),
         );
-        if args.verbose || args.patch {
-            match &info.diff {
+        if want_details {
+            match details[index].diff.as_ref() {
                 Some(diff) => {
                     for change in &diff.entries {
                         print_log_change(change, color_on);
                     }
                 }
                 None => {
-                    for path in &info.capture.paths {
+                    for path in &capture.paths {
                         println!("  ? {path}");
                     }
                 }
@@ -1517,38 +1524,40 @@ fn cmd_log(args: LogArgs<'_>) -> CliResult {
     Ok(())
 }
 
-fn capture_summary(detail: &sheaf_core::store::CaptureLogDetail) -> String {
-    use sheaf_core::store::SideContent;
-    let Some(diff) = &detail.diff else {
-        let paths = detail.capture.paths.len();
+fn capture_summary(capture: &sheaf_core::store::Capture) -> String {
+    let Some(stats) = capture.stats else {
+        // Pre-stats capture: churn was never recorded. Fall back to the cheap
+        // path count the capture already carries; never re-diff to fill it in.
+        let paths = capture.paths.len();
+        if paths == 0 {
+            return "metadata only".to_owned();
+        }
         return format!(
-            "details pruned ({paths} recorded {})",
+            "{paths} {} (churn unavailable)",
             if paths == 1 { "path" } else { "paths" }
         );
     };
-    let files = diff.entries.len();
-    if files == 0 {
+    if stats.files == 0 {
         return "metadata only".to_owned();
     }
-    let added: usize = diff.entries.iter().map(|entry| entry.added_lines).sum();
-    let removed: usize = diff.entries.iter().map(|entry| entry.removed_lines).sum();
-    let binaries = diff
-        .entries
-        .iter()
-        .filter(|entry| {
-            matches!(entry.old, SideContent::Binary { .. })
-                || matches!(entry.new, SideContent::Binary { .. })
-        })
-        .count();
-    let mut summary = format!("{files} {}", if files == 1 { "file" } else { "files" });
-    if binaries > 0 {
+    let mut summary = format!(
+        "{} {}",
+        stats.files,
+        if stats.files == 1 { "file" } else { "files" }
+    );
+    if stats.binaries > 0 {
         summary.push_str(&format!(
-            ", {binaries} {}",
-            if binaries == 1 { "binary" } else { "binaries" }
+            ", {} {}",
+            stats.binaries,
+            if stats.binaries == 1 {
+                "binary"
+            } else {
+                "binaries"
+            }
         ));
     }
-    if added > 0 || removed > 0 {
-        summary.push_str(&format!(" +{added} -{removed}"));
+    if stats.added_lines > 0 || stats.removed_lines > 0 {
+        summary.push_str(&format!(" +{} -{}", stats.added_lines, stats.removed_lines));
     }
     summary
 }
@@ -2815,13 +2824,22 @@ fn node_text(node: &sheaf_core::store::GraphNode, color_on: bool) -> String {
     }
     if let Some(origin) = &node.capture.origin {
         let label = match origin.kind {
-            OriginKind::Restore => Some("restore"),
-            OriginKind::PreRestore => Some("pre-restore"),
-            OriginKind::FragmentRestore => Some("fragment-restore"),
+            OriginKind::Restore => Some("restore".to_owned()),
+            OriginKind::PreRestore => Some("pre-restore".to_owned()),
+            OriginKind::FragmentRestore => Some("fragment-restore".to_owned()),
             OriginKind::Merge => None,
+            OriginKind::Editor => Some("editor".to_owned()),
+            OriginKind::EditorUndo => Some(match &origin.target {
+                Some(target) => format!("editor undo \u{2192} {}", short(target)),
+                None => "editor undo".to_owned(),
+            }),
+            OriginKind::EditorRedo => Some(match &origin.target {
+                Some(target) => format!("editor redo \u{2192} {}", short(target)),
+                None => "editor redo".to_owned(),
+            }),
         };
         if let Some(label) = label {
-            parts.push(paint(color_on, "2", label));
+            parts.push(paint(color_on, "2", &label));
         }
     }
     let when = DateTime::<Utc>::from_timestamp_millis(node.capture.timestamp_ms)
@@ -3682,6 +3700,15 @@ fn origin_suffix(origin: Option<&sheaf_core::store::CaptureOrigin>) -> String {
         OriginKind::Merge => match &origin.target {
             Some(source) => format!("   [merge \u{2190} {}]", short(source)),
             None => "   [merge]".to_owned(),
+        },
+        OriginKind::Editor => "   [editor]".to_owned(),
+        OriginKind::EditorUndo => match &origin.target {
+            Some(target) => format!("   [editor undo \u{2192} {}]", short(target)),
+            None => "   [editor undo]".to_owned(),
+        },
+        OriginKind::EditorRedo => match &origin.target {
+            Some(target) => format!("   [editor redo \u{2192} {}]", short(target)),
+            None => "   [editor redo]".to_owned(),
         },
     }
 }
@@ -6728,6 +6755,7 @@ mod output_and_argument_tests {
         assert_eq!(
             origin_suffix(Some(&CaptureOrigin {
                 kind: OriginKind::Restore,
+                source: None,
                 target: Some("1234567890abcdef".into()),
                 scope: vec![],
                 selections: vec![],
@@ -6737,6 +6765,7 @@ mod output_and_argument_tests {
         assert_eq!(
             origin_suffix(Some(&CaptureOrigin {
                 kind: OriginKind::Restore,
+                source: None,
                 target: None,
                 scope: vec![],
                 selections: vec![],
@@ -6746,6 +6775,7 @@ mod output_and_argument_tests {
         assert_eq!(
             origin_suffix(Some(&CaptureOrigin {
                 kind: OriginKind::PreRestore,
+                source: None,
                 target: None,
                 scope: vec![],
                 selections: vec![],
@@ -6755,6 +6785,7 @@ mod output_and_argument_tests {
         assert_eq!(
             origin_suffix(Some(&CaptureOrigin {
                 kind: OriginKind::FragmentRestore,
+                source: None,
                 target: None,
                 scope: vec![],
                 selections: vec![],
@@ -6959,6 +6990,7 @@ mod output_and_argument_tests {
         );
         assert!(origin_suffix(Some(&CaptureOrigin {
             kind: OriginKind::FragmentRestore,
+            source: None,
             target: None,
             scope: vec![],
             selections: vec!["selection-123456789".into()],
@@ -7449,6 +7481,7 @@ mod branch_graph_tests {
             checkpoints: vec![],
             origin: None,
             on_current,
+            stats: None,
         }
     }
 
@@ -7511,6 +7544,7 @@ mod branch_graph_tests {
                 let mut capture = cap("mmmmmmmmmmmm", "fM", "f2", true);
                 capture.origin = Some(CaptureOrigin {
                     kind: OriginKind::Merge,
+                    source: None,
                     target: Some("s2s2s2s2s2s2".to_owned()),
                     scope: vec![],
                     selections: vec![],
@@ -7554,6 +7588,7 @@ mod branch_graph_tests {
         capture.checkpoints = vec!["release".to_owned()];
         capture.origin = Some(CaptureOrigin {
             kind: OriginKind::Restore,
+            source: None,
             target: None,
             scope: vec![],
             selections: vec![],

@@ -431,6 +431,7 @@ impl ProjectStore {
             },
             Some(CaptureOrigin {
                 kind: OriginKind::Merge,
+                source: None,
                 target: plan.source.capture_id.clone(),
                 scope: plan
                     .actions

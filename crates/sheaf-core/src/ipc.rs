@@ -64,7 +64,11 @@ pub const PROTO_MAJOR: u32 = 1;
 /// Minor 13: `timeline.log` accepts a named `branch`, and its opt-in
 /// `details`/`patch` view streams exact parent deltas in the response body.
 /// The ordinary JSON capture page remains unchanged. Additive.
-pub const PROTO_MINOR: u32 = 13;
+///
+/// Minor 14: request envelopes may announce counted upload chunks, and
+/// `project.resolve`, `editor.capture`, and `editor.step` join the catalog.
+/// Additive only; editor clients gate uploads on the advertised capabilities.
+pub const PROTO_MINOR: u32 = 14;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;
@@ -83,6 +87,9 @@ pub struct Request {
     pub project: Option<PathBuf>,
     #[serde(default)]
     pub params: Value,
+    /// Counted raw-byte continuation frames following this envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyInfo>,
 }
 
 /// A structured error carried in a failed response: a stable machine code
@@ -243,14 +250,7 @@ impl Client {
         params: Value,
         body: Option<&[u8]>,
     ) -> Result<Reply> {
-        let id = self.send_request(method, project, params)?;
-        if let Some(bytes) = body {
-            // Chunked upload mirrors download framing (reserved; unused v1).
-            let mut w = &self.stream;
-            for c in bytes.chunks(MAX_CHUNK.max(1)) {
-                write_frame(&mut w, c, MAX_CHUNK)?;
-            }
-        }
+        let id = self.send_request(method, project, params, body)?;
 
         loop {
             let resp = self.read_envelope()?;
@@ -290,7 +290,7 @@ impl Client {
         params: Value,
         on_chunk: &mut dyn FnMut(&[u8]),
     ) -> Result<Reply> {
-        let id = self.send_request(method, project, params)?;
+        let id = self.send_request(method, project, params, None)?;
 
         loop {
             let resp = self.read_envelope()?;
@@ -367,7 +367,20 @@ impl Client {
         method: &str,
         project: Option<&Path>,
         params: Value,
+        body: Option<&[u8]>,
     ) -> Result<String> {
+        let chunks = match body {
+            Some(bytes) if bytes.len() > MAX_ENVELOPE => {
+                return Err(SheafError::Ipc(format!(
+                    "request body is {} bytes, over the {MAX_ENVELOPE}-byte cap",
+                    bytes.len()
+                )));
+            }
+            Some(bytes) => Some(BodyInfo {
+                chunks: bytes.len().div_ceil(MAX_CHUNK) as u32,
+            }),
+            None => None,
+        };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed).to_string();
         let req = Request {
             v: PROTO_MAJOR,
@@ -375,11 +388,17 @@ impl Client {
             method: method.to_string(),
             project: project.map(|p| p.to_path_buf()),
             params,
+            body: chunks,
         };
         let payload = serde_json::to_vec(&req)
             .map_err(|e| SheafError::Ipc(format!("serialize request: {e}")))?;
         let mut w = &self.stream;
         write_frame(&mut w, &payload, MAX_ENVELOPE)?;
+        if let Some(bytes) = body {
+            for chunk in bytes.chunks(MAX_CHUNK) {
+                write_frame(&mut w, chunk, MAX_CHUNK)?;
+            }
+        }
         Ok(id)
     }
 
@@ -606,7 +625,9 @@ mod tests {
         let upload: Vec<u8> = vec![7u8; MAX_CHUNK + 7]; // forces 2 upload frames
         let up = upload.clone();
         let server = serve_one(listener, move |req, stream| {
-            let req = req_id(req);
+            let parsed: Request = serde_json::from_slice(req).unwrap();
+            assert_eq!(parsed.body.as_ref().unwrap().chunks, 2);
+            let req = parsed.id;
             // The request body arrived as MAX_CHUNK-sized continuation frames.
             let a = read_frame(stream, MAX_CHUNK).unwrap();
             let b = read_frame(stream, MAX_CHUNK).unwrap();
@@ -632,6 +653,22 @@ mod tests {
         assert!(reply.response.ok);
         assert_eq!(reply.response.result.unwrap()["accepted"], true);
         assert_eq!(reply.body, b"alpha-omega");
+    }
+
+    #[test]
+    fn call_distinguishes_absent_and_explicitly_empty_request_bodies() {
+        for (body, expected) in [(None, None), (Some(&[][..]), Some(0))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (path, listener) = bind_socket(tmp.path());
+            let server = serve_one(listener, move |req, stream| {
+                let parsed: Request = serde_json::from_slice(req).unwrap();
+                assert_eq!(parsed.body.map(|info| info.chunks), expected);
+                write_env(stream, &Response::ok(parsed.id, Value::Null));
+            });
+            let mut client = Client::connect(&path, Duration::from_secs(5)).unwrap();
+            client.call("ping", None, Value::Null, body).unwrap();
+            server.join().unwrap();
+        }
     }
 
     #[test]

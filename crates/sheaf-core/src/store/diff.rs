@@ -98,6 +98,17 @@ pub struct SideDesc {
     pub frontier: Option<String>,
 }
 
+/// Aggregate churn for one comparison: changed-file count, total line
+/// additions and removals, and how many of those files are binary. Recorded
+/// once per capture so `log` can render a summary without re-diffing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureStats {
+    pub files: usize,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub binaries: usize,
+}
+
 /// Full result of a diff: the two sides described, every changed file, and
 /// whether the comparison ran in read-only degraded mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +124,26 @@ impl DiffOutcome {
     /// True when the two sides are identical (no changed files).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Aggregate churn across every changed file. This is the authoritative
+    /// source for a capture's summary line; recording it at capture time lets
+    /// `log` avoid re-materializing each parent diff.
+    pub fn stats(&self) -> CaptureStats {
+        let mut stats = CaptureStats {
+            files: self.entries.len(),
+            ..CaptureStats::default()
+        };
+        for entry in &self.entries {
+            stats.added_lines += entry.added_lines;
+            stats.removed_lines += entry.removed_lines;
+            if matches!(entry.old, SideContent::Binary { .. })
+                || matches!(entry.new, SideContent::Binary { .. })
+            {
+                stats.binaries += 1;
+            }
+        }
+        stats
     }
 
     /// Git-shaped unified patch for the whole comparison.

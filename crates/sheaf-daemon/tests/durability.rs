@@ -1062,3 +1062,133 @@ fn project_status_surfaces_pending_restore_intents() {
     std::fs::remove_file(state.join("restore.intent")).unwrap();
     daemon.shutdown();
 }
+
+#[test]
+fn editor_capture_and_step_carry_unsaved_text_over_the_socket() {
+    let guard = EnvGuard::new("editor-capture");
+    let socket = guard.socket();
+    let root = guard.project();
+    write_file(&root, "note.txt", "one\n".into());
+
+    let daemon = Daemon::spawn(socket.clone());
+    enroll(&socket, &root);
+    wait_ready(&socket, &root, Duration::from_secs(10));
+    wait_for_captures(&socket, &root, 1, Duration::from_secs(10));
+
+    let mut client = Client::connect(&socket, Duration::from_secs(5)).unwrap();
+
+    // project.resolve reports the eligible file with its watch cadence.
+    let file = root.join("note.txt");
+    let resolved = call(
+        &mut client,
+        "project.resolve",
+        None,
+        serde_json::json!({ "path": file.to_str().unwrap() }),
+    );
+    assert_eq!(resolved["relative_path"], "note.txt");
+    assert_eq!(resolved["eligibility"]["supported"], true);
+    assert_eq!(resolved["eligibility"]["class"], "durable");
+    assert!(resolved["watch"]["debounce_ms"].is_u64());
+
+    // An unsaved editor buffer is captured without touching the disk file.
+    let base = sheaf_core::store::hash_of(b"one\n");
+    let reply = client
+        .call(
+            "editor.capture",
+            Some(&root),
+            serde_json::json!({
+                "path": "note.txt",
+                "kind": "edit",
+                "base_sha256": base,
+                "saved_sha256": null,
+                "source": null,
+                "target": null,
+            }),
+            Some(b"one two\n"),
+        )
+        .unwrap();
+    assert!(reply.response.ok, "{:?}", reply.response.error);
+    let result = reply.response.result.unwrap();
+    assert_eq!(result["recorded"], true);
+    assert_eq!(result["rebased"], false);
+    let cursor = result["cursor"].as_str().unwrap().to_owned();
+    assert_eq!(
+        result["content_sha256"],
+        sheaf_core::store::hash_of(b"one two\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "one\n",
+        "the disk file must be untouched by the editor capture"
+    );
+
+    // editor.step undo returns the exact previous UTF-8 text as a body.
+    let step = client
+        .call(
+            "editor.step",
+            Some(&root),
+            serde_json::json!({
+                "path": "note.txt",
+                "cursor": cursor,
+                "direction": "undo",
+                "current_sha256": sheaf_core::store::hash_of(b"one two\n"),
+            }),
+            None,
+        )
+        .unwrap();
+    assert!(step.response.ok, "{:?}", step.response.error);
+    assert_eq!(step.response.result.unwrap()["changed"], true);
+    assert_eq!(step.body, b"one\n");
+
+    // A stale current digest is rejected, never answered with wrong text.
+    let stale = client
+        .call(
+            "editor.step",
+            Some(&root),
+            serde_json::json!({
+                "path": "note.txt",
+                "cursor": cursor,
+                "direction": "undo",
+                "current_sha256": sheaf_core::store::hash_of(b"stale\n"),
+            }),
+            None,
+        )
+        .unwrap();
+    assert!(!stale.response.ok);
+    assert_eq!(
+        stale.response.error.as_ref().map(|e| e.code.as_str()),
+        Some("editor.stale")
+    );
+
+    daemon.shutdown();
+}
+
+#[test]
+fn editor_capture_rejects_a_streamed_request_body() {
+    let guard = EnvGuard::new("editor-badbody");
+    let socket = guard.socket();
+    let root = guard.project();
+    write_file(&root, "note.txt", "one\n".into());
+
+    let daemon = Daemon::spawn(socket.clone());
+    enroll(&socket, &root);
+    wait_ready(&socket, &root, Duration::from_secs(10));
+
+    // A non-editor method that receives a body is refused as bad.request.
+    let mut client = Client::connect(&socket, Duration::from_secs(5)).unwrap();
+    let reply = client
+        .call(
+            "project.status",
+            Some(&root),
+            serde_json::json!({}),
+            Some(b"unexpected"),
+        )
+        .unwrap();
+    assert!(!reply.response.ok);
+    assert_eq!(
+        reply.response.error.as_ref().map(|e| e.code.as_str()),
+        Some("bad.request")
+    );
+
+    daemon.shutdown();
+}

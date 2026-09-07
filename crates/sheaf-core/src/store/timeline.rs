@@ -53,11 +53,20 @@ pub enum OriginKind {
     FragmentRestore,
     /// A divergent source branch squashed onto the active worktree.
     Merge,
+    /// A normal unsaved editor-buffer burst.
+    Editor,
+    /// Persistent editor traversal to an older logical text state.
+    EditorUndo,
+    /// Persistent editor traversal to a newer client-held logical text state.
+    EditorRedo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureOrigin {
     pub kind: OriginKind,
+    /// Logical editor cursor before this capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Capture the restore targeted, when that point names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -92,6 +101,11 @@ pub struct Capture {
     /// where abandoned futures interleave with live history.
     #[serde(default)]
     pub on_current: bool,
+    /// Aggregate churn recorded at commit; `None` for captures written before
+    /// stats recording (rendered with a metadata-only fallback). Populated
+    /// from the ledger during lineage walks, not carried in the commit message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<super::diff::CaptureStats>,
 }
 
 impl Capture {
@@ -919,11 +933,13 @@ pub(super) fn captures_from(
     let mut out = Vec::new();
     let ids: Vec<ID> = start.iter().collect();
     doc.travel_change_ancestors(&ids, &mut |change| {
-        if let Some(capture) = capture_from_change(change) {
+        if let Some(mut capture) = capture_from_change(change) {
             // Tombstoned captures are not part of the navigable timeline:
             // `@~N`, time resolution, and lineage walks count
             // only what is still restorable.
             if !ledger.is_tombstoned(&capture.id) && capture_matches(&capture, path, follow_names) {
+                // Churn lives in the ledger record, not the commit message.
+                capture.stats = ledger.captures.get(&capture.id).and_then(|rec| rec.stats);
                 out.push(capture);
             }
         }
@@ -1089,6 +1105,7 @@ fn capture_from_change(change: loro::ChangeMeta) -> Option<Capture> {
         checkpoints: Vec::new(),
         origin: meta.origin,
         on_current: true,
+        stats: None,
     })
 }
 
@@ -1963,6 +1980,7 @@ mod tests {
             checkpoints: Vec::new(),
             origin: None,
             on_current: true,
+            stats: None,
         }
     }
 

@@ -12,6 +12,7 @@
 
 mod blobs;
 mod diff;
+mod editor;
 mod fragment;
 mod frames;
 mod fsutil;
@@ -45,7 +46,7 @@ pub fn atomic_write_public(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 pub use blobs::hash_of;
-pub use diff::{DiffKind, DiffOutcome, FileDiff, SideContent, SideDesc};
+pub use diff::{CaptureStats, DiffKind, DiffOutcome, FileDiff, SideContent, SideDesc};
 pub use fragment::{
     FragmentAction, FragmentActionKind, FragmentCondition, FragmentConflict, FragmentFilePlan,
     FragmentMode, FragmentPlan, FragmentRange,
@@ -254,6 +255,8 @@ pub struct ProjectStore {
     /// hard admission bound; overflow takes the recoverable blob path.
     tracked_text_bytes: u64,
     max_tracked_bytes: u64,
+    /// Saved editor-buffer digests that suppress delayed filesystem save echoes.
+    saved_editor_digests: BTreeMap<PathBuf, editor::SavedBufferDigest>,
     /// Non-UTF-8 paths already complained about, so a build tool that keeps
     /// such a file hot does not flood the log. Keys are lossy renderings —
     /// they are for de-duplication only, never for tracking.
@@ -525,6 +528,7 @@ impl ProjectStore {
             pending_blobs: Vec::new(),
             tracked_text_bytes,
             max_tracked_bytes,
+            saved_editor_digests: BTreeMap::new(),
             warned_keys: BTreeSet::new(),
             grep_content_cache: RefCell::new(grep::GrepContentCache::open(root, true)),
         };
@@ -696,20 +700,7 @@ impl ProjectStore {
         // Branch labels follow the exact worktree head they named before this
         // batch. The global tips snapshot also tells us whether this capture
         // creates a new divergent lineage that needs automatic names.
-        let (branch_parent, prior_branch_tips) = if self.num_edits == 0 {
-            // Reading Loro frontiers commits the fresh document's bootstrap
-            // operations. The genesis capture must keep an empty parent for
-            // cache-chain correctness, and there cannot yet be a branch label
-            // to advance.
-            (
-                timeline::encode_frontier(&loro::Frontiers::default()),
-                Vec::new(),
-            )
-        } else {
-            let parent = self.current_frontier();
-            let tips = self.branch_tips()?;
-            (parent, tips)
-        };
+        let (branch_parent, prior_branch_tips) = self.capture_context()?;
 
         // ---- pass 1: classify into deterministic buckets ---------------
         // BTree* keeps processing order stable regardless of arrival order.
@@ -834,6 +825,9 @@ impl ProjectStore {
                 }
                 Err(e) => return Err(SheafError::Io(e)),
             };
+            if self.is_saved_editor_echo(p, &bytes) {
+                continue;
+            }
             outcome.events_applied += 1;
             match std::str::from_utf8(&bytes) {
                 Ok(text_new) => {
@@ -888,16 +882,58 @@ impl ProjectStore {
         if outcome.tree_records == 0 {
             return Ok(zero_outcome(self.seq));
         }
+        self.finish_capture(batch, origin, outcome, branch_parent, prior_branch_tips)
+    }
+
+    /// Snapshot branch state before a capture mutates the Loro document.
+    fn capture_context(&self) -> Result<(String, Vec<BranchTip>)> {
+        if self.num_edits == 0 {
+            Ok((
+                timeline::encode_frontier(&loro::Frontiers::default()),
+                Vec::new(),
+            ))
+        } else {
+            Ok((self.current_frontier(), self.branch_tips()?))
+        }
+    }
+
+    /// Commit and durably publish a capture through the one journal path.
+    fn finish_capture(
+        &mut self,
+        batch: &Batch,
+        origin: Option<timeline::CaptureOrigin>,
+        mut outcome: StoreOutcome,
+        branch_parent: String,
+        prior_branch_tips: Vec<BranchTip>,
+    ) -> Result<StoreOutcome> {
         let capture = timeline::commit_capture(&self.doc, batch, origin)?;
         let delta = self
             .doc
             .export(ExportMode::updates(&self.last_vv))
             .map_err(encode_err)?;
         // The capture's update delta and its ledger record land as one
-        // fsync'd unit: a torn tail drops whole frames, so the
-        // pair never half-materializes. The record's blobs registry lists
-        // every digest this batch's binary tree events named.
+        // fsync'd unit: a torn tail drops whole frames, so the pair never
+        // half-materializes. The record's blobs registry lists every digest
+        // this batch's binary tree events named.
         let blobs = std::mem::take(&mut self.pending_blobs);
+        // Churn is recorded once from the same differ `info`/`diff` use.
+        let stats = diff::compute_diff_points(
+            &self.root,
+            &self.doc,
+            &self.doc.state_frontiers(),
+            timeline::ResolvedPoint {
+                frontier: capture.parent_frontier.clone(),
+                capture_id: None,
+            },
+            Some(timeline::ResolvedPoint {
+                frontier: capture.frontier.clone(),
+                capture_id: Some(capture.id.clone()),
+            }),
+            &capture.paths,
+            &crate::ignore::IgnoreSet::empty(),
+        )
+        .ok()
+        .map(|diff| diff.stats());
         let record = ledger::LedgerRecord::Capture {
             id: capture.id.clone(),
             frontier: capture.frontier.clone(),
@@ -905,6 +941,7 @@ impl ProjectStore {
             paths: capture.paths.clone(),
             events: capture.events,
             blobs,
+            stats,
         };
         let encoded = record.encode();
         let branch_records = timeline::branch_records_after_capture(
@@ -928,10 +965,6 @@ impl ProjectStore {
         for record in branch_records {
             self.ledger.fold(record);
         }
-        // Derived grep rows publish only after the authoritative update and
-        // capture record are durable. Cache failure never rolls back history;
-        // a later query falls back to exact point materialization and repairs
-        // the missing row.
         self.grep_content_cache
             .borrow_mut()
             .index_capture(&self.doc, &capture);
@@ -940,17 +973,10 @@ impl ProjectStore {
         self.seq += 1;
         outcome.seq = self.seq;
         outcome.update_bytes = delta.len();
-        outcome.rotated = self.journal.written_in_segment == 0; // just rotated
+        outcome.rotated = self.journal.written_in_segment == 0;
         outcome.capture = Some(capture.clone());
-
         self.write_head(batch, &capture)?;
 
-        // Cadence: every `snapshot_edit_size` edits of the running TOTAL,
-        // not every N edits observed by this process. Compaction never
-        // resets the count, so the phase is anchored to persisted history
-        // and out-of-band compactions (gc trims, manual `compact`) cannot
-        // desynchronize it. Zero disables cadence snapshots (a `% 0` would
-        // panic; nobody who disables the cadence wants one per edit).
         self.num_edits += 1;
         self.bytes_since_snapshot +=
             (delta.len() + encoded.len() + branch_payloads.iter().map(Vec::len).sum::<usize>())

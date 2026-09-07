@@ -37,6 +37,7 @@ use sheaf_core::watcher::{self, StopFlag};
 const MAX_CONNS: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_SOFT: Duration = Duration::from_secs(10);
+const MAX_REQUEST_CHUNKS: u32 = (ipc::MAX_ENVELOPE / ipc::MAX_CHUNK) as u32;
 /// `restore.apply` hard deadline.
 const RESTORE_HARD: Duration = Duration::from_secs(120);
 /// Diffing a large tree materializes two whole points and runs a line
@@ -135,6 +136,34 @@ enum GrepStreamItem {
 enum IpcBody {
     Bytes(Vec<u8>),
     Stream(Receiver<GrepStreamItem>),
+    Counted(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorCaptureKind {
+    Edit,
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorStepDirection {
+    Undo,
+    Redo,
+}
+
+struct EditorCaptureResult {
+    outcome: sheaf_core::store::StoreOutcome,
+    cursor: Option<String>,
+    content_sha256: String,
+    rebased: bool,
+}
+
+struct EditorStepResult {
+    source: String,
+    target: String,
+    content_sha256: String,
+    text: String,
 }
 
 enum StoreCommand {
@@ -145,6 +174,24 @@ enum StoreCommand {
         command: Box<StoreCommand>,
     },
 
+    EditorCapture {
+        path: PathBuf,
+        text: String,
+        kind: EditorCaptureKind,
+        base_sha256: String,
+        saved_sha256: Option<String>,
+        source: Option<String>,
+        target: Option<String>,
+        reply: Sender<std::result::Result<EditorCaptureResult, sheaf_core::SheafError>>,
+    },
+    EditorStep {
+        path: PathBuf,
+        cursor: String,
+        direction: EditorStepDirection,
+        target: Option<String>,
+        current_sha256: String,
+        reply: Sender<std::result::Result<Option<EditorStepResult>, sheaf_core::SheafError>>,
+    },
     TimelineLog {
         all: bool,
         branch: Option<String>,
@@ -1232,8 +1279,6 @@ fn collect_loop(
     _lock_guard: std::fs::File,
     max_resume_age_ms: i64,
 ) {
-    use sheaf_core::classify::PathClass;
-    use sheaf_core::events::EventKind;
     use sheaf_core::scratch::ScratchWriter;
     use std::collections::BTreeSet;
 
@@ -1263,13 +1308,7 @@ fn collect_loop(
     let scratch_period = Duration::from_millis(scratch_cfg.flush_ms.max(1));
 
     let flush_scratch = |scratch: &mut ScratchWriter, dirty: &mut BTreeSet<(PathBuf, PathBuf)>| {
-        for (event_root, abs) in dirty.iter() {
-            if let Ok(rel) = abs.strip_prefix(event_root) {
-                scratch.snapshot(event_root, abs, &rel.to_string_lossy());
-            }
-        }
-        dirty.clear();
-        scratch.flush();
+        flush_scratch_ring(scratch, dirty)
     };
 
     // Plans handed out but not yet applied. Bounded and collector-local:
@@ -1286,6 +1325,26 @@ fn collect_loop(
                     command_root.clone(),
                     Debouncer::new(command_root.clone(), cfg.clone()),
                 );
+            }
+            // An editor command must never overtake a filesystem event that
+            // already arrived on the independent watcher channel: drain every
+            // queued event through the normal routing path first, so the
+            // force-flush below commits real disk changes ahead of the
+            // editor snapshot.
+            if command.is_editor() {
+                while let Ok(ev) = rx.try_recv() {
+                    route_fs_event(
+                        ev,
+                        &mut store,
+                        &mut debouncers,
+                        &mut classifiers,
+                        &mut mutes,
+                        &mut scratch,
+                        &mut scratch_dirty,
+                        &mut last_scratch_flush,
+                        &cfg,
+                    );
+                }
             }
             let mut flush_error = None;
             let memory_heavy = command.is_memory_heavy();
@@ -1324,86 +1383,17 @@ fn collect_loop(
             }
         }
         match rx.recv_timeout(poll) {
-            Ok(ev) => {
-                let start = ev.path().parent().unwrap_or_else(|| ev.path());
-                let Some(event_root) =
-                    sheaf_core::init::resolve_project_root(start).map(|path| normalize(&path))
-                else {
-                    tracing::warn!(path = %ev.path().display(), "event has no project root");
-                    continue;
-                };
-                if !store.is_registered_worktree(&event_root).unwrap_or(false) {
-                    tracing::warn!(
-                        root = %event_root.display(),
-                        path = %ev.path().display(),
-                        "event from unregistered worktree ignored"
-                    );
-                    continue;
-                }
-                if !debouncers.contains_key(&event_root) {
-                    debouncers.insert(
-                        event_root.clone(),
-                        Debouncer::new(event_root.clone(), cfg.clone()),
-                    );
-                }
-                if !classifiers.contains_key(&event_root) {
-                    let compiled = watcher::shared_classifier(classifier_for(&event_root));
-                    classifiers.insert(event_root.clone(), compiled);
-                }
-                if ev
-                    .path()
-                    .file_name()
-                    .is_some_and(|name| name == ".gitignore")
-                {
-                    refresh_classifications(&event_root, &classifiers[&event_root]);
-                }
-                // Route by classification. The probe path is the event's
-                // primary path (rename destinations); a rename whose
-                // SOURCE was volatile leaves a `gone` marker so the ring
-                // records the disappearance, not just the arrival.
-                let class = classifiers[&event_root]
-                    .read()
-                    .classify_event_path(&event_root, ev.path());
-                match (class, &ev.kind) {
-                    (PathClass::Never, _) => {}
-                    (PathClass::Volatile, EventKind::Removed { path }) => {
-                        if let Ok(rel) = path.strip_prefix(&event_root) {
-                            scratch.gone(&event_root, &rel.to_string_lossy());
-                        }
-                    }
-                    (PathClass::Volatile, EventKind::Renamed { from, .. }) => {
-                        let from_class = classifiers[&event_root]
-                            .read()
-                            .classify_event_path(&event_root, from);
-                        if from_class == PathClass::Volatile {
-                            if let Ok(rel) = from.strip_prefix(&event_root) {
-                                scratch.gone(&event_root, &rel.to_string_lossy());
-                            }
-                        }
-                        scratch_dirty.insert((event_root.clone(), ev.path().to_path_buf()));
-                    }
-                    (PathClass::Volatile, _) => {
-                        scratch_dirty.insert((event_root.clone(), ev.path().to_path_buf()));
-                    }
-                    (PathClass::Durable, _) => {
-                        let swallowed = store.activate_worktree(&event_root).is_ok()
-                            && mutes
-                                .get(&event_root)
-                                .is_some_and(|mute| mute.swallows(&ev, &store));
-                        if !swallowed {
-                            if let Some(batch) = debouncers
-                                .get_mut(&event_root)
-                                .expect("event debouncer exists")
-                                .feed(ev)
-                            {
-                                persist_batch(&mut store, &batch);
-                                flush_scratch(&mut scratch, &mut scratch_dirty);
-                                last_scratch_flush = Instant::now();
-                            }
-                        }
-                    }
-                }
-            }
+            Ok(ev) => route_fs_event(
+                ev,
+                &mut store,
+                &mut debouncers,
+                &mut classifiers,
+                &mut mutes,
+                &mut scratch,
+                &mut scratch_dirty,
+                &mut last_scratch_flush,
+                &cfg,
+            ),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1436,11 +1426,127 @@ fn collect_loop(
     flush_scratch(&mut scratch, &mut scratch_dirty);
 }
 
+/// Snapshot every dirty volatile path into the recovery ring and flush it.
+fn flush_scratch_ring(
+    scratch: &mut sheaf_core::scratch::ScratchWriter,
+    dirty: &mut std::collections::BTreeSet<(PathBuf, PathBuf)>,
+) {
+    for (event_root, abs) in dirty.iter() {
+        if let Ok(rel) = abs.strip_prefix(event_root) {
+            scratch.snapshot(event_root, abs, &rel.to_string_lossy());
+        }
+    }
+    dirty.clear();
+    scratch.flush();
+}
+
+/// Route one filesystem event through the classification/debounce/scratch
+/// path — the shared body of the collector's watcher drain, reused so an
+/// editor command can drain queued events before it executes.
+#[allow(clippy::too_many_arguments)]
+fn route_fs_event(
+    ev: sheaf_core::events::FsEvent,
+    store: &mut ProjectStore,
+    debouncers: &mut HashMap<PathBuf, Debouncer>,
+    classifiers: &mut HashMap<PathBuf, watcher::SharedClassifier>,
+    mutes: &mut HashMap<PathBuf, RestoreMute>,
+    scratch: &mut sheaf_core::scratch::ScratchWriter,
+    scratch_dirty: &mut std::collections::BTreeSet<(PathBuf, PathBuf)>,
+    last_scratch_flush: &mut Instant,
+    cfg: &DebouncerConfig,
+) {
+    use sheaf_core::classify::PathClass;
+    use sheaf_core::events::EventKind;
+
+    let start = ev.path().parent().unwrap_or_else(|| ev.path());
+    let Some(event_root) =
+        sheaf_core::init::resolve_project_root(start).map(|path| normalize(&path))
+    else {
+        tracing::warn!(path = %ev.path().display(), "event has no project root");
+        return;
+    };
+    if !store.is_registered_worktree(&event_root).unwrap_or(false) {
+        tracing::warn!(
+            root = %event_root.display(),
+            path = %ev.path().display(),
+            "event from unregistered worktree ignored"
+        );
+        return;
+    }
+    debouncers
+        .entry(event_root.clone())
+        .or_insert_with(|| Debouncer::new(event_root.clone(), cfg.clone()));
+    if !classifiers.contains_key(&event_root) {
+        let compiled = watcher::shared_classifier(classifier_for(&event_root));
+        classifiers.insert(event_root.clone(), compiled);
+    }
+    if ev
+        .path()
+        .file_name()
+        .is_some_and(|name| name == ".gitignore")
+    {
+        refresh_classifications(&event_root, &classifiers[&event_root]);
+    }
+    // Route by classification. The probe path is the event's primary path
+    // (rename destinations); a rename whose SOURCE was volatile leaves a
+    // `gone` marker so the ring records the disappearance, not just arrival.
+    let class = classifiers[&event_root]
+        .read()
+        .classify_event_path(&event_root, ev.path());
+    match (class, &ev.kind) {
+        (PathClass::Never, _) => {}
+        (PathClass::Volatile, EventKind::Removed { path }) => {
+            if let Ok(rel) = path.strip_prefix(&event_root) {
+                scratch.gone(&event_root, &rel.to_string_lossy());
+            }
+        }
+        (PathClass::Volatile, EventKind::Renamed { from, .. }) => {
+            let from_class = classifiers[&event_root]
+                .read()
+                .classify_event_path(&event_root, from);
+            if from_class == PathClass::Volatile {
+                if let Ok(rel) = from.strip_prefix(&event_root) {
+                    scratch.gone(&event_root, &rel.to_string_lossy());
+                }
+            }
+            scratch_dirty.insert((event_root.clone(), ev.path().to_path_buf()));
+        }
+        (PathClass::Volatile, _) => {
+            scratch_dirty.insert((event_root.clone(), ev.path().to_path_buf()));
+        }
+        (PathClass::Durable, _) => {
+            let swallowed = store.activate_worktree(&event_root).is_ok()
+                && mutes
+                    .get(&event_root)
+                    .is_some_and(|mute| mute.swallows(&ev, store));
+            if !swallowed {
+                if let Some(batch) = debouncers
+                    .get_mut(&event_root)
+                    .expect("event debouncer exists")
+                    .feed(ev)
+                {
+                    persist_batch(store, &batch);
+                    flush_scratch_ring(scratch, scratch_dirty);
+                    *last_scratch_flush = Instant::now();
+                }
+            }
+        }
+    }
+}
+
 impl StoreCommand {
     fn worktree_root(&self) -> Option<&Path> {
         match self {
             StoreCommand::InWorktree { root, .. } => Some(root),
             _ => None,
+        }
+    }
+
+    fn is_editor(&self) -> bool {
+        match self {
+            StoreCommand::InWorktree { command, .. } => command.is_editor(),
+            StoreCommand::EditorCapture { .. } | StoreCommand::EditorStep { .. } => true,
+            _ => false,
         }
     }
 
@@ -1458,7 +1564,9 @@ impl StoreCommand {
             | StoreCommand::ApplyFragment { .. }
             | StoreCommand::AddWorktree { .. }
             | StoreCommand::ApplyMerge { .. }
-            | StoreCommand::ResumeMerge { .. } => true,
+            | StoreCommand::ResumeMerge { .. }
+            | StoreCommand::EditorCapture { .. }
+            | StoreCommand::EditorStep { .. } => true,
             _ => false,
         }
     }
@@ -1489,6 +1597,12 @@ impl StoreCommand {
     fn send_error(self, error: sheaf_core::SheafError) {
         match self {
             StoreCommand::InWorktree { command, .. } => command.send_error(error),
+            StoreCommand::EditorCapture { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            StoreCommand::EditorStep { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             StoreCommand::TimelineLog { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -1627,6 +1741,52 @@ fn handle_store_command(
         command => command,
     };
     match command {
+        StoreCommand::EditorCapture {
+            path,
+            text,
+            kind,
+            base_sha256,
+            saved_sha256,
+            source,
+            target,
+            reply,
+        } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => handle_editor_capture(
+                    store,
+                    &path,
+                    text,
+                    kind,
+                    &base_sha256,
+                    saved_sha256.as_deref(),
+                    source.as_deref(),
+                    target.as_deref(),
+                ),
+            };
+            let _ = reply.send(result);
+        }
+        StoreCommand::EditorStep {
+            path,
+            cursor,
+            direction,
+            target,
+            current_sha256,
+            reply,
+        } => {
+            let result = match flush_error {
+                Some(error) => Err(error),
+                None => handle_editor_step(
+                    store,
+                    &path,
+                    &cursor,
+                    direction,
+                    target.as_deref(),
+                    &current_sha256,
+                ),
+            };
+            let _ = reply.send(result);
+        }
         StoreCommand::TimelineLog {
             all,
             branch,
@@ -1909,6 +2069,184 @@ fn handle_store_command(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_editor_capture(
+    store: &mut ProjectStore,
+    path: &Path,
+    text: String,
+    requested_kind: EditorCaptureKind,
+    base_sha256: &str,
+    saved_sha256: Option<&str>,
+    requested_source: Option<&str>,
+    requested_target: Option<&str>,
+) -> std::result::Result<EditorCaptureResult, sheaf_core::SheafError> {
+    use sheaf_core::store::{CaptureOrigin, HistoricalPathContent, OriginKind};
+
+    let current_text = store.editor_text(path)?;
+    let current_sha256 = sheaf_core::store::hash_of(current_text.as_bytes());
+    let current_cursor = store.editor_cursor(path)?;
+    let rebased = current_sha256 != base_sha256;
+
+    if let Some(saved) = saved_sha256 {
+        store.register_saved_editor_digest(path, saved)?;
+    }
+
+    let (kind, source, target) = if rebased {
+        (OriginKind::Editor, current_cursor.clone(), None)
+    } else {
+        if let Some(source) = requested_source {
+            let source = store.validate_editor_cursor(source)?;
+            if Some(source) != current_cursor {
+                return Err(sheaf_core::SheafError::EditorStale(
+                    "source cursor is no longer current".into(),
+                ));
+            }
+        }
+        match requested_kind {
+            EditorCaptureKind::Edit => {
+                if requested_target.is_some() {
+                    return Err(sheaf_core::SheafError::EditorStale(
+                        "ordinary editor capture cannot carry a target".into(),
+                    ));
+                }
+                (OriginKind::Editor, current_cursor.clone(), None)
+            }
+            EditorCaptureKind::Undo | EditorCaptureKind::Redo => {
+                if requested_source.is_none() {
+                    return Err(sheaf_core::SheafError::EditorStale(
+                        "editor navigation requires a source cursor".into(),
+                    ));
+                }
+                let target = requested_target.ok_or_else(|| {
+                    sheaf_core::SheafError::EditorStale(
+                        "editor navigation requires a target cursor".into(),
+                    )
+                })?;
+                let target = store.validate_editor_cursor(target)?;
+                let relative = path
+                    .strip_prefix(store.root())
+                    .map_err(|_| {
+                        sheaf_core::SheafError::EditorUnsupported(
+                            "editor path is outside the active worktree".into(),
+                        )
+                    })?
+                    .to_string_lossy();
+                match store.historical_path_content(&target, &relative)? {
+                    HistoricalPathContent::Text(target_text) if target_text == text => {}
+                    HistoricalPathContent::Text(_) => {
+                        return Err(sheaf_core::SheafError::EditorStale(
+                            "navigation body no longer matches its target".into(),
+                        ))
+                    }
+                    HistoricalPathContent::Absent | HistoricalPathContent::Binary { .. } => {
+                        return Err(sheaf_core::SheafError::EditorUnsupported(
+                            "navigation target is not retained UTF-8 text".into(),
+                        ))
+                    }
+                }
+                let kind = match requested_kind {
+                    EditorCaptureKind::Undo => OriginKind::EditorUndo,
+                    EditorCaptureKind::Redo => OriginKind::EditorRedo,
+                    EditorCaptureKind::Edit => unreachable!(),
+                };
+                (kind, current_cursor.clone(), Some(target))
+            }
+        }
+    };
+
+    let relative = path
+        .strip_prefix(store.root())
+        .map_err(|_| {
+            sheaf_core::SheafError::EditorUnsupported(
+                "editor path is outside the active worktree".into(),
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let outcome = store.apply_editor_snapshot(
+        path,
+        &text,
+        chrono::Utc::now(),
+        CaptureOrigin {
+            kind,
+            source,
+            target: target.clone(),
+            scope: vec![relative],
+            selections: Vec::new(),
+        },
+    )?;
+    let cursor = if matches!(kind, OriginKind::EditorUndo | OriginKind::EditorRedo) && !rebased {
+        target
+    } else {
+        store.editor_cursor(path)?
+    };
+    Ok(EditorCaptureResult {
+        outcome,
+        cursor,
+        content_sha256: sheaf_core::store::hash_of(text.as_bytes()),
+        rebased,
+    })
+}
+
+fn handle_editor_step(
+    store: &ProjectStore,
+    path: &Path,
+    cursor: &str,
+    direction: EditorStepDirection,
+    requested_target: Option<&str>,
+    current_sha256: &str,
+) -> std::result::Result<Option<EditorStepResult>, sheaf_core::SheafError> {
+    use sheaf_core::store::HistoricalPathContent;
+
+    let current_text = store.editor_text(path)?;
+    if sheaf_core::store::hash_of(current_text.as_bytes()) != current_sha256 {
+        return Err(sheaf_core::SheafError::EditorStale(
+            "current buffer digest no longer matches the store".into(),
+        ));
+    }
+    let source = store.validate_editor_cursor(cursor)?;
+    if store.editor_cursor(path)?.as_deref() != Some(source.as_str()) {
+        return Err(sheaf_core::SheafError::EditorStale(
+            "logical cursor is no longer current".into(),
+        ));
+    }
+    let target = match direction {
+        EditorStepDirection::Undo => store.previous_editor_cursor(&source, path)?,
+        EditorStepDirection::Redo => Some(store.validate_editor_cursor(
+            requested_target.ok_or_else(|| {
+                sheaf_core::SheafError::EditorStale(
+                    "redo requires an explicit target cursor".into(),
+                )
+            })?,
+        )?),
+    };
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let relative = path
+        .strip_prefix(store.root())
+        .map_err(|_| {
+            sheaf_core::SheafError::EditorUnsupported(
+                "editor path is outside the active worktree".into(),
+            )
+        })?
+        .to_string_lossy();
+    let text = match store.historical_path_content(&target, &relative)? {
+        HistoricalPathContent::Text(text) => text,
+        HistoricalPathContent::Absent | HistoricalPathContent::Binary { .. } => return Ok(None),
+    };
+    let content_sha256 = sheaf_core::store::hash_of(text.as_bytes());
+    if content_sha256 == current_sha256 {
+        return Ok(None);
+    }
+    Ok(Some(EditorStepResult {
+        source,
+        target,
+        content_sha256,
+        text,
+    }))
+}
+
 fn persist_batch(store: &mut ProjectStore, batch: &sheaf_core::events::Batch) {
     let _ = persist_batch_checked(store, batch);
 }
@@ -1981,22 +2319,41 @@ fn serve_connection(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
                 return Ok(());
             }
         };
-        let req: Request = match serde_json::from_slice(&env_bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = Response::err(
-                    "?",
-                    IpcError::new("bad.request", format!("unparseable envelope: {e}")),
-                );
-                write_response(&mut stream, &resp, &[])?;
-                continue;
+        let value: serde_json::Value = match serde_json::from_slice(&env_bytes) {
+            Ok(value) => value,
+            Err(_) => return Ok(()),
+        };
+        let recoverable_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let req: Request = match serde_json::from_value(value) {
+            Ok(req) => req,
+            Err(error) => {
+                if let Some(id) = recoverable_id {
+                    let resp = Response::err(
+                        id,
+                        IpcError::new("bad.request", format!("invalid envelope: {error}")),
+                    );
+                    let _ = write_response(&mut stream, &resp, &[]);
+                }
+                return Ok(());
+            }
+        };
+        let request_body = match read_request_body(&mut stream, req.body.as_ref()) {
+            Ok(body) => body,
+            Err(message) => {
+                let resp = Response::err(req.id.clone(), IpcError::new("bad.request", message));
+                let _ = write_response(&mut stream, &resp, &[]);
+                return Ok(());
             }
         };
 
         let mut shutting_down = false;
-        let (resp, body) = dispatch(&shared, &req, &mut shutting_down);
+        let (resp, body) = dispatch(&shared, &req, request_body, &mut shutting_down);
         match body {
             IpcBody::Bytes(bytes) => write_response(&mut stream, &resp, &bytes)?,
+            IpcBody::Counted(bytes) => write_response(&mut stream, &resp, &bytes)?,
             IpcBody::Stream(records) => write_streamed_response(&mut stream, &resp, records)?,
         }
         if shutting_down {
@@ -2004,6 +2361,38 @@ fn serve_connection(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+fn read_request_body(
+    stream: &mut UnixStream,
+    announcement: Option<&ipc::BodyInfo>,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    let Some(info) = announcement else {
+        return Ok(None);
+    };
+    if info.chunks == ipc::STREAMED_BODY_SENTINEL {
+        return Err("streamed request bodies are not supported".into());
+    }
+    if info.chunks > MAX_REQUEST_CHUNKS {
+        return Err(format!(
+            "request body announces {} chunks, over the {MAX_REQUEST_CHUNKS}-chunk cap",
+            info.chunks
+        ));
+    }
+
+    let mut body = Vec::new();
+    for _ in 0..info.chunks {
+        let chunk = ipc::read_frame(stream, ipc::MAX_CHUNK)
+            .map_err(|error| format!("invalid request body chunk: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > ipc::MAX_ENVELOPE {
+            return Err(format!(
+                "request body exceeds the {}-byte cap",
+                ipc::MAX_ENVELOPE
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 /// Envelope first, then any body chunks the envelope announces (the
@@ -2046,7 +2435,12 @@ fn write_response(stream: &mut UnixStream, resp: &Response, body: &[u8]) -> std:
     Ok(())
 }
 
-fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Response, IpcBody) {
+fn dispatch(
+    shared: &Shared,
+    req: &Request,
+    request_body: Option<Vec<u8>>,
+    shutting_down: &mut bool,
+) -> (Response, IpcBody) {
     let rid = req.id.clone();
     if req.v != PROTO_MAJOR {
         return (
@@ -2056,6 +2450,15 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                     "store.version_mismatch",
                     format!("client proto v{}, daemon supports v{}", req.v, PROTO_MAJOR),
                 ),
+            ),
+            IpcBody::Bytes(Vec::new()),
+        );
+    }
+    if request_body.is_some() && req.method != "editor.capture" {
+        return (
+            Response::err(
+                rid,
+                IpcError::new("bad.request", "this method does not accept a request body"),
             ),
             IpcBody::Bytes(Vec::new()),
         );
@@ -2099,10 +2502,15 @@ fn dispatch(shared: &Shared, req: &Request, shutting_down: &mut bool) -> (Respon
                     "merge.plan",
                     "merge.apply",
                     "merge.resume",
-
+                    "project.resolve",
+                    "editor.capture",
+                    "editor.step",
                 ],
             }),
         )),
+        "project.resolve" => plain(project_resolve(shared, req, rid)),
+        "editor.capture" => plain(editor_capture(shared, req, rid, request_body)),
+        "editor.step" => editor_step(shared, req, rid),
         "project.status" => plain(project_status(shared, req, rid)),
         "timeline.log" => bytes(timeline_log(shared, req, rid)),
         "timeline.info" => plain(timeline_info(shared, req, rid)),
@@ -2213,6 +2621,372 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
             "pending_merge": pending_merge,
         }),
     )
+}
+
+fn project_resolve(shared: &Shared, req: &Request, rid: String) -> Response {
+    let Some(path) = req.params.get("path").and_then(serde_json::Value::as_str) else {
+        return Response::err(
+            rid,
+            IpcError::new("bad.params", "`path` must be an absolute path"),
+        );
+    };
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Response::err(
+            rid,
+            IpcError::new("bad.params", "`path` must be an absolute path"),
+        );
+    }
+    let requested_meta = match std::fs::symlink_metadata(&requested) {
+        Ok(meta) => meta,
+        Err(error) => {
+            return Response::err(
+                rid,
+                IpcError::new(
+                    "bad.params",
+                    format!("cannot inspect {}: {error}", requested.display()),
+                ),
+            )
+        }
+    };
+    let canonical = match requested.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            return Response::err(
+                rid,
+                IpcError::new(
+                    "bad.params",
+                    format!("cannot resolve {}: {error}", requested.display()),
+                ),
+            )
+        }
+    };
+    let Some(root) = sheaf_core::init::resolve_project_root(&canonical) else {
+        return Response::err(
+            rid,
+            IpcError::new(
+                "project.not_enrolled",
+                format!("{} is not inside an enrolled project", requested.display()),
+            ),
+        );
+    };
+    let root = normalize(&root);
+    let relative = match canonical.strip_prefix(&root) {
+        Ok(path) => path,
+        Err(_) => {
+            return Response::err(
+                rid,
+                IpcError::new("bad.params", "resolved path is outside the project root"),
+            )
+        }
+    };
+    let Some(relative_path) = relative.to_str() else {
+        return Response::err(
+            rid,
+            IpcError::new("bad.params", "resolved path is not valid UTF-8"),
+        );
+    };
+
+    let status_request = Request {
+        v: req.v,
+        id: req.id.clone(),
+        method: "project.status".into(),
+        project: Some(root.clone()),
+        params: serde_json::Value::Null,
+        body: None,
+    };
+    let status = project_status(shared, &status_request, rid.clone());
+    if !status.ok {
+        return status;
+    }
+    let cfg = match config::load(&root) {
+        Ok(cfg) => cfg,
+        Err(error) => return core_error(rid, error),
+    };
+    let class = classifier_for(&root).classify_rel(relative);
+    let regular = requested_meta.file_type().is_file();
+    let symlink = requested_meta.file_type().is_symlink();
+    let bytes = requested_meta.len();
+    let durable = class == sheaf_core::classify::PathClass::Durable;
+    let class_name = if durable { "durable" } else { "volatile" };
+    let supported = durable && regular && !symlink && bytes <= sheaf_core::store::TEXT_MAX_BYTES;
+
+    let mut result = status.result.unwrap_or_else(|| json!({}));
+    let Some(fields) = result.as_object_mut() else {
+        return Response::err(
+            rid,
+            IpcError::new("store.corrupt", "project status result is not an object"),
+        );
+    };
+    fields.insert("relative_path".into(), json!(relative_path));
+    fields.insert(
+        "eligibility".into(),
+        json!({
+            "class": class_name,
+            "regular": regular,
+            "symlink": symlink,
+            "bytes": bytes,
+            "supported": supported,
+        }),
+    );
+    fields.insert(
+        "watch".into(),
+        json!({
+            "debounce_ms": cfg.watch.debounce_ms,
+            "max_hold_ms": cfg.watch.max_hold_ms,
+        }),
+    );
+    Response::ok(rid, result)
+}
+
+/// Parse the shared `{path, ...}` scope for an editor request into an
+/// absolute worktree path plus a live control channel.
+fn editor_target(
+    shared: &Shared,
+    req: &Request,
+    rid: &str,
+) -> std::result::Result<(PathBuf, ProjectControl), Response> {
+    let root = match require_project(req, rid) {
+        Ok(p) => normalize(p),
+        Err(resp) => return Err(resp),
+    };
+    let Some(relative) = req.params.get("path").and_then(serde_json::Value::as_str) else {
+        return Err(Response::err(
+            rid.to_owned(),
+            IpcError::new("bad.params", "`path` (root-relative) is required"),
+        ));
+    };
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Response::err(
+            rid.to_owned(),
+            IpcError::new(
+                "bad.params",
+                "`path` must be a canonical root-relative path",
+            ),
+        ));
+    }
+    let absolute = root.join(relative);
+    let control = project_control(shared, &root, rid)?;
+    Ok((absolute, control))
+}
+
+fn hex_field(req: &Request, key: &str) -> std::result::Result<Option<String>, String> {
+    match req.params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => {
+            if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Ok(Some(value.to_ascii_lowercase()))
+            } else {
+                Err(format!("`{key}` must be a 64-character SHA-256 hex digest"))
+            }
+        }
+        Some(_) => Err(format!("`{key}` must be a hex string or null")),
+    }
+}
+
+fn opt_capture_field(req: &Request, key: &str) -> std::result::Result<Option<String>, String> {
+    match req.params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("`{key}` must be a capture id or null")),
+    }
+}
+
+fn editor_capture(shared: &Shared, req: &Request, rid: String, body: Option<Vec<u8>>) -> Response {
+    let Some(body) = body else {
+        return Response::err(
+            rid,
+            IpcError::new(
+                "bad.request",
+                "editor.capture requires a UTF-8 request body",
+            ),
+        );
+    };
+    let text = match String::from_utf8(body) {
+        Ok(text) => text,
+        Err(_) => {
+            return Response::err(
+                rid,
+                IpcError::new(
+                    "editor.unsupported",
+                    "editor.capture body is not valid UTF-8",
+                ),
+            )
+        }
+    };
+    let kind = match req.params.get("kind").and_then(serde_json::Value::as_str) {
+        Some("edit") => EditorCaptureKind::Edit,
+        Some("undo") => EditorCaptureKind::Undo,
+        Some("redo") => EditorCaptureKind::Redo,
+        _ => {
+            return Response::err(
+                rid,
+                IpcError::new("bad.params", "`kind` must be edit|undo|redo"),
+            )
+        }
+    };
+    let base_sha256 = match hex_field(req, "base_sha256") {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return Response::err(
+                rid,
+                IpcError::new("bad.params", "`base_sha256` is required"),
+            )
+        }
+        Err(message) => return Response::err(rid, IpcError::new("bad.params", message)),
+    };
+    let saved_sha256 = match hex_field(req, "saved_sha256") {
+        Ok(value) => value,
+        Err(message) => return Response::err(rid, IpcError::new("bad.params", message)),
+    };
+    let source = match opt_capture_field(req, "source") {
+        Ok(value) => value,
+        Err(message) => return Response::err(rid, IpcError::new("bad.params", message)),
+    };
+    let target = match opt_capture_field(req, "target") {
+        Ok(value) => value,
+        Err(message) => return Response::err(rid, IpcError::new("bad.params", message)),
+    };
+    let (path, control) = match editor_target(shared, req, &rid) {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::EditorCapture {
+            path,
+            text,
+            kind,
+            base_sha256,
+            saved_sha256,
+            source,
+            target,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::err(rid, IpcError::new("internal", "project writer stopped"));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(result)) => {
+            let capture_id = result
+                .outcome
+                .capture
+                .as_ref()
+                .map(|capture| capture.id.clone());
+            tracing::debug!(
+                seq = result.outcome.seq,
+                bytes = result.content_sha256.len(),
+                recorded = capture_id.is_some(),
+                rebased = result.rebased,
+                "editor capture"
+            );
+            Response::ok(
+                rid,
+                json!({
+                    "recorded": capture_id.is_some(),
+                    "physical_capture_id": capture_id,
+                    "cursor": result.cursor,
+                    "content_sha256": result.content_sha256,
+                    "rebased": result.rebased,
+                }),
+            )
+        }
+        Ok(Err(e)) => core_error(rid, e),
+        Err(_) => Response::err(rid, IpcError::new("internal", "editor capture timed out")),
+    }
+}
+
+fn editor_step(shared: &Shared, req: &Request, rid: String) -> (Response, IpcBody) {
+    let plain = |resp: Response| (resp, IpcBody::Bytes(Vec::new()));
+    let direction = match req
+        .params
+        .get("direction")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("undo") => EditorStepDirection::Undo,
+        Some("redo") => EditorStepDirection::Redo,
+        _ => {
+            return plain(Response::err(
+                rid,
+                IpcError::new("bad.params", "`direction` must be undo|redo"),
+            ))
+        }
+    };
+    let Some(cursor) = req.params.get("cursor").and_then(serde_json::Value::as_str) else {
+        return plain(Response::err(
+            rid,
+            IpcError::new("bad.params", "`cursor` is required"),
+        ));
+    };
+    let cursor = cursor.to_owned();
+    let current_sha256 = match hex_field(req, "current_sha256") {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return plain(Response::err(
+                rid,
+                IpcError::new("bad.params", "`current_sha256` is required"),
+            ))
+        }
+        Err(message) => return plain(Response::err(rid, IpcError::new("bad.params", message))),
+    };
+    let target = match opt_capture_field(req, "target") {
+        Ok(value) => value,
+        Err(message) => return plain(Response::err(rid, IpcError::new("bad.params", message))),
+    };
+    let (path, control) = match editor_target(shared, req, &rid) {
+        Ok(pair) => pair,
+        Err(response) => return plain(response),
+    };
+    let (reply_tx, reply_rx) = channel();
+    if control
+        .send(StoreCommand::EditorStep {
+            path,
+            cursor,
+            direction,
+            target,
+            current_sha256,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return plain(Response::err(
+            rid,
+            IpcError::new("internal", "project writer stopped"),
+        ));
+    }
+    match reply_rx.recv_timeout(REQUEST_SOFT) {
+        Ok(Ok(Some(step))) => {
+            let body = step.text.into_bytes();
+            (
+                Response::ok(
+                    rid,
+                    json!({
+                        "changed": true,
+                        "source": step.source,
+                        "target": step.target,
+                        "content_sha256": step.content_sha256,
+                        "bytes": body.len() as u64,
+                    }),
+                ),
+                IpcBody::Counted(body),
+            )
+        }
+        Ok(Ok(None)) => plain(Response::ok(
+            rid,
+            json!({"changed": false, "reason": "start_of_text_history"}),
+        )),
+        Ok(Err(e)) => plain(core_error(rid, e)),
+        Err(_) => plain(Response::err(
+            rid,
+            IpcError::new("internal", "editor step timed out"),
+        )),
+    }
 }
 
 /// How long a command to a cold (lazily parked) project waits for the
@@ -4984,6 +5758,90 @@ mod tests {
         collector.join().unwrap();
     }
 
+    #[test]
+    fn a_queued_filesystem_event_commits_before_a_following_editor_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = skeleton_project(tmp.path(), "editor-ordering");
+        std::fs::write(root.join("note.txt"), "one\n").unwrap();
+        let (mut store, ignore, lock) = opened_store(&root);
+        store.reconcile_worktree(&ignore).unwrap();
+
+        let (event_tx, event_rx) = channel::<sheaf_core::events::FsEvent>();
+        let (control_tx, control_rx) = channel::<StoreCommand>();
+        let loop_root = root.clone();
+        let collector = std::thread::spawn(move || {
+            collect_loop(
+                loop_root,
+                event_rx,
+                control_rx,
+                DebouncerConfig {
+                    window: Duration::from_millis(40),
+                    max_hold: Duration::from_millis(80),
+                    cap_events: 100,
+                },
+                store,
+                watcher::shared_classifier(
+                    sheaf_core::classify::Classifier::from_volatile_patterns(&[]).unwrap(),
+                ),
+                sheaf_core::config::ScratchConfig::default(),
+                None,
+                lock,
+                60_000,
+            )
+        });
+
+        // A disk change lands on the watcher channel FIRST, then an editor
+        // capture for the same path is queued on the control channel. The
+        // editor command must drain the filesystem event before it runs, so
+        // the disk capture is committed strictly before the editor snapshot.
+        std::fs::write(root.join("note.txt"), "one\nDISK\n").unwrap();
+        event_tx
+            .send(sheaf_core::events::FsEvent::now(
+                sheaf_core::events::EventKind::Touched {
+                    path: sheaf_core::events::TouchedPath::from(root.join("note.txt")),
+                },
+            ))
+            .unwrap();
+        let (reply_tx, reply_rx) = channel();
+        control_tx
+            .send(StoreCommand::InWorktree {
+                root: root.clone(),
+                command: Box::new(StoreCommand::EditorCapture {
+                    path: root.join("note.txt"),
+                    text: "EDITOR\n".into(),
+                    kind: EditorCaptureKind::Edit,
+                    base_sha256: sheaf_core::store::hash_of(b"one\n"),
+                    saved_sha256: None,
+                    source: None,
+                    target: None,
+                    reply: reply_tx,
+                }),
+            })
+            .unwrap();
+        let result = reply_rx.recv_timeout(TEN_SECS).unwrap().unwrap();
+        assert!(result.outcome.capture.is_some());
+        assert!(
+            result.rebased,
+            "the disk write moved head under the editor base"
+        );
+
+        drop(control_tx);
+        drop(event_tx);
+        collector.join().unwrap();
+
+        let reopened = ProjectStore::open(&root, StoreLimits::default()).unwrap();
+        assert_eq!(
+            reopened.historical_path_content("@", "note.txt").unwrap(),
+            sheaf_core::store::HistoricalPathContent::Text("EDITOR\n".into()),
+            "the editor snapshot is the newest capture"
+        );
+        assert_eq!(
+            reopened.historical_path_content("@~1", "note.txt").unwrap(),
+            sheaf_core::store::HistoricalPathContent::Text("one\nDISK\n".into()),
+            "the filesystem capture committed immediately before it"
+        );
+    }
+
     /// The classification contract end to end: durable events reach the
     /// timeline, volatile events reach the scratch ring and ONLY the ring,
     /// and a volatile disappearance leaves a `gone` marker instead of a
@@ -5715,6 +6573,7 @@ mod tests {
             method: method.into(),
             project,
             params,
+            body: None,
         }
     }
 
@@ -5733,13 +6592,14 @@ mod tests {
 
         let mut stale = test_request("ping", None, json!({}));
         stale.v = PROTO_MAJOR + 7;
-        let (resp, body) = dispatch(&shared, &stale, &mut shutting_down);
+        let (resp, body) = dispatch(&shared, &stale, None, &mut shutting_down);
         assert_eq!(error_code_of(&resp), "store.version_mismatch");
         assert!(matches!(body, IpcBody::Bytes(bytes) if bytes.is_empty()));
 
         let (resp, _) = dispatch(
             &shared,
             &test_request("ping", None, json!({})),
+            None,
             &mut shutting_down,
         );
         assert!(resp.ok);
@@ -5750,6 +6610,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("no.such.method", None, json!({})),
+            None,
             &mut shutting_down,
         );
         assert_eq!(error_code_of(&resp), "bad.method");
@@ -5757,6 +6618,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("timeline.log", None, json!({})),
+            None,
             &mut shutting_down,
         );
         assert_eq!(error_code_of(&resp), "bad.params");
@@ -5769,6 +6631,7 @@ mod tests {
                 Some(unwatched.path().to_path_buf()),
                 json!({}),
             ),
+            None,
             &mut shutting_down,
         );
         assert_eq!(error_code_of(&resp), "project.not_enrolled");
@@ -5781,6 +6644,7 @@ mod tests {
                 Some(unwatched.path().to_path_buf()),
                 json!({}),
             ),
+            None,
             &mut shutting_down,
         );
         assert_eq!(error_code_of(&resp), "project.not_enrolled");
@@ -5790,6 +6654,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("shutdown", None, json!({})),
+            None,
             &mut flag,
         );
         assert!(resp.ok);
@@ -5839,6 +6704,7 @@ mod tests {
             let (resp, _) = dispatch(
                 &shared,
                 &test_request(method, project.clone(), params),
+                None,
                 &mut shutting_down,
             );
             assert!(!resp.ok, "{method} with invalid params must not succeed");
@@ -5917,6 +6783,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("enroll.notify", Some(tmp.path().join("missing")), json!({})),
+            None,
             &mut shutting_down,
         );
         assert_eq!(error_code_of(&resp), "project.not_enrolled");
@@ -5926,6 +6793,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("enroll.notify", Some(bare), json!({})),
+            None,
             &mut shutting_down,
         );
         assert_eq!(error_code_of(&resp), "project.not_enrolled");
@@ -5934,6 +6802,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("enroll.notify", Some(valid.clone()), json!({})),
+            None,
             &mut shutting_down,
         );
         assert!(resp.ok);
@@ -5959,7 +6828,12 @@ mod tests {
         };
 
         // Warm the project through the IPC path itself.
-        let (resp, _) = dispatch(&shared, &log_req(None), &mut shutting_down.borrow_mut());
+        let (resp, _) = dispatch(
+            &shared,
+            &log_req(None),
+            None,
+            &mut shutting_down.borrow_mut(),
+        );
         assert!(
             resp.ok,
             "timeline.log over a warming project must wait for it"
@@ -5972,13 +6846,23 @@ mod tests {
         std::fs::write(live.join("tracked.txt"), "content v2").unwrap();
         assert!(
             wait_until(15_000, || {
-                let (resp, _) = dispatch(&shared, &log_req(None), &mut shutting_down.borrow_mut());
+                let (resp, _) = dispatch(
+                    &shared,
+                    &log_req(None),
+                    None,
+                    &mut shutting_down.borrow_mut(),
+                );
                 resp.result.unwrap()["entries"].as_array().unwrap().len() >= 2
             }),
             "the second capture never landed"
         );
         std::thread::sleep(Duration::from_millis(500));
-        let (resp, _) = dispatch(&shared, &log_req(None), &mut shutting_down.borrow_mut());
+        let (resp, _) = dispatch(
+            &shared,
+            &log_req(None),
+            None,
+            &mut shutting_down.borrow_mut(),
+        );
         let entries = resp.result.unwrap()["entries"].as_array().unwrap().clone();
         let total = entries.len();
 
@@ -5987,6 +6871,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &log_req(Some(&cursor)),
+            None,
             &mut shutting_down.borrow_mut(),
         );
         assert!(resp.ok);
@@ -5998,6 +6883,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &log_req(Some("abc")),
+            None,
             &mut shutting_down.borrow_mut(),
         );
         assert_eq!(error_code_of(&resp), "state.bad_reference");
@@ -6006,6 +6892,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &log_req(Some("ffffff")),
+            None,
             &mut shutting_down.borrow_mut(),
         );
         assert_eq!(error_code_of(&resp), "state.bad_reference");
@@ -6034,7 +6921,7 @@ mod tests {
         };
 
         // Default: paths are present (the capture recorded the tracked file).
-        let (resp, _) = dispatch(&shared, &log_req(false), &mut shutting_down);
+        let (resp, _) = dispatch(&shared, &log_req(false), None, &mut shutting_down);
         assert!(resp.ok, "timeline.log over a warming project must wait");
         let entries = resp.result.unwrap()["entries"].as_array().unwrap().clone();
         assert!(!entries.is_empty());
@@ -6046,7 +6933,7 @@ mod tests {
         );
 
         // omit_paths: identity/time survive; paths are emptied.
-        let (resp, _) = dispatch(&shared, &log_req(true), &mut shutting_down);
+        let (resp, _) = dispatch(&shared, &log_req(true), None, &mut shutting_down);
         assert!(resp.ok);
         let slim = resp.result.unwrap()["entries"].as_array().unwrap().clone();
         assert_eq!(slim.len(), entries.len());
@@ -6076,6 +6963,7 @@ mod tests {
                 Some(live.clone()),
                 json!({"name": "feature", "at": "@"}),
             ),
+            None,
             &mut shutting_down,
         );
         assert!(created.ok, "branch creation failed: {:?}", created.error);
@@ -6092,6 +6980,7 @@ mod tests {
                     "limit": 10,
                 }),
             ),
+            None,
             &mut shutting_down,
         ) else {
             panic!("timeline.log details must use a byte body");
@@ -6114,6 +7003,7 @@ mod tests {
         let (missing, _) = dispatch(
             &shared,
             &test_request("timeline.log", Some(live), json!({"branch": "missing"})),
+            None,
             &mut shutting_down,
         );
         assert!(!missing.ok);
@@ -6123,7 +7013,7 @@ mod tests {
     // --------------------------------------------------- connection layer
 
     #[test]
-    fn serve_connection_roundtrips_framed_requests_and_survives_garbage_and_eof() {
+    fn serve_connection_roundtrips_requests_and_closes_after_malformed_json() {
         let shared = test_shared();
         let (mut client, server) = UnixStream::pair().unwrap();
         let actor = std::thread::spawn(move || serve_connection(shared, server));
@@ -6134,24 +7024,8 @@ mod tests {
             serde_json::from_slice(&frame).unwrap()
         };
 
-        let resp = roundtrip(
-            &mut client,
-            &Request {
-                v: PROTO_MAJOR,
-                id: "a".into(),
-                method: "ping".into(),
-                project: None,
-                params: json!({}),
-            },
-        );
-        assert!(resp.ok && resp.id == "a");
-
-        // An unparseable envelope is answered, not dropped.
-        ipc::write_frame(&mut client, b"this is not json", MAX_ENVELOPE).unwrap();
-        let frame = ipc::read_frame(&mut client, MAX_ENVELOPE).unwrap();
-        let resp: Response = serde_json::from_slice(&frame).unwrap();
-        assert_eq!(resp.id, "?");
-        assert_eq!(resp.error.unwrap().code, "bad.request");
+        let resp = roundtrip(&mut client, &test_request("ping", None, json!({})));
+        assert!(resp.ok && resp.id == "rid-1");
 
         let stale = Request {
             v: PROTO_MAJOR + 3,
@@ -6159,6 +7033,7 @@ mod tests {
             method: "ping".into(),
             project: None,
             params: json!({}),
+            body: None,
         };
         let resp = roundtrip(&mut client, &stale);
         assert_eq!(error_code_of(&resp), "store.version_mismatch");
@@ -6179,9 +7054,12 @@ mod tests {
         );
         assert_eq!(error_code_of(&resp), "project.not_enrolled");
 
-        // EOF ends the connection loop cleanly.
-        drop(client);
-        actor.join().unwrap().expect("serve_connection ends at EOF");
+        ipc::write_frame(&mut client, b"this is not json", MAX_ENVELOPE).unwrap();
+        assert!(ipc::read_frame(&mut client, MAX_ENVELOPE).is_err());
+        actor
+            .join()
+            .unwrap()
+            .expect("serve_connection closes after malformed JSON");
     }
 
     #[test]
@@ -6369,6 +7247,7 @@ mod tests {
             let (response, _body) = dispatch(
                 &shared,
                 &test_request(method, Some(root.clone()), params),
+                None,
                 &mut shutting_down,
             );
             assert_eq!(error_code_of(&response), "internal", "{method}");
@@ -6592,6 +7471,7 @@ mod tests {
             let (resp, body) = dispatch(
                 &shared,
                 &test_request(method, Some(root.clone()), params),
+                None,
                 &mut shutting_down,
             );
             assert!(!resp.ok, "{method} must fail");
@@ -6638,6 +7518,7 @@ mod tests {
                 let (resp, body) = dispatch(
                     &shared,
                     &test_request(verb, Some(root.clone()), params),
+                    None,
                     &mut shutting_down,
                 );
                 let elapsed = started.elapsed();
@@ -6692,6 +7573,7 @@ mod tests {
             dispatch(
                 &shared,
                 &test_request(method, Some(root.clone()), params),
+                None,
                 &mut shutting_down.borrow_mut(),
             )
         };
@@ -6776,6 +7658,7 @@ mod tests {
             dispatch(
                 &shared,
                 &test_request("smart.plan", Some(root.clone()), params),
+                None,
                 &mut shutting_down.borrow_mut(),
             )
         };
@@ -6800,6 +7683,7 @@ mod tests {
         let (resp, _) = dispatch(
             &shared,
             &test_request("timeline.log", Some(root.clone()), json!({})),
+            None,
             &mut shutting_down.borrow_mut(),
         );
         assert!(resp.ok, "warm-up failed: {:?}", resp.error);
@@ -6845,6 +7729,7 @@ mod tests {
             dispatch(
                 &shared,
                 &test_request(method, Some(root.clone()), params),
+                None,
                 &mut shutting_down.borrow_mut(),
             )
         };
@@ -6900,6 +7785,7 @@ mod tests {
             dispatch(
                 &shared,
                 &test_request(method, Some(primary.clone()), params),
+                None,
                 &mut shutting_down.borrow_mut(),
             )
         };

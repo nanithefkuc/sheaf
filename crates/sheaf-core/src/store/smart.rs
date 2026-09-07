@@ -1782,11 +1782,13 @@ mod tests {
             checkpoints: checkpoints.iter().map(|c| c.to_string()).collect(),
             origin: kind.map(|kind| CaptureOrigin {
                 kind,
+                source: None,
                 target: None,
                 scope: vec![],
                 selections: vec![],
             }),
             on_current: true,
+            stats: None,
         };
         let newest_first = vec![
             cap(&["src/lib.rs"], Some(OriginKind::Restore), &["cp-a"]),
@@ -1854,11 +1856,13 @@ mod tests {
             checkpoints: cps.iter().map(|s| (*s).into()).collect(),
             origin: kind.map(|k| CaptureOrigin {
                 kind: k,
+                source: None,
                 target: None,
                 scope: vec![],
                 selections: vec![],
             }),
             on_current: true,
+            stats: None,
         };
         let result = smart_attribution(
             &[
@@ -1890,11 +1894,13 @@ mod tests {
             checkpoints: vec![],
             origin: Some(CaptureOrigin {
                 kind: OriginKind::PreRestore,
+                source: None,
                 target: None,
                 scope: vec![],
                 selections: vec![],
             }),
             on_current: true,
+            stats: None,
         };
         let result = smart_attribution(
             &[capture],

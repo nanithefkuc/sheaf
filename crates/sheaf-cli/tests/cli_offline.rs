@@ -938,8 +938,11 @@ fn gc_offline_reports_plans_expiry_marks_and_applies() {
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "the marked capture is gone: {text}");
+    // Churn recorded at commit survives the parent capture being pruned: the
+    // summary still names the file count rather than falling back. (A pure add
+    // scores no line churn in the differ, so no `+/-` tail here.)
     assert!(
-        lines[0].contains(&middle[..12]) && lines[0].contains("details pruned"),
+        lines[0].contains(&middle[..12]) && lines[0].contains("1 file"),
         "{text}"
     );
     assert!(lines[1].contains(&newest[..12]), "{text}");
