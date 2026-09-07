@@ -46,6 +46,13 @@ enum Cmd {
         /// Project directory (default: nearest ancestor with a store).
         path: Option<PathBuf>,
     },
+    /// Warm the project store ahead of the first command: ask `sheafd` to
+    /// open it now, the same signal an editor plugin sends when it detects
+    /// `.sheaf/`. No-op when the store is already open.
+    Preload {
+        /// Project directory (default: nearest ancestor with a store).
+        path: Option<PathBuf>,
+    },
     /// Browse one branch's capture history.
     ///
     /// Human output selects the newest page but prints it oldest → newest,
@@ -695,6 +702,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         Cmd::Init { path } => cmd_init(path.as_deref()),
         Cmd::Status { path } => cmd_status(path.as_deref()),
+        Cmd::Preload { path } => cmd_preload(path.as_deref()),
         Cmd::Log {
             project,
             branch,
@@ -1021,6 +1029,13 @@ fn cmd_status(path: Option<&Path>) -> CliResult {
         );
         let legacy = cfg.ignore.patterns.len();
         println!(
+            "store close:   {}",
+            match cfg.store.idle_close_secs {
+                -1 => "never — kept resident while sheafd runs".to_string(),
+                n => format!("after {n}s idle ([store] idle_close_secs)"),
+            }
+        );
+        println!(
             "classify:      volatile={} config patterns{} gitignore={} durable-overrides={}",
             cfg.classify.volatile.len() + legacy,
             if legacy > 0 {
@@ -1070,6 +1085,44 @@ fn cmd_status(path: Option<&Path>) -> CliResult {
     }
 
     report_daemon_status(Some(&root));
+    Ok(())
+}
+
+/// `sheaf preload`: ask the daemon to open this project's store now — the
+/// same signal an editor plugin sends when it detects `.sheaf/` at
+/// workspace open, so the first `log`/`diff` after a fresh boot is warm
+/// instead of `project.warming`. No-op when the store is already open.
+fn cmd_preload(path: Option<&Path>) -> CliResult {
+    let start = match path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("no current directory")?,
+    };
+    let root = resolve_project_root(&start)
+        .map(|r| normalize_existing(&r))
+        .with_context(|| format!("no sheaf store above {}", start.display()))?;
+    let socket = sheaf_core::paths::control_socket_path();
+    let mut client = Client::connect(&socket, Duration::from_secs(2))
+        .context("sheafd is not running; start it with `sheafd run`")?;
+    // Preload waits out the whole cold open server-side; the client read
+    // budget must cover that wait plus protocol slack.
+    client.set_timeout(Duration::from_secs(35))?;
+    let reply = client.call("project.preload", Some(&root), serde_json::json!({}), None)?;
+    if !reply.response.ok {
+        return Err(anyhow::anyhow!(ipc_error_text(&reply.response)).into());
+    }
+    let value = reply.response.result.unwrap_or_default();
+    let state = value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let elapsed = value
+        .get("elapsed_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    match state {
+        "ready" => println!("preload: store ready ({elapsed} ms)"),
+        other => println!("preload: {other}; the store is still opening"),
+    }
     Ok(())
 }
 
@@ -4496,26 +4549,13 @@ impl<'a> SquashCtx<'a> {
             anyhow::bail!("daemon unavailable");
         };
         client.set_timeout(SQUASH_READ_BUDGET)?;
-        // A lazily-parked project answers the first request with a
-        // retryable `project.warming` while its store opens (a large store
-        // outlasts the daemon's cold-open budget). Honor the daemon's
-        // "retry shortly" contract so a squash right after `sheafd` starts
-        // resolves fully instead of silently degrading to partial stats.
-        let deadline = std::time::Instant::now() + SQUASH_READ_BUDGET;
-        loop {
-            let reply = client.call(method, Some(self.root), params.clone(), None)?;
-            if reply.response.ok {
-                return Ok(reply.response.result.unwrap_or_default());
-            }
-            let warming = reply
-                .response
-                .error
-                .as_ref()
-                .is_some_and(|e| e.code == "project.warming");
-            if warming && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(150));
-                continue;
-            }
+        // `project.warming` retries live in `Client::call`, so a squash
+        // right after `sheafd` starts resolves fully instead of degrading
+        // to partial stats; the wider budget here just bounds each read.
+        let reply = client.call(method, Some(self.root), params, None)?;
+        if reply.response.ok {
+            Ok(reply.response.result.unwrap_or_default())
+        } else {
             anyhow::bail!(ipc_error_text(&reply.response));
         }
     }

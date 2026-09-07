@@ -62,6 +62,8 @@ fn limits(max_segment_bytes: u64, every: u64) -> StoreLimits {
     StoreLimits {
         max_segment_bytes,
         snapshot_edit_size: every,
+
+        ..Default::default()
     }
 }
 

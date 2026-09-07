@@ -313,7 +313,10 @@ pub fn visit_records(
         }
     }
     if dropped > 0 {
-        tracing::warn!(dropped, "journal replay dropped torn frames; store integrity unaffected");
+        tracing::warn!(
+            dropped,
+            "journal replay dropped torn frames; store integrity unaffected"
+        );
     }
 }
 

@@ -120,7 +120,9 @@ echo "== log: follow a path through its renames =="
   || fail "without follow, pre-rename captures should stay hidden"
 [ "$(sheaf log --path src/strs.rs --follow --limit 1000 --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["entries"]))')" -ge 2 ] \
   || fail "--follow must include old-name captures"
-sheaf log --path src/strs.rs --follow | grep -q "src/util/strings.rs" || fail "follow omits the old name"
+# Human log prints per-entry paths only with -v; this grep checks the
+# old name is rendered through the rename.
+sheaf log --path src/strs.rs --follow -v | grep -q "src/util/strings.rs" || fail "follow omits the old name"
 ok "log --follow crosses the rename"
 
 echo "== the ugly branch case: rollback, divergence, checkpoints =="
@@ -260,7 +262,7 @@ sleep 1
 sheaf diff checkpoint:morning > "$E/deg.txt" 2>"$E/deg.err" || fail "degraded diff"
 grep -q "read-only store snapshot" "$E/deg.err" || fail "degraded note missing"
 grep -q "rename" "$E/deg.txt" || true  # state-dependent; only the path above is asserted
-sheaf log --path src/strs.rs --follow | grep -q "src/util/strings.rs" || fail "degraded follow"
+sheaf log --path src/strs.rs --follow -v | grep -q "src/util/strings.rs" || fail "degraded follow"
 sheaf checkpoint list | grep -q morning || fail "degraded checkpoint list"
 sheaf restore --at checkpoint:morning --dry-run >/dev/null || fail "degraded dry-run"
 ok "daemon down: diff, log --follow, checkpoints, dry-run all work"

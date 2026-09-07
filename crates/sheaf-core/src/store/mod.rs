@@ -164,8 +164,8 @@ fn state_dir(root: &Path) -> PathBuf {
 // ------------------------------------------------------------------ limits
 
 /// Store cadence knobs, configurable via the `[store]` section of
-/// `config.toml` (`snapshot_edit_size`, `max_segment_bytes`); older files
-/// keep these defaults. Values bind at store open.
+/// `config.toml`; older files keep these defaults. Values bind at store
+/// open (or watch spawn for the idle-close budget).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreLimits {
     /// Rotate the active journal segment at this many bytes.
@@ -179,6 +179,13 @@ pub struct StoreLimits {
         alias = "snapshot_every_batches"
     )]
     pub snapshot_edit_size: u64,
+    /// Unload the store from daemon memory after this many seconds with no
+    /// routed worktree event, no writer command, and no editor keepalive
+    /// ping. `-1` keeps the store resident until the daemon stops; any
+    /// later activity pays a fresh cold open. Read at watch spawn, so a
+    /// change needs a daemon restart, like the `[watch]` cadence knobs.
+    #[serde(default = "default_idle_close_secs")]
+    pub idle_close_secs: i64,
 }
 
 fn default_max_segment_bytes() -> u64 {
@@ -187,12 +194,16 @@ fn default_max_segment_bytes() -> u64 {
 fn default_snapshot_edit_size() -> u64 {
     512
 }
+fn default_idle_close_secs() -> i64 {
+    900
+}
 
 impl Default for StoreLimits {
     fn default() -> Self {
         StoreLimits {
             max_segment_bytes: default_max_segment_bytes(),
             snapshot_edit_size: default_snapshot_edit_size(),
+            idle_close_secs: default_idle_close_secs(),
         }
     }
 }
@@ -2111,6 +2122,8 @@ mod tests {
         let limits = StoreLimits {
             max_segment_bytes: 64 << 20,
             snapshot_edit_size: 1000,
+
+            ..Default::default()
         };
         let (store, outcome) = capture_files(root, limits, &["big.txt"]).expect("capture applies");
         assert_eq!(
@@ -2147,6 +2160,8 @@ mod tests {
         let limits = StoreLimits {
             max_segment_bytes: 512 << 20,
             snapshot_edit_size: 1000,
+
+            ..Default::default()
         };
         let (store, outcome) = capture_files(root, limits, &refs).expect("capture applies");
         assert!(
@@ -2245,6 +2260,8 @@ mod tests {
         let small = StoreLimits {
             max_segment_bytes: 32 * 1024,
             snapshot_edit_size: 1000,
+
+            ..Default::default()
         };
         let (_, outcome) =
             capture_files(root, small.clone(), &["tail.txt"]).expect("capture applies");
@@ -2263,6 +2280,8 @@ mod tests {
         let large = StoreLimits {
             max_segment_bytes: 512 << 20,
             snapshot_edit_size: 1000,
+
+            ..Default::default()
         };
         let (_, o2) = capture_files(root2, large, &["tail.txt"]).expect("capture applies");
         assert!(!o2.snapshotted, "large cap must not snapshot yet");
@@ -2503,6 +2522,8 @@ mod tests {
                 StoreLimits {
                     max_segment_bytes: 4 << 20,
                     snapshot_edit_size: 3,
+
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -2521,6 +2542,8 @@ mod tests {
             StoreLimits {
                 max_segment_bytes: 4 << 20,
                 snapshot_edit_size: 3,
+
+                ..Default::default()
             },
         );
         let err = outcome

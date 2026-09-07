@@ -115,6 +115,8 @@ fn timeline_grep_streams_records_and_matches_the_reader() {
             StoreLimits {
                 max_segment_bytes: 4 << 20,
                 snapshot_edit_size: 1_000,
+
+                ..Default::default()
             },
         )
         .unwrap();
@@ -244,6 +246,8 @@ fn anchored_history_streams_and_matches_the_reader() {
             StoreLimits {
                 max_segment_bytes: 4 << 20,
                 snapshot_edit_size: 1_000,
+
+                ..Default::default()
             },
         )
         .unwrap();

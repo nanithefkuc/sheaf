@@ -34,6 +34,8 @@ fn limits() -> StoreLimits {
     StoreLimits {
         max_segment_bytes: 4 << 20,
         snapshot_edit_size: 3,
+
+        ..Default::default()
     }
 }
 
@@ -287,6 +289,8 @@ fn reopened_store_snapshots_according_to_its_journal_tail_not_process_age() {
     let no_compaction = StoreLimits {
         max_segment_bytes: 4 << 20,
         snapshot_edit_size: u64::MAX,
+
+        ..Default::default()
     };
     {
         let mut store = ProjectStore::open(root, no_compaction).unwrap();

@@ -42,6 +42,8 @@ fn open(root: &Path) -> ProjectStore {
             // measures replay, not segment enumeration overhead.
             max_segment_bytes: 64 << 20,
             snapshot_edit_size: 500,
+
+            ..Default::default()
         },
     )
     .unwrap()

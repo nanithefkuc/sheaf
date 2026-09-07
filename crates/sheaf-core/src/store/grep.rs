@@ -1096,7 +1096,11 @@ impl GrepContentCache {
             pending.push((key, mapping));
         }
         if publish_failed > 0 {
-            tracing::warn!(failed = publish_failed, total = publish_total, "grep content publish finished with failures");
+            tracing::warn!(
+                failed = publish_failed,
+                total = publish_total,
+                "grep content publish finished with failures"
+            );
         }
         if pending.is_empty() {
             return (0, blobs_written);
@@ -1399,7 +1403,11 @@ impl GrepContentCache {
                 .collect::<Vec<_>>();
             let total = capture.paths.len();
             if failed > 0 {
-                tracing::warn!(failed, total, "grep capture indexing finished with failures");
+                tracing::warn!(
+                    failed,
+                    total,
+                    "grep capture indexing finished with failures"
+                );
             }
             rows
         };
@@ -4002,7 +4010,11 @@ impl ProjectStore {
         }
         let walk1_failed = report.captures_failed;
         if walk1_failed > 0 {
-            tracing::warn!(failed = walk1_failed, total = walk1_attempted, "grep cache backfill finished with failures");
+            tracing::warn!(
+                failed = walk1_failed,
+                total = walk1_attempted,
+                "grep cache backfill finished with failures"
+            );
         } else if walk1_attempted > 0 {
             tracing::debug!(total = walk1_attempted, "grep cache backfill complete");
         }
@@ -4059,7 +4071,11 @@ impl ProjectStore {
             }
             let walk2_failed = report.captures_failed - walk1_failed;
             if walk2_failed > 0 {
-                tracing::warn!(failed = walk2_failed, total = walk2_attempted, "grep cache backfill finished with failures");
+                tracing::warn!(
+                    failed = walk2_failed,
+                    total = walk2_attempted,
+                    "grep cache backfill finished with failures"
+                );
             } else if walk2_attempted > 0 {
                 tracing::debug!(total = walk2_attempted, "grep cache backfill complete");
             }

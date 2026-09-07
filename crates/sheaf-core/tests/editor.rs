@@ -261,7 +261,12 @@ fn editor_path_rejects_relative_symlink_and_untracked_inputs() {
 
     // A relative path is refused before any filesystem work.
     let relative = store
-        .apply_editor_snapshot(Path::new("note.txt"), "x\n", Utc::now(), editor_origin(None))
+        .apply_editor_snapshot(
+            Path::new("note.txt"),
+            "x\n",
+            Utc::now(),
+            editor_origin(None),
+        )
         .unwrap_err();
     assert_eq!(relative.code(), "editor.unsupported");
 
@@ -276,7 +281,10 @@ fn editor_path_rejects_relative_symlink_and_untracked_inputs() {
     // editor_text on a never-tracked path is unsupported, not a panic.
     let untracked = root.join("fresh.txt");
     std::fs::write(&untracked, "hi\n").unwrap();
-    assert_eq!(store.editor_text(&untracked).unwrap_err().code(), "editor.unsupported");
+    assert_eq!(
+        store.editor_text(&untracked).unwrap_err().code(),
+        "editor.unsupported"
+    );
 }
 
 #[test]
@@ -288,7 +296,12 @@ fn editor_snapshot_over_the_text_budget_is_rejected() {
     let mut store = open_small_budget(root);
     capture_disk(&mut store, root, &path);
     let error = store
-        .apply_editor_snapshot(&path, "much longer than eight bytes\n", Utc::now(), editor_origin(None))
+        .apply_editor_snapshot(
+            &path,
+            "much longer than eight bytes\n",
+            Utc::now(),
+            editor_origin(None),
+        )
         .unwrap_err();
     assert_eq!(error.code(), "editor.unsupported");
 }
@@ -314,11 +327,17 @@ fn identical_editor_snapshot_records_nothing() {
     std::fs::write(&path, "same\n").unwrap();
     let mut store = open(root);
     capture_disk(&mut store, root, &path);
-    let before = store.captures(false, None, false, usize::MAX).unwrap().len();
+    let before = store
+        .captures(false, None, false, usize::MAX)
+        .unwrap()
+        .len();
     let outcome = store
         .apply_editor_snapshot(&path, "same\n", Utc::now(), editor_origin(None))
         .unwrap();
     assert!(outcome.capture.is_none());
-    let after = store.captures(false, None, false, usize::MAX).unwrap().len();
+    let after = store
+        .captures(false, None, false, usize::MAX)
+        .unwrap()
+        .len();
     assert_eq!(before, after);
 }

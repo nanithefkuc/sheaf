@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,7 +68,13 @@ pub const PROTO_MAJOR: u32 = 1;
 /// Minor 14: request envelopes may announce counted upload chunks, and
 /// `project.resolve`, `editor.capture`, and `editor.step` join the catalog.
 /// Additive only; editor clients gate uploads on the advertised capabilities.
-pub const PROTO_MINOR: u32 = 14;
+///
+/// Minor 15: `project.preload` warms a lazily parked store ahead of the
+/// first command, and `project.keepalive` stamps the project's idle clock
+/// so an open editor keeps the store resident (`release: true` asks for a
+/// prompt close). `project.status` gains additive `store_loaded`, `idle_ms`,
+/// and `idle_close_secs` fields. Additive only.
+pub const PROTO_MINOR: u32 = 15;
 
 /// Maximum size of one JSON envelope frame (1 MiB).
 pub const MAX_ENVELOPE: usize = 1024 * 1024;
@@ -93,12 +99,16 @@ pub struct Request {
 }
 
 /// A structured error carried in a failed response: a stable machine code
-/// plus an optional human message.
+/// plus an optional human message. `retryable` marks the narrow class of
+/// transient errors a client may re-issue unchanged (today only the
+/// lazy-store warming error); absent or false means fail fast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcError {
     pub code: String,
     #[serde(default)]
     pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 impl IpcError {
@@ -107,6 +117,17 @@ impl IpcError {
         IpcError {
             code: code.into(),
             message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// Build an error the client may re-issue unchanged within a bounded
+    /// window.
+    pub fn retryable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        IpcError {
+            code: code.into(),
+            message: message.into(),
+            retryable: true,
         }
     }
 }
@@ -215,6 +236,14 @@ pub struct Reply {
     pub body: Vec<u8>,
 }
 
+/// Total window a client honors the daemon's retryable `project.warming`
+/// contract: a lazily parked project answers the first request with that
+/// error while its store opens (journal replay outlasts the daemon's
+/// 1.25 s cold-open budget), and the request is retried until it lands.
+const WARMING_RETRY_WINDOW: Duration = Duration::from_secs(15);
+/// Pause between warming retries; the daemon re-pings its wake each try.
+const WARMING_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 impl Client {
     /// Connect to the daemon at `socket`, applying `timeout` to reads and
     /// writes.
@@ -236,13 +265,6 @@ impl Client {
 
     /// Send one request and fully read its response, buffering any body
     /// (streamed or counted) into the returned [`Reply`].
-    ///
-    /// A response whose id does not match the request is an orphan left by
-    /// an earlier call that timed out client-side after its request reached
-    /// the daemon: the daemon answered late, and that answer now sits ahead
-    /// of ours in the stream. Such stale (older-id) responses are drained —
-    /// body and all — so this call still returns its own answer instead of
-    /// silently handing back the wrong one.
     pub fn call(
         &mut self,
         method: &str,
@@ -250,33 +272,7 @@ impl Client {
         params: Value,
         body: Option<&[u8]>,
     ) -> Result<Reply> {
-        let id = self.send_request(method, project, params, body)?;
-
-        loop {
-            let resp = self.read_envelope()?;
-            if resp.id == id {
-                let mut body_out = Vec::new();
-                if let Some(info) = &resp.body {
-                    if info.chunks == STREAMED_BODY_SENTINEL {
-                        // Streamed body: buffer it whole for this buffered caller.
-                        while let Some(chunk) = self.read_stream_chunk()? {
-                            body_out.extend_from_slice(&chunk);
-                        }
-                    } else {
-                        for _ in 0..info.chunks {
-                            let chunk = read_frame(&mut self.stream, MAX_CHUNK)
-                                .map_err(|e| SheafError::Ipc(format!("read body chunk: {e}")))?;
-                            body_out.extend_from_slice(&chunk);
-                        }
-                    }
-                }
-                return Ok(Reply {
-                    response: resp,
-                    body: body_out,
-                });
-            }
-            self.drain_orphan(&resp, &id)?;
-        }
+        self.call_retrying(method, project, params, body, None)
     }
 
     /// Like [`Client::call`], but for a streamed-body method: `on_chunk`
@@ -290,23 +286,74 @@ impl Client {
         params: Value,
         on_chunk: &mut dyn FnMut(&[u8]),
     ) -> Result<Reply> {
-        let id = self.send_request(method, project, params, None)?;
+        self.call_retrying(method, project, params, None, Some(on_chunk))
+    }
 
+    /// `call`/`call_streaming` with one retry policy: a RETRYABLE
+    /// `project.warming` response (a lazily parked store still opening) is
+    /// retried until the window lapses. Eager-boot warming is never
+    /// retried — its contract is fail-fast so a mutation is never queued
+    /// to execute after its caller gave up. The socket read timeout still
+    /// bounds every single attempt, so a hung daemon surfaces as a
+    /// transport error, not a silent stall.
+    fn call_retrying(
+        &mut self,
+        method: &str,
+        project: Option<&Path>,
+        params: Value,
+        body: Option<&[u8]>,
+        mut on_chunk: Option<&mut dyn FnMut(&[u8])>,
+    ) -> Result<Reply> {
+        let deadline = Instant::now() + WARMING_RETRY_WINDOW;
+        loop {
+            let reply = self.exchange(method, project, &params, body, &mut on_chunk)?;
+            let warming = !reply.response.ok
+                && reply
+                    .response
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.code == "project.warming" && e.retryable);
+            if warming && Instant::now() < deadline {
+                std::thread::sleep(WARMING_RETRY_INTERVAL);
+                continue;
+            }
+            return Ok(reply);
+        }
+    }
+    /// One request/response exchange: envelope out, response matched by
+    /// correlation id, any body reassembled (streamed chunks pass through
+    /// `on_chunk` as they arrive).
+    fn exchange(
+        &mut self,
+        method: &str,
+        project: Option<&Path>,
+        params: &Value,
+        body: Option<&[u8]>,
+        on_chunk: &mut Option<&mut dyn FnMut(&[u8])>,
+    ) -> Result<Reply> {
+        let id = self.send_request(method, project, params.clone(), body)?;
         loop {
             let resp = self.read_envelope()?;
             if resp.id == id {
                 let mut body_out = Vec::new();
                 if let Some(info) = &resp.body {
                     if info.chunks == STREAMED_BODY_SENTINEL {
+                        // Streamed body: chunks flow to the caller as they
+                        // arrive; a stale response is not the caller's data
+                        // and is drained without firing `on_chunk`.
                         while let Some(chunk) = self.read_stream_chunk()? {
-                            on_chunk(&chunk);
+                            if let Some(f) = on_chunk.as_mut() {
+                                f(&chunk);
+                            }
                             body_out.extend_from_slice(&chunk);
                         }
                     } else {
                         for _ in 0..info.chunks {
                             let chunk = read_frame(&mut self.stream, MAX_CHUNK)
                                 .map_err(|e| SheafError::Ipc(format!("read body chunk: {e}")))?;
-                            on_chunk(&chunk);
+                            if let Some(f) = on_chunk.as_mut() {
+                                f(&chunk);
+                            }
                             body_out.extend_from_slice(&chunk);
                         }
                     }
@@ -316,8 +363,6 @@ impl Client {
                     body: body_out,
                 });
             }
-            // A stale response is not the caller's data: drain it without
-            // firing `on_chunk`.
             self.drain_orphan(&resp, &id)?;
         }
     }

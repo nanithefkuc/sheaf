@@ -16,13 +16,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
+use parking_lot::Mutex;
 use serde_json::json;
 
 use sheaf_core::config::sheaf_dir;
@@ -121,6 +122,11 @@ struct WatchEntry {
     /// Lazy-open trigger: IPC commands to a cold project send here so the
     /// collector wakes, opens the store, and only then drains the command.
     wake: Sender<()>,
+    /// Millis since daemon start of the last store activity: a routed
+    /// worktree event, a handled writer command, or an editor keepalive
+    /// ping. The collector compares this against `[store] idle_close_secs`
+    /// each tick; `project.keepalive` stamps it from the IPC side.
+    idle_clock: Arc<AtomicU64>,
 }
 
 /// One message from the collector's grep walk to the connection writer:
@@ -361,6 +367,10 @@ enum StoreCommand {
     ResumeMerge {
         reply: Sender<std::result::Result<sheaf_core::store::MergeOutcome, sheaf_core::SheafError>>,
     },
+    /// Editor-released unload request (`project.keepalive` with
+    /// `release`). Intercepted in `collect_loop` before the ordinary
+    /// command path: the reply says whether the close can happen now.
+    CloseStore { reply: Sender<bool> },
 }
 
 /// The collector side of `smart.plan`: phase one names candidate paths,
@@ -391,13 +401,12 @@ impl Shared {
     }
 
     fn watching(&self, root: &Path) -> bool {
-        self.table.lock().unwrap().contains_key(&normalize(root))
+        self.table.lock().contains_key(&normalize(root))
     }
 
     fn cold(&self, root: &Path) -> bool {
         self.table
             .lock()
-            .unwrap()
             .get(&normalize(root))
             .is_some_and(|entry| entry.cold.load(Ordering::Acquire))
     }
@@ -405,7 +414,6 @@ impl Shared {
     fn ready(&self, root: &Path) -> bool {
         self.table
             .lock()
-            .unwrap()
             .get(&normalize(root))
             .is_some_and(|entry| entry.ready.load(Ordering::Acquire))
     }
@@ -414,6 +422,31 @@ impl Shared {
         let reg = Registry::global()?;
         Ok(reg.list()?.iter().any(|e| same_root(&e.root, root)))
     }
+
+    /// Record activity on a project's idle clock (editor keepalive). Cheap
+    /// and unconditional: the clock only gates the close decision while the
+    /// store is warm, and a fresh open re-stamps it anyway.
+    fn stamp_idle(&self, root: &Path) {
+        if let Some(entry) = self.table.lock().get(&normalize(root)) {
+            entry.idle_clock.store(stamp_now(), Ordering::Release);
+        }
+    }
+
+    /// Millis since the project's store last saw activity, when watched.
+    fn idle_ms(&self, root: &Path) -> Option<u64> {
+        self.table
+            .lock()
+            .get(&normalize(root))
+            .map(|e| stamp_now().saturating_sub(e.idle_clock.load(Ordering::Acquire)))
+    }
+}
+
+/// Millis since daemon start — the unit of the shared idle clocks. A
+/// process-lifetime `Instant` plus `AtomicU64` stamps: no lock, and the
+/// collector reads the clock every poll tick.
+fn stamp_now() -> u64 {
+    static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
+    STARTED.elapsed().as_millis() as u64
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -579,7 +612,7 @@ fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener, started: Insta
 
     // Phase 1: stop the event producers so no new batch can start.
     {
-        let mut table = shared.table.lock().unwrap();
+        let mut table = shared.table.lock();
         for entry in table.values_mut() {
             entry.stop.store(true, Ordering::SeqCst);
             for h in entry.watch_handles.drain(..) {
@@ -591,7 +624,7 @@ fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener, started: Insta
     // shutdown flush" contract: a burst that started before SIGTERM still
     // lands in the journal with its fsync, instead of dying at the socket.
     {
-        let mut table = shared.table.lock().unwrap();
+        let mut table = shared.table.lock();
         for (root, mut entry) in table.drain() {
             let collector = entry.collector.take();
             // Release this entry's stored event sender before waiting. The
@@ -610,7 +643,10 @@ fn graceful_shutdown(shared: Arc<Shared>, listener: UnixListener, started: Insta
     drop(listener);
     // Socket removal last so probes never see live-but-exiting states.
     let _ = std::fs::remove_file(&shared.socket_path);
-    tracing::info!(uptime_ms = started.elapsed().as_millis() as u64, "daemon stopped");
+    tracing::info!(
+        uptime_ms = started.elapsed().as_millis() as u64,
+        "daemon stopped"
+    );
     std::process::exit(0);
 }
 
@@ -890,7 +926,7 @@ fn refresh_classifications(root: &Path, shared: &watcher::SharedClassifier) {
 fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool {
     let root_n = normalize(root);
     {
-        let table = shared.table.lock().unwrap();
+        let table = shared.table.lock();
         if table.contains_key(&root_n) {
             return true; // idempotent
         }
@@ -1008,6 +1044,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
     // open nothing yet; the collector thread does it on first activity.
     let policy = effective_policy(&root_n, policy);
     let store_limits = cfg.store.clone();
+    let idle_close = idle_close_from(&cfg, &root_n);
     let eager_pair = if matches!(policy, OpenPolicy::Eager) {
         match open_store_locked(&root_n, store_limits.clone(), cfg.watch.max_tracked_bytes) {
             Ok(pair) => Some(pair),
@@ -1031,73 +1068,102 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
     // Eager entries hold an open store from the start; only lazy ones are
     // cold. Keeping the distinction in the initial value means the warming
     // gate alone governs the eager boot window (fail-fast, never queue),
-    // while cold is exclusively the lazy parked state.
+    // while cold is exclusively the lazy parked state. It flips back when
+    // the idle-close budget unloads the store.
     let cold = Arc::new(AtomicBool::new(matches!(policy, OpenPolicy::Lazy)));
     let collector_stop = stop_flag.clone();
     let scratch_cfg = cfg.scratch.clone();
+    let idle_clock = Arc::new(AtomicU64::new(0));
     let collector_thread = {
         let root_n2 = root_n.clone();
         let classifier2 = classifier.clone();
         let ready2 = ready.clone();
         let cold2 = cold.clone();
+        let idle_clock2 = idle_clock.clone();
         std::thread::Builder::new()
             .name(format!("collect:{}", root_n.display()))
             .spawn(move || {
-                let (store, lock_file, initial_mute) = match eager_pair {
-                    Some((mut store, lock_file)) => {
-                        let cls = classifier2.read().clone();
-                        let mute =
-                            boot_reconcile_store(&root_n2, &mut store, &cls, max_resume_age_ms);
-                        ready2.store(true, Ordering::Release);
-                        (store, lock_file, mute)
+                // The store's life on this daemon run is a cycle: park
+                // cold until the first activity, open and reconcile,
+                // serve until the idle-close budget lapses, flush the
+                // tails, drop the store and its flock, and park again.
+                // The channels (events, control, wake) span every cycle;
+                // only the store and its writer flock come and go.
+                let mut eager = eager_pair;
+                let wake_rx = wake_rx;
+                let mut rx_ev = rx_ev;
+                let mut control_rx = control_rx;
+                loop {
+                    let (store, lock_file, initial_mute) = match eager.take() {
+                        Some((mut store, lock_file)) => {
+                            let cls = classifier2.read().clone();
+                            let mute =
+                                boot_reconcile_store(&root_n2, &mut store, &cls, max_resume_age_ms);
+                            ready2.store(true, Ordering::Release);
+                            (store, lock_file, mute)
+                        }
+                        None => {
+                            let Some((mut store, lock_file)) = collect_cold(
+                                &root_n2,
+                                &rx_ev,
+                                &wake_rx,
+                                &collector_stop,
+                                store_limits.clone(),
+                                max_tracked_bytes,
+                            ) else {
+                                return; // stopped while parked; nothing to flush
+                            };
+                            let cls = classifier2.read().clone();
+                            let mute =
+                                boot_reconcile_store(&root_n2, &mut store, &cls, max_resume_age_ms);
+                            cold2.store(false, Ordering::Release);
+                            ready2.store(true, Ordering::Release);
+                            (store, lock_file, mute)
+                        }
+                    };
+                    idle_clock2.store(stamp_now(), Ordering::Release);
+                    // Journal replay is the most allocation-heavy thing this
+                    // process ever does, and nothing in the steady state needs
+                    // what it transiently allocated. Without an explicit trim,
+                    // glibc holds the freed arenas indefinitely: a store that
+                    // took GiB to open idled hundreds of MiB above its true
+                    // footprint until the first memory-heavy command happened
+                    // to trim. Return the replay's pages now.
+                    trim_process_heap();
+                    match collect_loop(
+                        root_n2.clone(),
+                        rx_ev,
+                        control_rx,
+                        deb_cfg.clone(),
+                        store,
+                        classifier2.clone(),
+                        scratch_cfg.clone(),
+                        initial_mute,
+                        lock_file,
+                        max_resume_age_ms,
+                        idle_close,
+                        idle_clock2.as_ref(),
+                        &wake_rx,
+                    ) {
+                        LoopExit::Shutdown => return,
+                        LoopExit::IdleClosed { rx, control } => {
+                            rx_ev = rx;
+                            control_rx = control;
+                            cold2.store(true, Ordering::Release);
+                            ready2.store(false, Ordering::Release);
+                            trim_process_heap();
+                            tracing::info!(
+                                root = %root_n2.display(),
+                                "store unloaded after the idle-close budget"
+                            );
+                        }
                     }
-                    None => {
-                        let Some((mut store, lock_file)) = collect_cold(
-                            &root_n2,
-                            &rx_ev,
-                            &wake_rx,
-                            &collector_stop,
-                            store_limits,
-                            max_tracked_bytes,
-                        ) else {
-                            return; // stopped before any activity; nothing to flush
-                        };
-                        let cls = classifier2.read().clone();
-                        let mute =
-                            boot_reconcile_store(&root_n2, &mut store, &cls, max_resume_age_ms);
-                        cold2.store(false, Ordering::Release);
-                        ready2.store(true, Ordering::Release);
-                        // The wake channel has served its purpose; letting it
-                        // hang would buffer every post-open wake forever.
-                        drop(wake_rx);
-                        (store, lock_file, mute)
-                    }
-                };
-                // Journal replay is the most allocation-heavy thing this
-                // process ever does, and nothing in the steady state needs
-                // what it transiently allocated. Without an explicit trim,
-                // glibc holds the freed arenas indefinitely: a store that
-                // took GiB to open idled hundreds of MiB above its true
-                // footprint until the first memory-heavy command happened
-                // to trim. Return the replay's pages now.
-                trim_process_heap();
-                collect_loop(
-                    root_n2,
-                    rx_ev,
-                    control_rx,
-                    deb_cfg,
-                    store,
-                    classifier2,
-                    scratch_cfg,
-                    initial_mute,
-                    lock_file,
-                    max_resume_age_ms,
-                )
+                }
             })
             .expect("spawn collector thread")
     };
 
-    shared.table.lock().unwrap().insert(
+    shared.table.lock().insert(
         root_n.clone(),
         WatchEntry {
             stop: stop_flag,
@@ -1108,6 +1174,7 @@ fn spawn_watch_policy(shared: &Shared, root: &Path, policy: OpenPolicy) -> bool 
             collector: Some(collector_thread),
             control: control_tx,
             wake: wake_tx,
+            idle_clock,
         },
     );
     tracing::info!(root = %root_n.display(), cold = matches!(policy, OpenPolicy::Lazy), "watch started");
@@ -1281,6 +1348,57 @@ impl RestoreMute {
     }
 }
 
+/// Why `collect_loop` returned. `Shutdown`: the event channel hung up (the
+/// daemon is stopping) and the tails are flushed. `IdleClosed`: the
+/// idle-close budget lapsed (or an editor released the project), the store
+/// and its writer flock are dropped, and the channel receivers come back
+/// for the next open cycle.
+enum LoopExit {
+    Shutdown,
+    IdleClosed {
+        rx: Receiver<sheaf_core::events::FsEvent>,
+        control: Receiver<StoreCommand>,
+    },
+}
+
+/// Whether the store may be dropped right now. Outstanding plan tokens
+/// would dangle (their applier expects the same writer generation), and a
+/// pending restore or merge intent has a staleness deadline that a parked
+/// cold state would let lapse — both keep the store resident.
+fn closeable_now(
+    root: &Path,
+    plans: &[sheaf_core::store::RestorePlan],
+    fragment_plans: &[sheaf_core::store::FragmentPlan],
+    merge_plans: &[sheaf_core::store::MergePlan],
+) -> bool {
+    plans.is_empty()
+        && fragment_plans.is_empty()
+        && merge_plans.is_empty()
+        && sheaf_core::store::pending_restore_at(root).is_none()
+        && sheaf_core::store::pending_merge_at(root).is_none()
+}
+
+/// Normalize `[store] idle_close_secs`: `-1` keeps the store resident
+/// forever, a non-negative value sets the idle budget (0 closes at the
+/// first quiescent tick). Anything below `-1` is a config mistake — warn
+/// once per watch spawn and fall back to the default.
+fn idle_close_from(cfg: &ProjectConfig, root: &Path) -> Option<Duration> {
+    match cfg.store.idle_close_secs {
+        -1 => None,
+        secs if secs >= 0 => Some(Duration::from_secs(secs as u64)),
+        other => {
+            tracing::warn!(
+                root = %root.display(),
+                value = other,
+                "invalid [store] idle_close_secs; using the default (900)"
+            );
+            Some(Duration::from_secs(
+                StoreLimits::default().idle_close_secs as u64,
+            ))
+        }
+    }
+}
+
 /// Per-project debouncer sink: batches persist through the Loro-backed
 /// store, falling back to log-only when persistence fails. This
 /// thread is the project's sole writer, so restores execute here too.
@@ -1289,7 +1407,8 @@ impl RestoreMute {
 /// the timeline), `Volatile` feeds the scratch ring (never the timeline),
 /// `Never` is dropped defensively — the backend already refuses to emit
 /// it. The ring flushes when durable work flushes, on its own cadence
-/// (`[scratch] flush_ms`), and at shutdown.
+/// (`[scratch] flush_ms`), at shutdown, and when an idle close drops the
+/// store back to the cold-parked state.
 #[allow(clippy::too_many_arguments)]
 fn collect_loop(
     root: PathBuf,
@@ -1302,11 +1421,14 @@ fn collect_loop(
     initial_mute: Option<RestoreMute>,
     _lock_guard: std::fs::File,
     max_resume_age_ms: i64,
-) {
+    idle_close: Option<Duration>,
+    idle_clock: &AtomicU64,
+    wake: &Receiver<()>,
+) -> LoopExit {
     use sheaf_core::scratch::ScratchWriter;
     use std::collections::BTreeSet;
-
     let poll = (cfg.window / 4).max(Duration::from_millis(20));
+    let mut close_requested = false;
     let mut debouncers = HashMap::from([(root.clone(), Debouncer::new(root.clone(), cfg.clone()))]);
     let mut classifiers = HashMap::from([(root.clone(), classifier)]);
     let mut mutes = HashMap::new();
@@ -1343,6 +1465,18 @@ fn collect_loop(
 
     loop {
         while let Ok(command) = control.try_recv() {
+            // An editor releasing the project: answer from the writer so
+            // the reply reflects the same guards the close decision uses,
+            // and never count the release itself as activity.
+            if let StoreCommand::CloseStore { reply } = &command {
+                let closeable = closeable_now(&root, &plans, &fragment_plans, &merge_plans);
+                let _ = reply.send(closeable);
+                if closeable {
+                    close_requested = true;
+                }
+                continue;
+            }
+            idle_clock.store(stamp_now(), Ordering::Release);
             let command_root = command.worktree_root().unwrap_or(&root).to_path_buf();
             if !debouncers.contains_key(&command_root) {
                 debouncers.insert(
@@ -1406,18 +1540,24 @@ fn collect_loop(
                 trim_process_heap();
             }
         }
+        // Warming wakes that arrived while warm: the store is already
+        // open, so discard them before they pool in the channel.
+        while wake.try_recv().is_ok() {}
         match rx.recv_timeout(poll) {
-            Ok(ev) => route_fs_event(
-                ev,
-                &mut store,
-                &mut debouncers,
-                &mut classifiers,
-                &mut mutes,
-                &mut scratch,
-                &mut scratch_dirty,
-                &mut last_scratch_flush,
-                &cfg,
-            ),
+            Ok(ev) => {
+                idle_clock.store(stamp_now(), Ordering::Release);
+                route_fs_event(
+                    ev,
+                    &mut store,
+                    &mut debouncers,
+                    &mut classifiers,
+                    &mut mutes,
+                    &mut scratch,
+                    &mut scratch_dirty,
+                    &mut last_scratch_flush,
+                    &cfg,
+                );
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1437,7 +1577,51 @@ fn collect_loop(
             last_scratch_flush = Instant::now();
         }
         mutes.retain(|_, mute| Instant::now() < mute.until);
+        // Idle close: the budget lapsed, or an editor released the project.
+        // A release must land regardless of the configured budget — `None`
+        // only disables the *timer*, never an explicit close. The same tail
+        // the shutdown path runs flushes in-flight debounce batches and the
+        // scratch ring before the store and its writer flock are dropped;
+        // the next open replays whatever this missed.
+        let idle_expired = match idle_close {
+            None => false,
+            Some(limit) => {
+                stamp_now().saturating_sub(idle_clock.load(Ordering::Acquire))
+                    >= limit.as_millis() as u64
+            }
+        };
+        if (close_requested || idle_expired)
+            && closeable_now(&root, &plans, &fragment_plans, &merge_plans)
+        {
+            flush_pending_tails(
+                &mut debouncers,
+                &mut store,
+                &mut scratch,
+                &mut scratch_dirty,
+            );
+            drop(store);
+            drop(_lock_guard);
+            return LoopExit::IdleClosed { rx, control };
+        }
     }
+    flush_pending_tails(
+        &mut debouncers,
+        &mut store,
+        &mut scratch,
+        &mut scratch_dirty,
+    );
+    LoopExit::Shutdown
+}
+
+/// Flush every pending debounce batch and the scratch ring — the tail work
+/// shared by daemon shutdown and an idle store close. Both are the last
+/// write this store generation sees.
+fn flush_pending_tails(
+    debouncers: &mut HashMap<PathBuf, Debouncer>,
+    store: &mut ProjectStore,
+    scratch: &mut sheaf_core::scratch::ScratchWriter,
+    scratch_dirty: &mut std::collections::BTreeSet<(PathBuf, PathBuf)>,
+) {
     let tails: Vec<_> = debouncers
         .values_mut()
         .map(Debouncer::force_flush)
@@ -1445,9 +1629,9 @@ fn collect_loop(
         .collect();
     for tail in tails {
         tracing::info!(root = %tail.root.display(), events = tail.len(), "final drain completed");
-        persist_batch(&mut store, &tail);
+        persist_batch(store, &tail);
     }
-    flush_scratch(&mut scratch, &mut scratch_dirty);
+    flush_scratch_ring(scratch, scratch_dirty);
 }
 
 /// Snapshot every dirty volatile path into the recovery ring and flush it.
@@ -1706,6 +1890,9 @@ impl StoreCommand {
             }
             StoreCommand::ResumeMerge { reply } => {
                 let _ = reply.send(Err(error));
+            }
+            StoreCommand::CloseStore { reply } => {
+                let _ = reply.send(false);
             }
         }
     }
@@ -2087,6 +2274,11 @@ fn handle_store_command(
                 },
             };
             let _ = reply.send(result);
+        }
+        // Intercepted in `collect_loop` before the command reaches here;
+        // defensive arm keeps the match exhaustive.
+        StoreCommand::CloseStore { reply } => {
+            let _ = reply.send(false);
         }
         StoreCommand::InWorktree { .. } => unreachable!("worktree wrapper was unwrapped"),
     }
@@ -2528,6 +2720,8 @@ fn dispatch(
                     "merge.apply",
                     "merge.resume",
                     "project.resolve",
+                    "project.preload",
+                    "project.keepalive",
                     "editor.capture",
                     "editor.step",
                 ],
@@ -2537,6 +2731,8 @@ fn dispatch(
         "editor.capture" => plain(editor_capture(shared, req, rid, request_body)),
         "editor.step" => editor_step(shared, req, rid),
         "project.status" => plain(project_status(shared, req, rid)),
+        "project.preload" => plain(project_preload(shared, req, rid)),
+        "project.keepalive" => plain(project_keepalive(shared, req, rid)),
         "timeline.log" => bytes(timeline_log(shared, req, rid)),
         "timeline.info" => plain(timeline_info(shared, req, rid)),
         "checkpoint.list" => plain(checkpoint_list(shared, req, rid)),
@@ -2641,6 +2837,9 @@ fn project_status(shared: &Shared, req: &Request, rid: String) -> Response {
             "watching": shared.watching(&store_root),
             "ready": shared.ready(&store_root),
             "cold": shared.cold(&store_root),
+            "store_loaded": !shared.cold(&store_root),
+            "idle_ms": shared.idle_ms(&store_root),
+            "idle_close_secs": report_idle_close_secs(&store_root),
             "store_format": format,
             "pending_restore": pending,
             "pending_merge": pending_merge,
@@ -3018,10 +3217,17 @@ fn editor_step(shared: &Shared, req: &Request, rid: String) -> (Response, IpcBod
 /// store to open before falling back to the warming error. Must stay
 /// under the CLI's default 2s call timeout so the client sees a proper
 /// error, and keeps the warm-up contract intact: a mutation is never
-/// queued to execute after its caller has given up on it.
+/// queued to execute after its caller has given up on it. The lazy-cold
+/// warming reply carries `retryable`, which `Client::call` honors with a
+/// bounded re-issue window; eager-boot warming stays fail-fast. Editors
+/// that want to pay the whole cold open up front call `project.preload`.
 const COLD_OPEN_BUDGET: Duration = Duration::from_millis(1250);
-#[derive(Clone, Debug)]
+/// `project.preload` waits longer than a command would: the editor calls
+/// it opportunistically at workspace open and wants the store warm, not a
+/// fast answer. Same inline-wait precedent as RESTORE_HARD.
+const PRELOAD_BUDGET: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Debug)]
 struct ProjectControl {
     sender: Sender<StoreCommand>,
     worktree: PathBuf,
@@ -3036,6 +3242,33 @@ impl ProjectControl {
             root: self.worktree.clone(),
             command: Box::new(command),
         })
+    }
+}
+
+/// Wake a lazily parked project's open and wait up to `budget` for
+/// readiness. Only used for lazy (cold) projects — eager boot captures
+/// are never waited on from IPC. Returns whether the project became
+/// ready. The table lock is re-taken every iteration and never held
+/// across the wait: one slow project must not stall every other IPC
+/// operation.
+fn wait_for_ready(shared: &Shared, store_root: &Path, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        let (ready, wake) = {
+            let table = shared.table.lock();
+            let Some(entry) = table.get(store_root) else {
+                return false; // unwatched: the caller reports it
+            };
+            (entry.ready.clone(), entry.wake.clone())
+        };
+        if ready.load(Ordering::Acquire) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let _ = wake.send(());
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -3061,50 +3294,179 @@ fn project_control(
             ),
         ));
     }
-    let (cold, ready, wake, control) = {
-        let table = shared.table.lock().unwrap();
+    let control = {
+        let table = shared.table.lock();
         let Some(entry) = table.get(&store_root) else {
             return Err(Response::err(
                 rid.to_owned(),
                 IpcError::new("project.not_enrolled", "project is not currently watched"),
             ));
         };
-        (
-            entry.cold.clone(),
-            entry.ready.clone(),
-            entry.wake.clone(),
-            entry.control.clone(),
-        )
-        // Lock released before any waiting: the table must never be held
-        // across a cold-open wait, or one slow project would stall every
-        // other IPC operation.
+        entry.control.clone()
     };
-
+    // The collector boot-reconciles before draining commands, so a command
+    // issued after this wait never observes a half-open store. The two
+    // warming shapes differ on purpose:
+    //
+    // - Lazy (cold): the park has no deadline, so a bounded wake-and-wait
+    //   gives the open a chance to land; if it outlasts the budget the
+    //   error is marked `retryable` — the client may re-issue and the
+    //   mutation runs once the open lands, still within the caller's
+    //   own patience.
+    // - Eager: a boot capture with a staleness deadline is running. Its
+    //   contract is fail-fast with NO wait — a mutation must never be
+    //   queued to execute after its caller gave up on it.
+    let (cold, ready) = {
+        let table = shared.table.lock();
+        let entry = table.get(&store_root).expect("entry checked above");
+        (entry.cold.clone(), entry.ready.clone())
+    };
     if cold.load(Ordering::Acquire) {
-        // Lazy project: trigger the open and give it a bounded head start.
-        // The collector boot-reconciles before draining commands, so a
-        // command issued after this wait never observes a half-open store.
-        let deadline = Instant::now() + COLD_OPEN_BUDGET;
-        while cold.load(Ordering::Acquire) && Instant::now() < deadline {
-            let _ = wake.send(());
-            std::thread::sleep(Duration::from_millis(25));
+        let ready_now = wait_for_ready(shared, &store_root, COLD_OPEN_BUDGET);
+        if !ready_now {
+            return Err(Response::err(
+                rid.to_owned(),
+                IpcError::retryable(
+                    "project.warming",
+                    "store is opening (lazy project); retry shortly",
+                ),
+            ));
         }
-    }
-    if !ready.load(Ordering::Acquire) {
-        let detail = if cold.load(Ordering::Acquire) {
-            "store is opening (lazy project); retry shortly"
-        } else {
-            "initial worktree capture is still in progress; retry shortly"
-        };
+    } else if !ready.load(Ordering::Acquire) {
         return Err(Response::err(
             rid.to_owned(),
-            IpcError::new("project.warming", detail),
+            IpcError::new(
+                "project.warming",
+                "initial worktree capture is still in progress; retry shortly",
+            ),
         ));
     }
     Ok(ProjectControl {
         sender: control,
         worktree,
     })
+}
+
+/// Effective idle-close budget for reporting: `None` means "never" (`-1`
+/// after normalization, including the invalid-value fallback).
+fn report_idle_close_secs(root: &Path) -> Option<i64> {
+    let cfg = config::load(root).unwrap_or_default();
+    idle_close_from(&cfg, root).map(|d| d.as_secs() as i64)
+}
+
+/// `project.preload`: warm the store ahead of the first real command.
+/// Idempotent; triggers the lazy open and waits (longer than a command
+/// would) so an editor opening a workspace usually gets `ready` back.
+/// Never fails on slowness — `warming` is a state here, not an error.
+fn project_preload(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(p) => normalize(p),
+        Err(resp) => return resp,
+    };
+    let store_root = normalize(&config::store_root(&root));
+    let linked_registered = root == store_root
+        || sheaf_core::store::linked_worktrees(&store_root)
+            .is_ok_and(|items| items.into_iter().any(|item| normalize(&item.path) == root));
+    // Watched-in-table is the enrollment proof here — the daemon only
+    // watches enrolled projects — matching `project_control` semantics
+    // (no global-registry round-trip on the hot path).
+    if !linked_registered || shared.table.lock().get(&store_root).is_none() {
+        return Response::err(
+            rid,
+            IpcError::new(
+                "project.not_enrolled",
+                format!("{} is not enrolled", root.display()),
+            ),
+        );
+    }
+    let started = Instant::now();
+    let ready = wait_for_ready(shared, &store_root, PRELOAD_BUDGET);
+    Response::ok(
+        rid,
+        json!({
+            "state": if ready { "ready" } else { "warming" },
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    )
+}
+
+/// `project.keepalive`: stamp the project's idle clock so an open editor
+/// keeps the store resident. Deliberately a plain method — it must never
+/// wake or reopen a cold store. `release: true` asks the writer to close
+/// the store now; the reply reports whether it closed immediately or was
+/// deferred by an outstanding plan or pending restore/merge intent (the
+/// idle budget remains the fallback either way).
+fn project_keepalive(shared: &Shared, req: &Request, rid: String) -> Response {
+    let root = match require_project(req, &rid) {
+        Ok(p) => normalize(p),
+        Err(resp) => return resp,
+    };
+    let store_root = normalize(&config::store_root(&root));
+    let linked_registered = root == store_root
+        || sheaf_core::store::linked_worktrees(&store_root)
+            .is_ok_and(|items| items.into_iter().any(|item| normalize(&item.path) == root));
+    if !linked_registered || shared.table.lock().get(&store_root).is_none() {
+        return Response::err(
+            rid,
+            IpcError::new(
+                "project.not_enrolled",
+                format!("{} is not enrolled", root.display()),
+            ),
+        );
+    }
+    let release = req
+        .params
+        .get("release")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let (cold, control) = {
+        let table = shared.table.lock();
+        let Some(entry) = table.get(&store_root) else {
+            return Response::err(
+                rid,
+                IpcError::new("project.not_enrolled", "project is not currently watched"),
+            );
+        };
+        (entry.cold.load(Ordering::Acquire), entry.control.clone())
+    };
+    if cold {
+        // Cold store: nothing to keep alive, nothing to release. Reporting
+        // beats erroring — a plugin pinging after an idle unload must not
+        // treat the unloaded state as a failure.
+        return Response::ok(
+            rid,
+            json!({
+                "state": "cold",
+                "idle_ms": serde_json::Value::Null,
+                "idle_close_secs": report_idle_close_secs(&store_root),
+            }),
+        );
+    }
+    if release {
+        let (reply_tx, reply_rx) = channel::<bool>();
+        let sent = control
+            .send(StoreCommand::CloseStore { reply: reply_tx })
+            .is_ok();
+        let accepted = sent && reply_rx.recv_timeout(REQUEST_SOFT).unwrap_or(false);
+        let state = if accepted { "closing" } else { "deferred" };
+        return Response::ok(
+            rid,
+            json!({
+                "state": state,
+                "idle_ms": shared.idle_ms(&store_root),
+                "idle_close_secs": report_idle_close_secs(&store_root),
+            }),
+        );
+    }
+    shared.stamp_idle(&store_root);
+    Response::ok(
+        rid,
+        json!({
+            "state": "ready",
+            "idle_ms": 0,
+            "idle_close_secs": report_idle_close_secs(&store_root),
+        }),
+    )
 }
 
 fn timeline_log(shared: &Shared, req: &Request, rid: String) -> (Response, Vec<u8>) {
@@ -4352,7 +4714,7 @@ fn attach_linked_watch(shared: &Shared, store_root: &Path, worktree: &Path) -> R
         .map_err(anyhow::Error::msg)?,
     );
     let backend = watcher::default_backend(worktree.to_path_buf(), classifier)?;
-    let mut table = shared.table.lock().unwrap();
+    let mut table = shared.table.lock();
     let entry = table
         .get_mut(&normalize(store_root))
         .ok_or_else(|| anyhow::anyhow!("primary project is no longer watched"))?;
@@ -4756,6 +5118,213 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------ preload / keepalive / idle close
+
+    /// A skeleton whose config carries a specific `[store] idle_close_secs`.
+    fn idle_project(base: &Path, name: &str, idle_close_secs: i64) -> PathBuf {
+        let root = skeleton_project(base, name);
+        std::fs::write(
+            root.join(".sheaf/config.toml"),
+            format!("format_version = 2\n\n[store]\nidle_close_secs = {idle_close_secs}\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    fn warm_via_event(shared: &Shared, root: &Path) {
+        // The write must land after the watcher's baseline registration.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(root.join("activity.txt"), "wake").unwrap();
+        assert!(
+            wait_until(10_000, || shared.ready(root)),
+            "store never warmed on first activity"
+        );
+    }
+
+    #[test]
+    fn preload_warms_a_cold_store_without_worktree_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = skeleton_project(tmp.path(), "preload");
+        std::fs::write(live.join("tracked.txt"), "content").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        assert!(shared.cold(&live));
+
+        let req = test_request("project.preload", Some(live.clone()), json!({}));
+        let resp = project_preload(&shared, &req, "rid-1".into());
+        assert!(resp.ok, "preload must not fail: {resp:?}");
+        let state = resp.result.unwrap()["state"].as_str().unwrap().to_owned();
+        assert_eq!(state, "ready");
+        assert!(!shared.cold(&live));
+        assert!(shared.ready(&live));
+    }
+
+    #[test]
+    fn keepalive_never_wakes_a_cold_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = skeleton_project(tmp.path(), "keepalive-cold");
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+
+        let req = test_request("project.keepalive", Some(live.clone()), json!({}));
+        let resp = project_keepalive(&shared, &req, "rid-1".into());
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["state"].as_str(), Some("cold"));
+        // The ping must not have triggered the lazy open.
+        assert!(shared.cold(&live));
+        assert!(!shared.ready(&live));
+        assert!(lock_is_free(&live));
+    }
+
+    #[test]
+    fn idle_close_unloads_then_a_command_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = idle_project(tmp.path(), "idle-close", 1);
+        std::fs::write(live.join("seed.txt"), "seed\n").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        warm_via_event(&shared, &live);
+        assert!(!shared.cold(&live));
+        assert!(!lock_is_free(&live), "warm project holds the writer flock");
+
+        // One second of quiet later the store is gone again.
+        assert!(
+            wait_until(10_000, || shared.cold(&live)),
+            "store never idled out of memory"
+        );
+        assert!(lock_is_free(&live), "an unloaded store releases its flock");
+
+        // The cycle continues: the next command reopens and serves.
+        let control = match project_control(&shared, &live, "test-rid") {
+            Ok(sender) => sender,
+            Err(response) => panic!("reopen did not finish within the budget: {response:?}"),
+        };
+        let (reply_tx, reply_rx) = channel();
+        control
+            .send(StoreCommand::TimelineLog {
+                all: false,
+                branch: None,
+                path: None,
+                follow: false,
+                limit: 10,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let answer = reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a command after an idle close must still be answered");
+        let (captures, _) = answer.expect("timeline log over a reopened store");
+        assert!(!captures.is_empty(), "the reopen reconciles the baseline");
+        assert!(shared.ready(&live));
+        assert!(!shared.cold(&live));
+    }
+
+    #[test]
+    fn idle_close_never_happens_when_configured_negative_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = idle_project(tmp.path(), "idle-never", -1);
+        std::fs::write(live.join("seed.txt"), "seed\n").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        warm_via_event(&shared, &live);
+
+        // A 1s budget would have closed by now (see the idle-close test);
+        // `-1` keeps the store resident well past that window.
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(!shared.cold(&live), "-1 must keep the store resident");
+        assert!(!lock_is_free(&live));
+    }
+
+    #[test]
+    fn keepalive_release_closes_a_warm_store_even_when_never_was_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = idle_project(tmp.path(), "release", -1);
+        std::fs::write(live.join("seed.txt"), "seed\n").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        warm_via_event(&shared, &live);
+
+        let req = test_request(
+            "project.keepalive",
+            Some(live.clone()),
+            json!({ "release": true }),
+        );
+        let resp = project_keepalive(&shared, &req, "rid-1".into());
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["state"].as_str(), Some("closing"));
+        assert!(
+            wait_until(10_000, || shared.cold(&live)),
+            "an accepted release must unload the store"
+        );
+        assert!(lock_is_free(&live));
+    }
+
+    #[test]
+    fn keepalive_release_is_deferred_by_a_pending_restore_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = idle_project(tmp.path(), "release-deferred", 1);
+        std::fs::write(live.join("seed.txt"), "seed\n").unwrap();
+        let shared = test_shared();
+        assert!(spawn_watch(&shared, &live));
+        warm_via_event(&shared, &live);
+
+        // A pending restore has a staleness deadline; a parked cold state
+        // could let it lapse, so the close must not happen over it.
+        let intent = serde_json::json!({
+            "token": "test-token",
+            "mode": "full",
+            "scope": [],
+            "target": {"frontier": "f1", "capture_id": null},
+            "started_ms": chrono::Utc::now().timestamp_millis(),
+        });
+        std::fs::create_dir_all(live.join(".sheaf/state")).unwrap();
+        std::fs::write(
+            live.join(".sheaf/state/restore.intent"),
+            serde_json::to_string(&intent).unwrap(),
+        )
+        .unwrap();
+
+        let req = test_request(
+            "project.keepalive",
+            Some(live.clone()),
+            json!({ "release": true }),
+        );
+        let resp = project_keepalive(&shared, &req, "rid-1".into());
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["state"].as_str(), Some("deferred"));
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(
+            !shared.cold(&live),
+            "a pending restore intent must keep the store open"
+        );
+    }
+
+    #[test]
+    fn idle_close_from_normalizes_the_config_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = |secs: i64| ProjectConfig {
+            store: StoreLimits {
+                idle_close_secs: secs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(idle_close_from(&limits(-1), tmp.path()), None);
+        assert_eq!(
+            idle_close_from(&limits(0), tmp.path()),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            idle_close_from(&limits(900), tmp.path()),
+            Some(Duration::from_secs(900))
+        );
+        // Below -1 is a config mistake: fall back to the default budget.
+        assert_eq!(
+            idle_close_from(&limits(-5), tmp.path()),
+            Some(Duration::from_secs(900))
+        );
+    }
+
     // ------------------------------------------------------- pure helpers
 
     #[test]
@@ -4845,6 +5414,7 @@ mod tests {
             >();
             let (tx_smart, _) =
                 channel::<std::result::Result<SmartPlanReply, sheaf_core::SheafError>>();
+            let (tx_close, _) = channel::<bool>();
             let grep_request = point_grep("needle");
             vec![
                 StoreCommand::TimelineLog {
@@ -4920,6 +5490,7 @@ mod tests {
                     head_texts: None,
                     reply: tx_smart,
                 },
+                StoreCommand::CloseStore { reply: tx_close },
             ]
         };
         let boundaries: Vec<bool> = commands
@@ -4946,6 +5517,7 @@ mod tests {
                 false, // PlanFragment
                 true,  // ApplyFragment
                 false, // PlanSmart
+                false, // CloseStore
             ]
         );
         let heavy: Vec<bool> = commands.iter().map(|c| c.is_memory_heavy()).collect();
@@ -4969,6 +5541,7 @@ mod tests {
                 false, // PlanFragment
                 false, // ApplyFragment
                 false, // PlanSmart
+                false, // CloseStore
             ]
         );
     }
@@ -5023,9 +5596,11 @@ mod tests {
         let (wake_tx, _wake_rx) = channel::<()>();
         let (events, _events_rx) = channel();
 
-        shared.table.lock().unwrap().insert(
+        shared.table.lock().insert(
             normalize(&root),
             WatchEntry {
+                idle_clock: Arc::new(AtomicU64::new(0)),
+
                 stop: watcher::new_stop_flag(),
                 cold: Arc::new(AtomicBool::new(true)),
                 ready: Arc::new(AtomicBool::new(false)),
@@ -5730,6 +6305,8 @@ mod tests {
         let (event_tx, event_rx) = channel::<sheaf_core::events::FsEvent>();
         let (control_tx, control_rx) = channel::<StoreCommand>();
         let loop_root = root.clone();
+        let idle_clock = Arc::new(AtomicU64::new(0));
+        let (_wake_tx, wake_rx) = channel::<()>();
         let collector = std::thread::spawn(move || {
             collect_loop(
                 loop_root,
@@ -5748,6 +6325,9 @@ mod tests {
                 None,
                 lock,
                 60_000,
+                None,
+                idle_clock.as_ref(),
+                &wake_rx,
             )
         });
 
@@ -5794,6 +6374,8 @@ mod tests {
         let (event_tx, event_rx) = channel::<sheaf_core::events::FsEvent>();
         let (control_tx, control_rx) = channel::<StoreCommand>();
         let loop_root = root.clone();
+        let idle_clock = Arc::new(AtomicU64::new(0));
+        let (_wake_tx, wake_rx) = channel::<()>();
         let collector = std::thread::spawn(move || {
             collect_loop(
                 loop_root,
@@ -5812,6 +6394,9 @@ mod tests {
                 None,
                 lock,
                 60_000,
+                None,
+                idle_clock.as_ref(),
+                &wake_rx,
             )
         });
 
@@ -5889,6 +6474,8 @@ mod tests {
         let (control_tx, control_rx) = channel::<StoreCommand>();
         let loop_root = root.clone();
         let shared = watcher::shared_classifier(classifier);
+        let idle_clock = Arc::new(AtomicU64::new(0));
+        let (_wake_tx, wake_rx) = channel::<()>();
         let collector = std::thread::spawn(move || {
             collect_loop(
                 loop_root,
@@ -5910,6 +6497,9 @@ mod tests {
                 None,
                 lock,
                 60_000,
+                None,
+                idle_clock.as_ref(),
+                &wake_rx,
             )
         });
 
@@ -6542,7 +7132,7 @@ mod tests {
 
         let (events, event_rx) = channel::<sheaf_core::events::FsEvent>();
         let (control, control_rx) = channel::<StoreCommand>();
-        let (wake, _wake_rx) = channel::<()>();
+        let (wake, wake_rx) = channel::<()>();
         let loop_root = root.clone();
         let collector = std::thread::spawn(move || {
             collect_loop(
@@ -6562,10 +7152,14 @@ mod tests {
                 None,
                 lock,
                 60_000,
-            )
+                None,
+                &Arc::new(AtomicU64::new(0)),
+                &wake_rx,
+            );
         });
 
         let mut entry = WatchEntry {
+            idle_clock: Arc::new(AtomicU64::new(0)),
             stop: watcher::new_stop_flag(),
             cold: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
@@ -6754,6 +7348,8 @@ mod tests {
             let (events, _events_rx) = channel();
 
             WatchEntry {
+                idle_clock: Arc::new(AtomicU64::new(0)),
+
                 stop: watcher::new_stop_flag(),
                 cold: Arc::new(AtomicBool::new(cold)),
                 ready: Arc::new(AtomicBool::new(ready)),
@@ -6768,7 +7364,6 @@ mod tests {
         shared
             .table
             .lock()
-            .unwrap()
             .insert(normalize(&root), entry_for(false, false));
         let err = project_control(&shared, &root, "rid").unwrap_err();
         assert_eq!(error_code_of(&err), "project.warming");
@@ -6782,7 +7377,6 @@ mod tests {
         shared
             .table
             .lock()
-            .unwrap()
             .insert(normalize(&root), entry_for(false, true));
         assert!(project_control(&shared, &root, "rid").is_ok());
 
@@ -6792,7 +7386,6 @@ mod tests {
         shared
             .table
             .lock()
-            .unwrap()
             .insert(normalize(&root), entry_for(true, false));
         let err = project_control(&shared, &root, "rid").unwrap_err();
         assert_eq!(error_code_of(&err), "project.warming");
@@ -7230,9 +7823,11 @@ mod tests {
         let (wake, _wake_rx) = channel();
         let (events, _events_rx) = channel();
 
-        shared.table.lock().unwrap().insert(
+        shared.table.lock().insert(
             normalize(&root),
             WatchEntry {
+                idle_clock: Arc::new(AtomicU64::new(0)),
+
                 stop: watcher::new_stop_flag(),
                 cold: Arc::new(AtomicBool::new(false)),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -7444,9 +8039,11 @@ mod tests {
         let (wake, _wake_rx) = channel::<()>();
         let (events, _events_rx) = channel();
 
-        shared.table.lock().unwrap().insert(
+        shared.table.lock().insert(
             normalize(&root),
             WatchEntry {
+                idle_clock: Arc::new(AtomicU64::new(0)),
+
                 stop: watcher::new_stop_flag(),
                 cold: Arc::new(AtomicBool::new(false)),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -7525,9 +8122,11 @@ mod tests {
                 let (wake, _wake_rx) = channel::<()>();
                 let (events, _events_rx) = channel();
 
-                shared.table.lock().unwrap().insert(
+                shared.table.lock().insert(
                     normalize(&root),
                     WatchEntry {
+                        idle_clock: Arc::new(AtomicU64::new(0)),
+
                         stop: watcher::new_stop_flag(),
                         cold: Arc::new(AtomicBool::new(false)),
                         ready: Arc::new(AtomicBool::new(true)),

@@ -557,13 +557,38 @@ mod tests {
         assert!(cfg.scratch.enabled);
         assert_eq!(cfg.scratch.max_bytes, crate::scratch::DEFAULT_MAX_BYTES);
         assert!(cfg.retention.expiry.is_none());
+        assert_eq!(cfg.store.idle_close_secs, 900);
         // The rendered skeleton exposes every section so the knobs are
         // discoverable in each new project's config.
         let rendered = render_default();
         assert!(rendered.contains("[store]"));
+        assert!(rendered.contains("idle_close_secs = 900"));
         assert!(rendered.contains("[classify]"));
         assert!(rendered.contains("[scratch]"));
         assert!(!rendered.contains("[ignore]"));
+    }
+
+    #[test]
+    fn idle_close_secs_accepts_the_never_sentinel_and_defaults_when_sparse() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `-1` is the documented "keep the store resident forever" value.
+        std::fs::create_dir_all(tmp.path().join(".sheaf/store")).unwrap();
+        std::fs::write(
+            config_file_path(tmp.path()),
+            "format_version = 2\n\n[store]\nidle_close_secs = -1\n",
+        )
+        .unwrap();
+        assert_eq!(load(tmp.path()).unwrap().store.idle_close_secs, -1);
+
+        // A `[store]` section without the key keeps the struct default.
+        std::fs::write(
+            config_file_path(tmp.path()),
+            "format_version = 2\n\n[store]\nmax_segment_bytes = 1024\n",
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.store.idle_close_secs, 900);
+        assert_eq!(cfg.store.max_segment_bytes, 1024);
     }
 
     #[test]

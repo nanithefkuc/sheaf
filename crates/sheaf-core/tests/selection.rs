@@ -21,6 +21,8 @@ fn open(root: &Path) -> ProjectStore {
         StoreLimits {
             max_segment_bytes: 4 << 20,
             snapshot_edit_size: 1_000,
+
+            ..Default::default()
         },
     )
     .unwrap()

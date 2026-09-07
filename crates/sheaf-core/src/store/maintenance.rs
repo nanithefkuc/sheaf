@@ -1198,7 +1198,9 @@ pub(super) fn plan_retention(
             }
             // A failed scan must not masquerade as "nothing prunable": the
             // plan would defer every mark with no hint as to why.
-            Err(e) => tracing::warn!(error = %e, "prunable-prefix scan failed; plan defers every mark"),
+            Err(e) => {
+                tracing::warn!(error = %e, "prunable-prefix scan failed; plan defers every mark")
+            }
         }
     }
 
@@ -1361,7 +1363,10 @@ fn prunable_prefix(
         });
     }
     if skipped > 0 {
-        tracing::warn!(count = skipped, "prune scan skipped captures it could not compare");
+        tracing::warn!(
+            count = skipped,
+            "prune scan skipped captures it could not compare"
+        );
     }
     out.sort_by_key(|c| c.at_ms);
     Ok(out)
@@ -1565,6 +1570,8 @@ mod tests {
         StoreLimits {
             max_segment_bytes: 4 << 20,
             snapshot_edit_size: 3,
+
+            ..Default::default()
         }
     }
 

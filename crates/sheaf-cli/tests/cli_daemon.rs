@@ -631,6 +631,27 @@ fn restore_resume_and_abandon_report_daemon_errors_without_pending_intent() {
 }
 
 #[test]
+fn preload_warms_a_fresh_daemon_and_the_next_log_is_immediate() {
+    let fx = fixture("preload", V1);
+
+    // A fresh daemon has the project lazily parked; preload must open the
+    // store and say so.
+    let (ok, out, err) = sheaf(&fx, &["preload"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("store ready"), "{out}");
+
+    // The warmed store answers a read without a warming retry delay, and
+    // the baseline reconcile preload triggered is visible in the log.
+    let (ok, out, err) = sheaf(&fx, &["log", "--json"]);
+    assert!(ok, "{err}");
+    let value = json_out(&out);
+    assert!(
+        value["entries"].as_array().is_some_and(|e| !e.is_empty()),
+        "expected the baseline capture after preload: {out}"
+    );
+}
+
+#[test]
 fn live_worktree_edits_form_a_branch_that_squash_merges() {
     let fx = fixture("worktree-merge", V1);
     let (ok, _, err) = sheaf(&fx, &["checkpoint", "create", "branch-base"]);

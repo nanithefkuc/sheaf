@@ -23,6 +23,8 @@ fn open(root: &Path) -> ProjectStore {
         StoreLimits {
             max_segment_bytes: 4 << 20,
             snapshot_edit_size: 1_000,
+
+            ..Default::default()
         },
     )
     .unwrap()
@@ -580,6 +582,8 @@ fn pruned_intervals_are_reported_without_fabricated_content() {
         StoreLimits {
             max_segment_bytes: 4 << 20,
             snapshot_edit_size: 3,
+
+            ..Default::default()
         },
     )
     .unwrap();
@@ -812,6 +816,8 @@ fn retention_survivors_unchanged_and_binaries_skipped() {
         StoreLimits {
             max_segment_bytes: 4 << 20,
             snapshot_edit_size: 3,
+
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1730,6 +1736,8 @@ fn history_retention_gap_sits_chronologically_and_ends_the_episode() {
         StoreLimits {
             max_segment_bytes: 4 << 20,
             snapshot_edit_size: 3,
+
+            ..Default::default()
         },
     )
     .unwrap();

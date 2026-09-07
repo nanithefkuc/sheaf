@@ -1411,6 +1411,8 @@ mod tests {
         StoreLimits {
             max_segment_bytes: 64 << 20,
             snapshot_edit_size: 1000,
+
+            ..Default::default()
         }
     }
 

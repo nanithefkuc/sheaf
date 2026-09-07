@@ -237,6 +237,12 @@ fn tool_table() -> Vec<Value> {
             &[],
         ),
         tool(
+            "sheaf_preload",
+            "Warm the project store ahead of the first command: ask sheafd to open it now, the same signal an editor plugin sends when it detects .sheaf/. Waits for the cold open; no-op when already open.",
+            project_prop(),
+            &[],
+        ),
+        tool(
             "sheaf_log",
             "Browse capture history, newest first. A capture is a debounced batch of worktree changes recorded as CRDT operations (sheaf's flight recorder).",
             merge_props(&[project_prop(), json!({
@@ -415,6 +421,12 @@ fn build_command(
     match name {
         "sheaf_status" => {
             cmd.arg("status");
+            if let Some(root) = project {
+                cmd.arg(root);
+            }
+        }
+        "sheaf_preload" => {
+            cmd.arg("preload");
             if let Some(root) = project {
                 cmd.arg(root);
             }
@@ -751,6 +763,7 @@ mod tests {
             names,
             [
                 "sheaf_status",
+                "sheaf_preload",
                 "sheaf_log",
                 "sheaf_diff",
                 "sheaf_checkpoint_list",
@@ -1025,6 +1038,17 @@ mod tests {
         // Without a project: bare status, no working directory override.
         let cmd = build("sheaf_status", json!({}), None).unwrap();
         assert_eq!(argv(&cmd), [BIN, "status"]);
+        assert_eq!(cwd(&cmd), None);
+    }
+
+    #[test]
+    fn preload_passes_root_positionally_and_as_cwd() {
+        let cmd = build("sheaf_preload", json!({"project": "/p"}), Some("/p")).unwrap();
+        assert_eq!(argv(&cmd), [BIN, "preload", "/p"]);
+        assert_eq!(cwd(&cmd), Some(PathBuf::from("/p")));
+
+        let cmd = build("sheaf_preload", json!({}), None).unwrap();
+        assert_eq!(argv(&cmd), [BIN, "preload"]);
         assert_eq!(cwd(&cmd), None);
     }
 
@@ -1314,6 +1338,6 @@ mod tests {
         // The client's initialized notification is silently consumed.
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let list = handle_request("tools/list", json!(1), json!({})).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 15);
     }
 }
